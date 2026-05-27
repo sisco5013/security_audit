@@ -2318,13 +2318,13 @@ def page_shell(title: str, body: str, refresh_seconds: int | None = None) -> byt
     }}
     .settings-groups {{
       display: grid;
-      gap: 22px;
+      gap: 18px;
       max-width: none;
     }}
     .settings-group {{
       border: 1px solid var(--line);
       border-radius: 10px;
-      padding: 18px;
+      padding: 16px;
       background: linear-gradient(180deg, #ffffff 0%, #fbfcfe 100%);
     }}
     .settings-group-head {{
@@ -2332,23 +2332,33 @@ def page_shell(title: str, body: str, refresh_seconds: int | None = None) -> byt
       align-items: flex-end;
       justify-content: space-between;
       gap: 16px;
-      padding-bottom: 12px;
-      margin-bottom: 14px;
+      padding-bottom: 10px;
+      margin-bottom: 12px;
       border-bottom: 1px solid #e7ecf3;
+    }}
+    .settings-group-kicker {{
+      margin: 0 0 3px;
+      color: #175cd3;
+      font-size: 12px;
+      font-weight: 850;
+      letter-spacing: 0.04em;
     }}
     .settings-group-head h2 {{
       margin: 0;
       font-size: 17px;
     }}
+    .settings-group-head p {{
+      margin: 4px 0 0;
+    }}
     .settings-grid {{
       display: grid;
-      grid-template-columns: repeat(3, minmax(220px, 1fr));
-      gap: 14px;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 12px;
     }}
     .settings-card {{
       display: flex;
       flex-direction: column;
-      min-height: 176px;
+      min-height: 158px;
       border: 1px solid #e1e7f0;
       border-radius: 9px;
       padding: 15px;
@@ -2369,9 +2379,6 @@ def page_shell(title: str, body: str, refresh_seconds: int | None = None) -> byt
     .settings-card .actions {{
       margin-top: auto;
       padding-top: 12px;
-    }}
-    .settings-card.wide {{
-      grid-column: span 2;
     }}
     .badge {{
       display: inline-flex;
@@ -4383,8 +4390,9 @@ def settings_page(config: AppConfig) -> bytes:
       <div class="settings-group">
         <div class="settings-group-head">
           <div>
-            <h2>检测规则</h2>
-            <p class="muted">决定哪些文件、名称和目标会进入审计矩阵与明细。</p>
+            <p class="settings-group-kicker">RULES</p>
+            <h2>文件识别规则</h2>
+            <p class="muted">定义哪些附件对象进入审计矩阵，包括敏感名称、图纸、最高预警对象和压缩包。</p>
           </div>
         </div>
         <div class="settings-grid">
@@ -4412,6 +4420,42 @@ def settings_page(config: AppConfig) -> bytes:
         <p class="muted">压缩包作为矩阵审计对象，替代原“其他”列。</p>
         <div class="actions"><a class="button primary" href="/settings/archive-suffixes">维护压缩包后缀</a></div>
       </div>
+        </div>
+      </div>
+
+      <div class="settings-group">
+        <div class="settings-group-head">
+          <div>
+            <p class="settings-group-kicker">NOISE CONTROL</p>
+            <h2>内部目标与降噪</h2>
+            <p class="muted">维护内部系统、内部网段和已知正常软件行为，降低首页和矩阵噪音。</p>
+          </div>
+        </div>
+        <div class="settings-grid">
+      <div class="settings-card">
+        <h3>内部目标策略</h3>
+        <p class="metric">域名 {len(internal_domains)} / 网段 {len(internal_networks)}</p>
+        <p class="muted">维护不按外部目标统计的内部系统网段/域名。</p>
+        <div class="actions"><a class="button primary" href="/settings/internal-targets">维护内部目标</a></div>
+      </div>
+      <div class="settings-card">
+        <h3>排除策略</h3>
+        <p class="metric">共 {len(exclusions)} 条，启用 {sum(1 for rule in exclusions if rule_enabled(rule))} 条</p>
+        <p class="muted">用于搜狗输入法同步、浏览器配置同步等已知软件行为降噪；原始 syslog 不删除。</p>
+        <div class="actions"><a class="button primary" href="/settings/exclusions">维护排除策略</a></div>
+      </div>
+        </div>
+      </div>
+
+      <div class="settings-group">
+        <div class="settings-group-head">
+          <div>
+            <p class="settings-group-kicker">DATA SOURCES</p>
+            <h2>解密与 PLM 数据源</h2>
+            <p class="muted">维护加密软件解密记录、合规 IP 池和 PLM 登录审计的强约束部门。</p>
+          </div>
+        </div>
+        <div class="settings-grid">
       <div class="settings-card">
         <h3>解密记录导入</h3>
         <p class="metric">{esc(decrypt_metric)}</p>
@@ -4430,6 +4474,18 @@ def settings_page(config: AppConfig) -> bytes:
         <p class="muted">仅跟踪强约束部门账号；不在加密终端IP池登录时判一级风险。</p>
         <div class="actions"><a class="button primary" href="/settings/plm-login">维护PLM策略</a></div>
       </div>
+        </div>
+      </div>
+
+      <div class="settings-group">
+        <div class="settings-group-head">
+          <div>
+            <p class="settings-group-kicker">IDENTITY</p>
+            <h2>组织与身份映射</h2>
+            <p class="muted">统一企业微信通讯录、解密记录原始组织和审计报告中的公司部门口径。</p>
+          </div>
+        </div>
+        <div class="settings-grid">
       <div class="settings-card">
         <h3>组织别名关联</h3>
         <p class="metric">{len(organization_aliases)} 条</p>
@@ -4448,30 +4504,8 @@ def settings_page(config: AppConfig) -> bytes:
       <div class="settings-group">
         <div class="settings-group-head">
           <div>
-            <h2>降噪与内部口径</h2>
-            <p class="muted">维护内部目标和已知正常行为，减少报告噪音但不删除原始日志。</p>
-          </div>
-        </div>
-        <div class="settings-grid">
-      <div class="settings-card">
-        <h3>内部目标策略</h3>
-        <p class="metric">域名 {len(internal_domains)} / 网段 {len(internal_networks)}</p>
-        <p class="muted">维护不按外部目标统计的内部系统网段/域名。</p>
-        <div class="actions"><a class="button primary" href="/settings/internal-targets">维护内部目标</a></div>
-      </div>
-      <div class="settings-card wide">
-        <h3>排除策略</h3>
-        <p class="metric">共 {len(exclusions)} 条，启用 {sum(1 for rule in exclusions if rule_enabled(rule))} 条</p>
-        <p class="muted">用于搜狗输入法同步、浏览器配置同步等已知软件行为降噪；原始 syslog 不删除。</p>
-        <div class="actions"><a class="button primary" href="/settings/exclusions">维护排除策略</a></div>
-      </div>
-        </div>
-      </div>
-
-      <div class="settings-group">
-        <div class="settings-group-head">
-          <div>
-            <h2>智能分析与访问控制</h2>
+            <p class="settings-group-kicker">SYSTEM</p>
+            <h2>系统能力与访问控制</h2>
             <p class="muted">控制AI研判是否启用，并维护全集团审计报告访问权限。</p>
           </div>
         </div>
@@ -4484,7 +4518,7 @@ def settings_page(config: AppConfig) -> bytes:
         <p class="muted">完整维护AI异常研判提示词，必须保留审计摘要 JSON 占位符。</p>
         <div class="actions"><a class="button primary" href="/settings/ai">维护AI提示词</a></div>
       </div>
-      <div class="settings-card wide">
+      <div class="settings-card">
         <h3>认证与报表查看</h3>
         <p class="metric">查看用户 {len(auth["global_viewer_userids"])}</p>
         <p class="muted">策略管理员固定 userid=10056。</p>
