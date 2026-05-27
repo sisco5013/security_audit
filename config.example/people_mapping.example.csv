@@ -1,0 +1,3 @@
+match_type,match_value,person_name,company,department,position,sensitive_role,status,note
+# email,user@example.com,Example User,Example Company,Example Department,Engineer,no,active,
+# client_ip,172.16.0.10,Example User,Example Company,Example Department,Engineer,no,active,

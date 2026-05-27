@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "description": "Example exclusion rules. Production rules are maintained in the policy UI.",
+  "rules": [
+    {
+      "enabled": true,
+      "rule_name": "Example trusted internal system upload",
+      "topic": "file_audit",
+      "target_contains": ["internal.example.local"],
+      "target_regex": [],
+      "file_contains": [],
+      "file_regex": [],
+      "process_contains": [],
+      "subject_contains": [],
+      "action": "exclude",
+      "note": "Example only."
+    }
+  ]
+}

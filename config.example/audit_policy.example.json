@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "description": "Example audit policy. Copy to /data/tianqing-audit/config/audit_policy.json and edit in the policy UI.",
+  "design_suffixes": {
+    "three_d": ["prt", "asm", "sldasm", "sldprt", "step"],
+    "two_d": ["dwg"],
+    "pcb_ecad": []
+  },
+  "critical_design_patterns": [
+    {
+      "key": "structure_standard",
+      "label": "结构标准方案",
+      "regex": "^[3568][^\\\\/\\.]{2}\\.[^\\\\/\\.]{3}\\.[^\\\\/\\.]{3}\\.(?:sldasm|sldprt|step)$",
+      "description": "结构方案图号主体为三段点号命名，每段固定三位，第一段以 3/5/6/8 开头，后缀为 SLDASM/SLDPRT/STEP。",
+      "enabled": true,
+      "match_examples": ["356.123.456.sldprt", "5AB.CD1.999.SLDASM", "8XY.abc.DEF.step"],
+      "miss_examples": ["123.456.789.sldprt", "356.1234.456.sldprt", "356.123.456.dwg"]
+    },
+    {
+      "key": "yb_standard_long",
+      "label": "油变标准方案",
+      "regex": "^(?:3yb|5yb|8yb)\\.[^\\\\/\\.]{3}\\.[^\\\\/\\.]{5}\\.[^\\\\/\\.]{2}\\.(?:dwg|prt|asm|sldasm|sldprt|step)$",
+      "description": "油变标准方案图号为 3YB/5YB/8YB.三位.五位.两位，二维 DWG 和三维 PRT/ASM/SLDASM/SLDPRT/STEP 均适用。",
+      "enabled": true,
+      "match_examples": ["3YB.123.12345.12.sldprt", "5YB.ABC.12345.01.dwg"],
+      "miss_examples": ["3YB.12.12345.12.sldprt", "3YB.123.1234.12.pdf"]
+    },
+    {
+      "key": "yb_standard_short",
+      "label": "油变标准方案",
+      "regex": "^(?:5yb|8yb)\\.[^\\\\/\\.]{3}\\.[^\\\\/\\.]{4}\\.(?:dwg|prt|asm|sldasm|sldprt|step)$",
+      "description": "油变标准方案短图号为 5YB/8YB.三位.四位，二维 DWG 和三维 PRT/ASM/SLDASM/SLDPRT/STEP 均适用。",
+      "enabled": true,
+      "match_examples": ["5YB.123.1234.step", "8YB.ABC.9999.DWG"],
+      "miss_examples": ["3YB.123.1234.step", "5YB.123.12345.step"]
+    },
+    {
+      "key": "electrical_standard",
+      "label": "电气标准方案",
+      "regex": "^DQ[^\\\\/\\-]+-[^\\\\/\\-]+-[^\\\\/\\-]+-[^\\\\/\\-]+\\.dwg$",
+      "description": "电气方案图号以 DQ 开头，主体正好三个短横线，后缀为 DWG。",
+      "enabled": true,
+      "match_examples": ["DQ1-22-333-4444.dwg", "DQABC-DEF-G-HI.DWG"],
+      "miss_examples": ["DQ001-002-003.dwg", "DQ001-002-003-004-005.dwg"]
+    }
+  ],
+  "archive_suffixes": ["zip", "rar", "7z", "tar", "gz", "bz2", "xz"],
+  "internal_targets": {
+    "domains": ["daqo.com"],
+    "networks": ["172.88.0.0/16", "172.188.0.0/16"]
+  },
+  "organization_aliases": [],
+  "auth": {
+    "policy_admin_userids": ["10056"],
+    "global_viewer_userids": [],
+    "session_hours": 8
+  },
+  "ai_analysis": {
+    "enabled": false,
+    "prompt_template": "请基于以下审计上下文输出管理摘要：{audit_context_json}"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "description": "Example sensitive filename keywords. Production keywords are maintained in the policy UI.",
+  "rules": [
+    {
+      "enabled": true,
+      "keyword": "示例敏感词",
+      "category": "",
+      "scope": "both",
+      "match_type": "contains",
+      "note": ""
+    }
+  ]
+}

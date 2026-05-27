@@ -1,0 +1,4 @@
+# Allow Tianqing raw syslog files on the dedicated data volume.
+/data/tianqing-audit/ r,
+/data/tianqing-audit/raw-log/ rw,
+/data/tianqing-audit/raw-log/** rwk,

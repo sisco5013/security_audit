@@ -1,0 +1,41 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# macOS/editor noise
+.DS_Store
+*.swp
+*.swo
+
+# Logs, locks, temporary files
+*.log
+*.lock
+*.pid
+*.tmp
+*.bak
+*.bak-*
+
+# Generated reports and audit evidence
+reports/
+*.html
+*.xlsx
+*.xls
+*.csv.tmp
+
+# Runtime configuration and sensitive local data
+audit_policy.json
+sensitive_keywords.json
+audit_exclusions.json
+people_mapping.csv
+recipient_mapping.csv
+audit_dispositions.csv
+wecom_directory_cache.json
+.auth_proxy_token
+.auth_sessions.json
+.env
+*.env
+
+# Local data volumes / imported decrypt records
+data/
+decrypt-records/

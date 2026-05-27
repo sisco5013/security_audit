@@ -1,0 +1,3 @@
+match_type,match_value,relation,recipient_name,organization,note
+# domain,daqo.com,internal,Internal mail,Group,
+# email,customer@example.com,customer,Customer Contact,Customer Company,
