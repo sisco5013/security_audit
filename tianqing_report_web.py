@@ -162,6 +162,7 @@ AUTH_STATE_COOKIE_NAME = "tq_audit_state"
 AUTH_PROXY_TOKEN_FILE = ".auth_proxy_token"
 AUTH_SESSION_FILE = ".auth_sessions.json"
 DEFAULT_POLICY_ADMIN_USERIDS = [FIXED_POLICY_ADMIN_USERID]
+DEFAULT_PLM_CONSTRAINED_DEPARTMENTS = ["技术部", "研发部", "工艺部"]
 
 
 @dataclass
@@ -456,6 +457,7 @@ def normalize_login_next(next_path: str) -> str:
         "/settings/policy/": "/settings/policy",
         "/settings/internal-targets/": "/settings/internal-targets",
         "/settings/archive-suffixes/": "/settings/archive-suffixes",
+        "/settings/plm-login/": "/settings/plm-login",
         "/settings/decrypt-records/": "/settings/decrypt-records",
         "/settings/organization-aliases/": "/settings/organization-aliases",
         "/settings/organization-tree/": "/settings/organization-tree",
@@ -3241,6 +3243,7 @@ def load_policy_doc(config: AppConfig) -> dict[str, Any]:
             "archive_suffixes": DEFAULT_ARCHIVE_SUFFIXES,
             "organization_aliases": [],
             "internal_targets": {"domains": ["daqo.com"], "networks": ["172.88.0.0/16", "172.188.0.0/16"]},
+            "plm_login_audit": {"constrained_departments": DEFAULT_PLM_CONSTRAINED_DEPARTMENTS},
             "ai_analysis": {"prompt_template": DEFAULT_AI_PROMPT_TEMPLATE},
             "auth": {
                 "policy_admin_userids": DEFAULT_POLICY_ADMIN_USERIDS,
@@ -3281,6 +3284,14 @@ def load_policy_doc(config: AppConfig) -> dict[str, Any]:
     internal_targets.setdefault("domains", ["daqo.com"])
     internal_targets.setdefault("networks", ["172.88.0.0/16", "172.188.0.0/16"])
     loaded["internal_targets"] = internal_targets
+    plm_login_audit = loaded.get("plm_login_audit")
+    if not isinstance(plm_login_audit, dict):
+        plm_login_audit = {}
+    constrained_departments = plm_login_audit.get("constrained_departments")
+    if not isinstance(constrained_departments, list):
+        constrained_departments = DEFAULT_PLM_CONSTRAINED_DEPARTMENTS
+    plm_login_audit["constrained_departments"] = normalize_unique_text_list(constrained_departments)
+    loaded["plm_login_audit"] = plm_login_audit
     ai_analysis = loaded.get("ai_analysis")
     if not isinstance(ai_analysis, dict):
         ai_analysis = {}
@@ -3334,6 +3345,19 @@ def form_list(value: str) -> list[str]:
             if item:
                 values.append(item)
     return values
+
+
+def normalize_unique_text_list(value: Any) -> list[str]:
+    source = value if isinstance(value, list) else form_list(str(value or ""))
+    seen: set[str] = set()
+    result: list[str] = []
+    for raw in source:
+        item = " ".join(str(raw or "").strip().split())
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
 
 
 def normalize_userids(value: str) -> list[str]:
@@ -4321,6 +4345,7 @@ def settings_page(config: AppConfig) -> bytes:
     design = policy_doc.get("design_suffixes") if isinstance(policy_doc.get("design_suffixes"), dict) else {}
     internal_targets = policy_doc.get("internal_targets") if isinstance(policy_doc.get("internal_targets"), dict) else {}
     ai_analysis = policy_doc.get("ai_analysis") if isinstance(policy_doc.get("ai_analysis"), dict) else {}
+    plm_login_audit = policy_doc.get("plm_login_audit") if isinstance(policy_doc.get("plm_login_audit"), dict) else {}
     organization_aliases = normalize_organization_aliases(policy_doc.get("organization_aliases"))
     three_d = design.get("three_d") or []
     two_d = design.get("two_d") or []
@@ -4328,6 +4353,7 @@ def settings_page(config: AppConfig) -> bytes:
     archive_suffixes = policy_doc.get("archive_suffixes") if isinstance(policy_doc.get("archive_suffixes"), list) else []
     internal_domains = internal_targets.get("domains") or []
     internal_networks = internal_targets.get("networks") or []
+    plm_departments = normalize_unique_text_list(plm_login_audit.get("constrained_departments") or DEFAULT_PLM_CONSTRAINED_DEPARTMENTS)
     prompt_template = str(ai_analysis.get("prompt_template") or "")
     prompt_mode = "自定义" if prompt_template.strip() and prompt_template.strip() != DEFAULT_AI_PROMPT_TEMPLATE.strip() else "默认"
     ai_enabled = ai_policy_enabled_from_doc(policy_doc)
@@ -4397,6 +4423,12 @@ def settings_page(config: AppConfig) -> bytes:
         <p class="metric">{esc(terminal_metric)}</p>
         <p class="muted">上传加密软件终端清单，最新批次可作为 PLM 等系统合规 IP 池来源。</p>
         <div class="actions"><a class="button primary" href="/settings/encryption-terminals">上传终端列表</a></div>
+      </div>
+      <div class="settings-card">
+        <h3>PLM登录审计策略</h3>
+        <p class="metric">{len(plm_departments)} 个部门</p>
+        <p class="muted">仅跟踪强约束部门账号；不在加密终端IP池登录时判一级风险。</p>
+        <div class="actions"><a class="button primary" href="/settings/plm-login">维护PLM策略</a></div>
       </div>
       <div class="settings-card">
         <h3>组织别名关联</h3>
@@ -4639,6 +4671,45 @@ def archive_suffixes_page(config: AppConfig, message: str = "") -> bytes:
     </section>
 """
     return page_shell("压缩包后缀策略", body)
+
+
+def plm_login_policy_page(config: AppConfig, message: str = "", error: str = "") -> bytes:
+    doc = load_policy_doc(config)
+    plm = doc.get("plm_login_audit") if isinstance(doc.get("plm_login_audit"), dict) else {}
+    departments = normalize_unique_text_list(plm.get("constrained_departments") or DEFAULT_PLM_CONSTRAINED_DEPARTMENTS)
+    department_text = ", ".join(departments)
+    msg = f'<p class="muted">{esc(message)}</p>' if message else ""
+    err = f'<p class="note error">{esc(error)}</p>' if error else ""
+    body = f"""
+    <header>
+      <div>
+        <h1>PLM登录审计策略</h1>
+        <div class="muted">定义需要强制使用加密终端合规 IP 池登录 PLM 的部门范围。</div>
+      </div>
+      <div class="actions">
+        <a class="button" href="/settings">策略中心</a>
+        <a class="button" href="/settings/encryption-terminals">加密终端列表</a>
+        <a class="button" href="/">当前报告首页</a>
+      </div>
+    </header>
+    {msg}
+    {err}
+    <section class="panel">
+      <h2>强约束部门</h2>
+      <form method="post" action="/settings/plm-login/save">
+        <label class="full">部门名称，逗号分隔
+          <textarea name="constrained_departments" spellcheck="false" placeholder="技术部, 研发部, 工艺部">{esc(department_text)}</textarea>
+        </label>
+        <p class="muted full">PLM账号匹配到企业微信通讯录，且部门命中该列表时，登录 IP 不在最新加密终端合规 IP 池内即判一级风险。列表外部门暂不跟踪。</p>
+        <div class="full actions"><button class="primary" type="submit">保存覆盖</button></div>
+      </form>
+    </section>
+    <section class="panel">
+      <h2>当前口径</h2>
+      <div class="table-wrap"><table><thead><tr><th>部门</th><th>规则</th></tr></thead><tbody>{"".join(f"<tr><td>{esc(item)}</td><td>不在合规IP池登录PLM判一级风险</td></tr>" for item in departments) or '<tr><td colspan="2" class="muted">暂无强约束部门。</td></tr>'}</tbody></table></div>
+    </section>
+"""
+    return page_shell("PLM登录审计策略", body)
 
 
 def decrypt_records_page(config: AppConfig, message: str = "", error: str = "") -> bytes:
@@ -5343,6 +5414,11 @@ class ReportHandler(BaseHTTPRequestHandler):
                 return
             self.send_html(archive_suffixes_page(self.config))
             return
+        if parsed.path == "/settings/plm-login":
+            if not self.require_admin(session):
+                return
+            self.send_html(plm_login_policy_page(self.config))
+            return
         if parsed.path == "/settings/decrypt-records":
             if not self.require_admin(session):
                 return
@@ -5472,6 +5548,11 @@ class ReportHandler(BaseHTTPRequestHandler):
                 return
             self.handle_archive_suffixes_post(parsed.path, form)
             return
+        if parsed.path.startswith("/settings/plm-login/"):
+            if not self.require_admin(session):
+                return
+            self.handle_plm_login_policy_post(parsed.path, form)
+            return
         if parsed.path.startswith("/settings/decrypt-records/"):
             if not self.require_admin(session):
                 return
@@ -5597,6 +5678,7 @@ class ReportHandler(BaseHTTPRequestHandler):
             "/settings/policy",
             "/settings/internal-targets",
             "/settings/archive-suffixes",
+            "/settings/plm-login",
             "/settings/decrypt-records",
             "/settings/encryption-terminals",
             "/settings/organization-aliases",
@@ -5660,6 +5742,24 @@ class ReportHandler(BaseHTTPRequestHandler):
             doc["archive_suffixes"] = normalize_suffixes(form.get("archive_suffixes") or "")
             write_rule_doc(policy_path(self.config), doc, self.config)
         self.redirect("/settings/archive-suffixes")
+
+    def handle_plm_login_policy_post(self, path: str, form: dict[str, str]) -> None:
+        with RULES_LOCK:
+            if not path.endswith("/save"):
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            departments = normalize_unique_text_list(form.get("constrained_departments") or "")
+            if not departments:
+                self.send_html(plm_login_policy_page(self.config, error="至少保留一个强约束部门。"), HTTPStatus.BAD_REQUEST)
+                return
+            doc = load_policy_doc(self.config)
+            plm_login_audit = doc.get("plm_login_audit")
+            if not isinstance(plm_login_audit, dict):
+                plm_login_audit = {}
+            plm_login_audit["constrained_departments"] = departments
+            doc["plm_login_audit"] = plm_login_audit
+            write_rule_doc(policy_path(self.config), doc, self.config)
+        self.redirect("/settings/plm-login")
 
     def handle_decrypt_records_post(
         self,

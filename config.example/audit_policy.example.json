@@ -50,6 +50,9 @@
     "networks": ["172.88.0.0/16", "172.188.0.0/16"]
   },
   "organization_aliases": [],
+  "plm_login_audit": {
+    "constrained_departments": ["技术部", "研发部", "工艺部"]
+  },
   "auth": {
     "policy_admin_userids": ["10056"],
     "global_viewer_userids": [],
