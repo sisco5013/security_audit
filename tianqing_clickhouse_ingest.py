@@ -24,6 +24,7 @@ from typing import Any, Iterable
 
 import tianqing_external_audit_report as report
 import tianqing_decrypt_records as decrypt_records
+import tianqing_encryption_terminals as encryption_terminals
 
 
 DEFAULT_LOG_FILE = "/data/tianqing-audit/raw-log/tianqing.log"
@@ -243,6 +244,7 @@ def init_db(args: argparse.Namespace) -> None:
     clickhouse_request(args, ASSET_OBSERVATION_TABLE_SQL)
     clickhouse_request(args, ASSET_LATEST_TABLE_SQL)
     clickhouse_request(args, decrypt_records.DECRYPT_TABLE_SQL)
+    clickhouse_request(args, encryption_terminals.TERMINAL_TABLE_SQL)
 
 
 def open_log(path: Path):

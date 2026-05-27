@@ -34,6 +34,7 @@ import urllib.error
 import urllib.request
 
 import tianqing_decrypt_records as decrypt_records
+import tianqing_encryption_terminals as encryption_terminals
 import tianqing_external_audit_report as report_gen
 
 try:
@@ -3740,12 +3741,36 @@ def decrypt_upload_dir() -> Path:
     return Path("/data/tianqing-audit/decrypt-records/uploads")
 
 
+def encryption_terminal_upload_dir() -> Path:
+    return Path("/data/tianqing-audit/encryption-terminals/uploads")
+
+
 def decrypt_query(config: AppConfig, query: str) -> list[dict[str, Any]]:
     if not config.use_clickhouse:
         return []
     args = clickhouse_args(config)
     try:
         decrypt_records.ensure_decrypt_table(args)
+        text = decrypt_records.clickhouse_request(args, query).decode("utf-8", errors="replace")
+    except Exception:
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def encryption_terminal_query(config: AppConfig, query: str) -> list[dict[str, Any]]:
+    if not config.use_clickhouse:
+        return []
+    args = clickhouse_args(config)
+    try:
+        encryption_terminals.ensure_terminal_table(args)
         text = decrypt_records.clickhouse_request(args, query).decode("utf-8", errors="replace")
     except Exception:
         return []
@@ -4061,6 +4086,53 @@ FORMAT JSONEachRow
     )
 
 
+def encryption_terminal_batches(config: AppConfig, limit: int = 20) -> list[dict[str, Any]]:
+    return encryption_terminal_query(
+        config,
+        f"""
+SELECT
+    import_batch,
+    anyLast(source_file) AS source_file,
+    min(import_time) AS import_time,
+    count() AS rows,
+    uniqExactIf(ip_address, ip_address != '') AS ips,
+    uniqExactIf(company, company != '') AS companies
+FROM encryption_terminal_inventory FINAL
+GROUP BY import_batch
+ORDER BY import_time DESC
+LIMIT {int(limit)}
+FORMAT JSONEachRow
+""",
+    )
+
+
+def latest_encryption_terminal_pool(config: AppConfig) -> dict[str, Any]:
+    rows = encryption_terminal_query(
+        config,
+        """
+SELECT
+    any(import_batch) AS import_batch,
+    any(source_file) AS source_file,
+    max(import_time) AS import_time,
+    count() AS rows,
+    uniqExactIf(ip_address, ip_address != '') AS ips,
+    uniqExactIf(company, company != '') AS companies
+FROM encryption_terminal_inventory FINAL
+WHERE import_batch = (
+    SELECT import_batch
+    FROM encryption_terminal_inventory FINAL
+    GROUP BY import_batch
+    ORDER BY max(import_time) DESC
+    LIMIT 1
+)
+FORMAT JSONEachRow
+""",
+    )
+    if not rows or int(rows[0].get("rows") or 0) <= 0:
+        return {}
+    return rows[0]
+
+
 def decrypt_org_candidates(config: AppConfig, policy_doc: dict[str, Any], limit: int = 80) -> list[dict[str, Any]]:
     aliases = decrypt_records.normalize_aliases(policy_doc)
     candidates = decrypt_query(
@@ -4266,6 +4338,10 @@ def settings_page(config: AppConfig) -> bytes:
     decrypt_metric = "未导入"
     if recent_decrypt_batches:
         decrypt_metric = f"{int(recent_decrypt_batches[0].get('rows') or 0)} 条"
+    terminal_pool = latest_encryption_terminal_pool(config)
+    terminal_metric = "未导入"
+    if terminal_pool:
+        terminal_metric = f"{int(terminal_pool.get('ips') or 0)} 个IP"
     body = f"""
     <header>
       <div>
@@ -4315,6 +4391,12 @@ def settings_page(config: AppConfig) -> bytes:
         <p class="metric">{esc(decrypt_metric)}</p>
         <p class="muted">上传加密软件解密/外发申请 Excel，独立追踪标准图纸解密风险。</p>
         <div class="actions"><a class="button primary" href="/settings/decrypt-records">上传解密记录</a></div>
+      </div>
+      <div class="settings-card">
+        <h3>加密终端列表</h3>
+        <p class="metric">{esc(terminal_metric)}</p>
+        <p class="muted">上传加密软件终端清单，最新批次可作为 PLM 等系统合规 IP 池来源。</p>
+        <div class="actions"><a class="button primary" href="/settings/encryption-terminals">上传终端列表</a></div>
       </div>
       <div class="settings-card">
         <h3>组织别名关联</h3>
@@ -4606,6 +4688,68 @@ def decrypt_records_page(config: AppConfig, message: str = "", error: str = "") 
     </section>
 """
     return page_shell("解密记录导入", body)
+
+
+def encryption_terminals_page(config: AppConfig, message: str = "", error: str = "") -> bytes:
+    batches = encryption_terminal_batches(config, 30)
+    latest_pool = latest_encryption_terminal_pool(config)
+    rows = []
+    for item in batches:
+        rows.append(
+            "<tr>"
+            f"<td>{esc(item.get('import_batch') or '-')}</td>"
+            f"<td>{esc(item.get('source_file') or '-')}</td>"
+            f"<td>{esc(item.get('import_time') or '-')}</td>"
+            f"<td>{esc(item.get('rows') or 0)}</td>"
+            f"<td>{esc(item.get('ips') or 0)}</td>"
+            f"<td>{esc(item.get('companies') or 0)}</td>"
+            "</tr>"
+        )
+    batch_table = "".join(rows) or '<tr><td colspan="6" class="muted">暂无导入批次。</td></tr>'
+    pool_text = "尚未导入终端列表"
+    if latest_pool:
+        pool_text = (
+            f"最新批次 {latest_pool.get('import_batch') or '-'}："
+            f"{int(latest_pool.get('ips') or 0)} 个合规 IP，"
+            f"{int(latest_pool.get('rows') or 0)} 条终端记录。"
+        )
+    msg = f'<p class="muted">{esc(message)}</p>' if message else ""
+    error_html = f'<p class="error">{esc(error)}</p>' if error else ""
+    body = f"""
+    <header>
+      <div>
+        <h1>加密终端列表导入</h1>
+        <div class="muted">上传加密软件终端清单 .xlsx；最新导入批次可作为合规 IP 池来源。</div>
+      </div>
+      <div class="actions">
+        <a class="button" href="/settings">策略中心</a>
+        <a class="button" href="/settings/decrypt-records">解密记录导入</a>
+        <a class="button" href="/">当前报告首页</a>
+      </div>
+    </header>
+    {msg}
+    {error_html}
+    <section class="panel">
+      <h2>当前合规 IP 池来源</h2>
+      <p class="metric">{esc(pool_text)}</p>
+      <p class="muted">该页面只维护数据源。PLM 登录审计等模块后续会读取最新批次中的 IP 地址作为合规 IP 池，不使用历史批次叠加。</p>
+    </section>
+    <section class="panel">
+      <h2>上传 Excel</h2>
+      <form method="post" action="/settings/encryption-terminals/upload" enctype="multipart/form-data">
+        <label class="full">终端列表 .xlsx 文件
+          <input name="terminal_file" type="file" multiple accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">
+        </label>
+        <p class="muted full">支持一次选择多个 .xlsx；系统会识别常见表头：IP地址、MAC地址、计算机名、使用人、账号、公司、部门、操作系统、客户端版本、状态、最后在线时间。重复上传会按终端记录指纹去重。</p>
+        <div class="full actions"><button class="primary" type="submit">批量上传并导入</button></div>
+      </form>
+    </section>
+    <section class="panel">
+      <h2>最近导入批次</h2>
+      <div class="table-wrap"><table><thead><tr><th>批次</th><th>源文件</th><th>导入时间</th><th>终端记录</th><th>IP数</th><th>公司数</th></tr></thead><tbody>{batch_table}</tbody></table></div>
+    </section>
+"""
+    return page_shell("加密终端列表导入", body)
 
 
 def alias_row_form(idx: int, item: dict[str, Any]) -> str:
@@ -5048,7 +5192,8 @@ class ReportHandler(BaseHTTPRequestHandler):
         return False
 
     def csrf_upload_fallback_ok(self, path: str, session: AuthSession) -> bool:
-        if path != "/settings/decrypt-records/upload" or session.role != "admin":
+        upload_paths = {"/settings/decrypt-records/upload", "/settings/encryption-terminals/upload"}
+        if path not in upload_paths or session.role != "admin":
             return False
         content_type = self.headers.get("Content-Type", "")
         return content_type.startswith("multipart/form-data") and self.same_origin_request()
@@ -5111,7 +5256,8 @@ class ReportHandler(BaseHTTPRequestHandler):
     def parse_request_form(self, parsed_path: str) -> tuple[dict[str, str], dict[str, list[dict[str, Any]]]] | None:
         length = int(self.headers.get("Content-Length", "0") or "0")
         content_type = self.headers.get("Content-Type", "")
-        limit = MAX_UPLOAD_POST_BYTES if parsed_path == "/settings/decrypt-records/upload" and content_type.startswith("multipart/form-data") else MAX_POST_BYTES
+        upload_paths = {"/settings/decrypt-records/upload", "/settings/encryption-terminals/upload"}
+        limit = MAX_UPLOAD_POST_BYTES if parsed_path in upload_paths and content_type.startswith("multipart/form-data") else MAX_POST_BYTES
         if length > limit:
             self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
             return None
@@ -5201,6 +5347,11 @@ class ReportHandler(BaseHTTPRequestHandler):
             if not self.require_admin(session):
                 return
             self.send_html(decrypt_records_page(self.config))
+            return
+        if parsed.path == "/settings/encryption-terminals":
+            if not self.require_admin(session):
+                return
+            self.send_html(encryption_terminals_page(self.config))
             return
         if parsed.path == "/settings/organization-aliases":
             if not self.require_admin(session):
@@ -5326,6 +5477,11 @@ class ReportHandler(BaseHTTPRequestHandler):
                 return
             self.handle_decrypt_records_post(parsed.path, form, files)
             return
+        if parsed.path.startswith("/settings/encryption-terminals/"):
+            if not self.require_admin(session):
+                return
+            self.handle_encryption_terminals_post(parsed.path, form, files)
+            return
         if parsed.path.startswith("/settings/organization-aliases/"):
             if not self.require_admin(session):
                 return
@@ -5442,6 +5598,7 @@ class ReportHandler(BaseHTTPRequestHandler):
             "/settings/internal-targets",
             "/settings/archive-suffixes",
             "/settings/decrypt-records",
+            "/settings/encryption-terminals",
             "/settings/organization-aliases",
             "/settings/organization-tree",
             "/settings/ai",
@@ -5581,6 +5738,82 @@ class ReportHandler(BaseHTTPRequestHandler):
             f" 明细：{detail}"
         )
         self.send_html(decrypt_records_page(self.config, message=message))
+
+    def handle_encryption_terminals_post(
+        self,
+        path: str,
+        form: dict[str, str],
+        files: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        if not path.endswith("/upload"):
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        uploads = [item for item in files.get("terminal_file", []) if isinstance(item, dict)]
+        if not uploads:
+            self.send_html(encryption_terminals_page(self.config, error="请选择至少一个 .xlsx 文件。"), HTTPStatus.BAD_REQUEST)
+            return
+        day_dir = encryption_terminal_upload_dir() / datetime.now().strftime("%Y%m%d")
+        summaries: list[encryption_terminals.TerminalImportSummary] = []
+        failures: list[str] = []
+        try:
+            day_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self.send_html(
+                encryption_terminals_page(self.config, error=f"上传目录不可用：{type(exc).__name__}: {str(exc)[:240]}"),
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        for idx, uploaded in enumerate(uploads, 1):
+            original_filename = safe_upload_filename(str(uploaded.get("filename") or ""))
+            content = uploaded.get("content")
+            if not original_filename.lower().endswith(".xlsx"):
+                failures.append(f"{original_filename or '未命名文件'}：仅支持 .xlsx")
+                continue
+            if not isinstance(content, (bytes, bytearray)) or not content:
+                failures.append(f"{original_filename}：文件为空")
+                continue
+            batch_id = datetime.now().strftime("%Y%m%d%H%M%S") + f"-{idx:02d}-" + secrets.token_hex(4)
+            dest = day_dir / f"{batch_id}_{original_filename}"
+            try:
+                dest.write_bytes(bytes(content))
+                dest.chmod(0o640)
+                summary = encryption_terminals.import_terminal_workbook(
+                    clickhouse_args(self.config),
+                    dest,
+                    original_filename,
+                    batch_id,
+                )
+                summaries.append(summary)
+            except Exception as exc:
+                failures.append(f"{original_filename}：{type(exc).__name__}: {str(exc)[:180]}")
+
+        if not summaries:
+            self.send_html(
+                encryption_terminals_page(self.config, error="导入失败：" + "；".join(failures[:8])),
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        total_rows = sum(summary.total_rows for summary in summaries)
+        inserted_rows = sum(summary.inserted_rows for summary in summaries)
+        duplicate_rows = sum(summary.duplicate_rows for summary in summaries)
+        valid_ip_rows = sum(summary.valid_ip_rows for summary in summaries)
+        unique_ips = sum(summary.unique_ips for summary in summaries)
+        missing_ip_rows = sum(summary.missing_ip_rows for summary in summaries)
+        detail = "；".join(
+            f"{summary.source_file}: 新增 {summary.inserted_rows}, IP {summary.unique_ips}, 重复 {summary.duplicate_rows}"
+            for summary in summaries[:6]
+        )
+        if len(summaries) > 6:
+            detail += f"；另 {len(summaries) - 6} 个文件"
+        failure_text = f"；失败 {len(failures)} 个：{'；'.join(failures[:4])}" if failures else ""
+        message = (
+            f"终端列表导入完成：成功 {len(summaries)} 个文件{failure_text}；"
+            f"总行数 {total_rows}，新增 {inserted_rows}，重复 {duplicate_rows}；"
+            f"有效IP行 {valid_ip_rows}，唯一IP合计 {unique_ips}，缺IP行 {missing_ip_rows}。"
+            f" 明细：{detail}"
+        )
+        self.send_html(encryption_terminals_page(self.config, message=message))
 
     def handle_organization_alias_post(self, path: str, form: dict[str, str]) -> None:
         with RULES_LOCK:

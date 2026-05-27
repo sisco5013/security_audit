@@ -29,6 +29,7 @@ APP_FILES=(
   tianqing_external_audit_report.py
   tianqing_clickhouse_ingest.py
   tianqing_decrypt_records.py
+  tianqing_encryption_terminals.py
   generate_tianqing_period_report.sh
   backfill_tianqing_archives.sh
   people_mapping.csv

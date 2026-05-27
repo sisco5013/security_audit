@@ -15,7 +15,7 @@ The repository intentionally excludes runtime and audit evidence data:
 - Generated HTML reports under `reports/`.
 - WeCom directory cache.
 - Real audit policy, sensitive keywords, exclusions, people mapping, recipient mapping, and disposition files.
-- Excel decrypt records and imported evidence.
+- Excel decrypt records, encryption terminal inventory exports, and imported evidence.
 - Local `.env`, sessions, logs, locks, and temporary files.
 
 Production runtime configuration should live outside the app code directory, for example:
@@ -24,6 +24,7 @@ Production runtime configuration should live outside the app code directory, for
 /data/tianqing-audit/config/audit_policy.json
 /data/tianqing-audit/config/sensitive_keywords.json
 /data/tianqing-audit/config/audit_exclusions.json
+/data/tianqing-audit/encryption-terminals/uploads/
 ```
 
 The Web service and report scripts support these environment variables:

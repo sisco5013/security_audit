@@ -39,3 +39,4 @@ wecom_directory_cache.json
 # Local data volumes / imported decrypt records
 data/
 decrypt-records/
+encryption-terminals/
