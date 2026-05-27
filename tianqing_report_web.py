@@ -163,6 +163,7 @@ AUTH_PROXY_TOKEN_FILE = ".auth_proxy_token"
 AUTH_SESSION_FILE = ".auth_sessions.json"
 DEFAULT_POLICY_ADMIN_USERIDS = [FIXED_POLICY_ADMIN_USERID]
 DEFAULT_PLM_CONSTRAINED_DEPARTMENTS = ["技术部", "研发部", "工艺部"]
+DEFAULT_PLM_TERMINAL_MATCH_FIELDS = ["ip_address", "computer_name"]
 
 
 @dataclass
@@ -3250,7 +3251,10 @@ def load_policy_doc(config: AppConfig) -> dict[str, Any]:
             "archive_suffixes": DEFAULT_ARCHIVE_SUFFIXES,
             "organization_aliases": [],
             "internal_targets": {"domains": ["daqo.com"], "networks": ["172.88.0.0/16", "172.188.0.0/16"]},
-            "plm_login_audit": {"constrained_departments": DEFAULT_PLM_CONSTRAINED_DEPARTMENTS},
+            "plm_login_audit": {
+                "constrained_departments": DEFAULT_PLM_CONSTRAINED_DEPARTMENTS,
+                "terminal_match_fields": DEFAULT_PLM_TERMINAL_MATCH_FIELDS,
+            },
             "ai_analysis": {"prompt_template": DEFAULT_AI_PROMPT_TEMPLATE},
             "auth": {
                 "policy_admin_userids": DEFAULT_POLICY_ADMIN_USERIDS,
@@ -3298,6 +3302,11 @@ def load_policy_doc(config: AppConfig) -> dict[str, Any]:
     if not isinstance(constrained_departments, list):
         constrained_departments = DEFAULT_PLM_CONSTRAINED_DEPARTMENTS
     plm_login_audit["constrained_departments"] = normalize_unique_text_list(constrained_departments)
+    match_fields = plm_login_audit.get("terminal_match_fields")
+    if not isinstance(match_fields, list):
+        match_fields = DEFAULT_PLM_TERMINAL_MATCH_FIELDS
+    normalized_match_fields = [item for item in normalize_unique_text_list(match_fields) if item in DEFAULT_PLM_TERMINAL_MATCH_FIELDS]
+    plm_login_audit["terminal_match_fields"] = normalized_match_fields or DEFAULT_PLM_TERMINAL_MATCH_FIELDS
     loaded["plm_login_audit"] = plm_login_audit
     ai_analysis = loaded.get("ai_analysis")
     if not isinstance(ai_analysis, dict):
@@ -4126,8 +4135,9 @@ SELECT
     anyLast(source_file) AS source_file,
     min(import_time) AS import_time,
     count() AS rows,
-    uniqExactIf(ip_address, ip_address != '') AS ips,
-    uniqExactIf(company, company != '') AS companies
+    uniqExactIf(tuple(ip_address, computer_name), notEmpty(ip_address) AND notEmpty(computer_name)) AS terminal_keys,
+    uniqExactIf(ip_address, notEmpty(ip_address)) AS ips,
+    uniqExactIf(company, notEmpty(company)) AS companies
 FROM encryption_terminal_inventory FINAL
 GROUP BY import_batch
 ORDER BY import_time DESC
@@ -4146,6 +4156,7 @@ SELECT
     anyLast(source_file) AS source_file,
     max(import_time) AS import_time,
     count() AS rows,
+    uniqExactIf(tuple(ip_address, computer_name), notEmpty(ip_address) AND notEmpty(computer_name)) AS terminal_keys,
     uniqExactIf(ip_address, notEmpty(ip_address)) AS ips,
     uniqExactIf(company, notEmpty(company)) AS companies
 FROM encryption_terminal_inventory FINAL
@@ -4369,7 +4380,7 @@ def settings_page(config: AppConfig) -> bytes:
     terminal_pool = latest_encryption_terminal_pool(config)
     terminal_metric = "未导入"
     if terminal_pool:
-        terminal_metric = f"{int(terminal_pool.get('ips') or 0)} 个IP"
+        terminal_metric = f"{int(terminal_pool.get('terminal_keys') or 0)} 个终端键"
     body = f"""
     <header>
       <div>
@@ -4447,7 +4458,7 @@ def settings_page(config: AppConfig) -> bytes:
           <div>
             <p class="settings-group-kicker">DATA SOURCES</p>
             <h2>解密与 PLM 数据源</h2>
-            <p class="muted">维护加密软件解密记录、合规 IP 池和 PLM 登录审计的强约束部门。</p>
+            <p class="muted">维护加密软件解密记录、合规终端池和 PLM 登录审计的强约束部门。</p>
           </div>
         </div>
         <div class="settings-grid">
@@ -4460,13 +4471,13 @@ def settings_page(config: AppConfig) -> bytes:
       <div class="settings-card">
         <h3>加密终端列表</h3>
         <p class="metric">{esc(terminal_metric)}</p>
-        <p class="muted">上传加密软件终端清单，最新批次可作为 PLM 等系统合规 IP 池来源。</p>
+        <p class="muted">上传加密软件终端清单，最新批次按 IP+计算机名作为 PLM 合规终端池来源。</p>
         <div class="actions"><a class="button primary" href="/settings/encryption-terminals">上传终端列表</a></div>
       </div>
       <div class="settings-card">
         <h3>PLM登录审计策略</h3>
         <p class="metric">{len(plm_departments)} 个部门</p>
-        <p class="muted">仅跟踪强约束部门账号；不在加密终端IP池登录时判一级风险。</p>
+        <p class="muted">仅跟踪强约束部门账号；登录终端不在加密终端池时判一级风险。</p>
         <div class="actions"><a class="button primary" href="/settings/plm-login">维护PLM策略</a></div>
       </div>
         </div>
@@ -4706,6 +4717,7 @@ def plm_login_policy_page(config: AppConfig, message: str = "", error: str = "")
     doc = load_policy_doc(config)
     plm = doc.get("plm_login_audit") if isinstance(doc.get("plm_login_audit"), dict) else {}
     departments = normalize_unique_text_list(plm.get("constrained_departments") or DEFAULT_PLM_CONSTRAINED_DEPARTMENTS)
+    terminal_match_fields = normalize_unique_text_list(plm.get("terminal_match_fields") or DEFAULT_PLM_TERMINAL_MATCH_FIELDS)
     department_text = ", ".join(departments)
     msg = f'<p class="muted">{esc(message)}</p>' if message else ""
     err = f'<p class="note error">{esc(error)}</p>' if error else ""
@@ -4713,7 +4725,7 @@ def plm_login_policy_page(config: AppConfig, message: str = "", error: str = "")
     <header>
       <div>
         <h1>PLM登录审计策略</h1>
-        <div class="muted">定义需要强制使用加密终端合规 IP 池登录 PLM 的部门范围。</div>
+        <div class="muted">定义需要强制使用加密终端合规终端池登录 PLM 的部门范围。</div>
       </div>
       <div class="actions">
         <a class="button" href="/settings">策略中心</a>
@@ -4729,13 +4741,14 @@ def plm_login_policy_page(config: AppConfig, message: str = "", error: str = "")
         <label class="full">部门名称，逗号分隔
           <textarea name="constrained_departments" spellcheck="false" placeholder="技术部, 研发部, 工艺部">{esc(department_text)}</textarea>
         </label>
-        <p class="muted full">PLM账号匹配到企业微信通讯录，且部门命中该列表时，登录 IP 不在最新加密终端合规 IP 池内即判一级风险。列表外部门暂不跟踪。</p>
+        <p class="muted full">PLM账号匹配到企业微信通讯录，且部门命中该列表时，登录 IP + 计算机名不在最新加密终端合规终端池内即判一级风险。列表外部门暂不跟踪。</p>
         <div class="full actions"><button class="primary" type="submit">保存覆盖</button></div>
       </form>
     </section>
     <section class="panel">
       <h2>当前口径</h2>
-      <div class="table-wrap"><table><thead><tr><th>部门</th><th>规则</th></tr></thead><tbody>{"".join(f"<tr><td>{esc(item)}</td><td>不在合规IP池登录PLM判一级风险</td></tr>" for item in departments) or '<tr><td colspan="2" class="muted">暂无强约束部门。</td></tr>'}</tbody></table></div>
+      <p class="muted">合规终端键：{esc(' + '.join(terminal_match_fields))}。PLM 登录接口接入后会按该键匹配最新加密终端批次。</p>
+      <div class="table-wrap"><table><thead><tr><th>部门</th><th>规则</th></tr></thead><tbody>{"".join(f"<tr><td>{esc(item)}</td><td>登录IP+计算机名不在合规终端池判一级风险</td></tr>" for item in departments) or '<tr><td colspan="2" class="muted">暂无强约束部门。</td></tr>'}</tbody></table></div>
     </section>
 """
     return page_shell("PLM登录审计策略", body)
@@ -4801,16 +4814,18 @@ def encryption_terminals_page(config: AppConfig, message: str = "", error: str =
             f"<td>{esc(item.get('source_file') or '-')}</td>"
             f"<td>{esc(item.get('import_time') or '-')}</td>"
             f"<td>{esc(item.get('rows') or 0)}</td>"
+            f"<td>{esc(item.get('terminal_keys') or 0)}</td>"
             f"<td>{esc(item.get('ips') or 0)}</td>"
             f"<td>{esc(item.get('companies') or 0)}</td>"
             "</tr>"
         )
-    batch_table = "".join(rows) or '<tr><td colspan="6" class="muted">暂无导入批次。</td></tr>'
+    batch_table = "".join(rows) or '<tr><td colspan="7" class="muted">暂无导入批次。</td></tr>'
     pool_text = "尚未导入终端列表"
     if latest_pool:
         pool_text = (
             f"最新批次 {latest_pool.get('import_batch') or '-'}："
-            f"{int(latest_pool.get('ips') or 0)} 个合规 IP，"
+            f"{int(latest_pool.get('terminal_keys') or 0)} 个合规终端键，"
+            f"{int(latest_pool.get('ips') or 0)} 个去重 IP，"
             f"{int(latest_pool.get('rows') or 0)} 条终端记录。"
         )
     msg = f'<p class="muted">{esc(message)}</p>' if message else ""
@@ -4819,7 +4834,7 @@ def encryption_terminals_page(config: AppConfig, message: str = "", error: str =
     <header>
       <div>
         <h1>加密终端列表导入</h1>
-        <div class="muted">上传加密软件终端清单 .xlsx；最新导入批次可作为合规 IP 池来源。</div>
+        <div class="muted">上传加密软件终端清单 .xlsx；最新导入批次按 IP + 计算机名作为合规终端池来源。</div>
       </div>
       <div class="actions">
         <a class="button" href="/settings">策略中心</a>
@@ -4830,9 +4845,9 @@ def encryption_terminals_page(config: AppConfig, message: str = "", error: str =
     {msg}
     {error_html}
     <section class="panel">
-      <h2>当前合规 IP 池来源</h2>
+      <h2>当前合规终端池来源</h2>
       <p class="metric">{esc(pool_text)}</p>
-      <p class="muted">该页面只维护数据源。PLM 登录审计等模块后续会读取最新批次中的 IP 地址作为合规 IP 池，不使用历史批次叠加。</p>
+      <p class="muted">该页面只维护数据源。PLM 登录审计等模块后续会读取最新批次中的 `IP地址 + 计算机名` 作为合规终端键，不使用历史批次叠加；若 PLM 登录记录缺少计算机名，应单独标记为待复核，不按纯 IP 自动放行。</p>
     </section>
     <section class="panel">
       <h2>上传 Excel</h2>
@@ -4846,7 +4861,7 @@ def encryption_terminals_page(config: AppConfig, message: str = "", error: str =
     </section>
     <section class="panel">
       <h2>最近导入批次</h2>
-      <div class="table-wrap"><table><thead><tr><th>批次</th><th>源文件</th><th>导入时间</th><th>终端记录</th><th>IP数</th><th>公司数</th></tr></thead><tbody>{batch_table}</tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>批次</th><th>源文件</th><th>导入时间</th><th>终端记录</th><th>终端键</th><th>IP数</th><th>公司数</th></tr></thead><tbody>{batch_table}</tbody></table></div>
     </section>
 """
     return page_shell("加密终端列表导入", body)
@@ -5786,6 +5801,7 @@ class ReportHandler(BaseHTTPRequestHandler):
             if not isinstance(plm_login_audit, dict):
                 plm_login_audit = {}
             plm_login_audit["constrained_departments"] = departments
+            plm_login_audit["terminal_match_fields"] = DEFAULT_PLM_TERMINAL_MATCH_FIELDS
             doc["plm_login_audit"] = plm_login_audit
             write_rule_doc(policy_path(self.config), doc, self.config)
         self.redirect("/settings/plm-login")
@@ -5928,9 +5944,10 @@ class ReportHandler(BaseHTTPRequestHandler):
         duplicate_rows = sum(summary.duplicate_rows for summary in summaries)
         valid_ip_rows = sum(summary.valid_ip_rows for summary in summaries)
         unique_ips = sum(summary.unique_ips for summary in summaries)
+        unique_terminal_keys = sum(summary.unique_terminal_keys for summary in summaries)
         missing_ip_rows = sum(summary.missing_ip_rows for summary in summaries)
         detail = "；".join(
-            f"{summary.source_file}: 新增 {summary.inserted_rows}, IP {summary.unique_ips}, 重复 {summary.duplicate_rows}"
+            f"{summary.source_file}: 新增 {summary.inserted_rows}, 终端键 {summary.unique_terminal_keys}, IP {summary.unique_ips}, 重复 {summary.duplicate_rows}"
             for summary in summaries[:6]
         )
         if len(summaries) > 6:
@@ -5939,7 +5956,7 @@ class ReportHandler(BaseHTTPRequestHandler):
         message = (
             f"终端列表导入完成：成功 {len(summaries)} 个文件{failure_text}；"
             f"总行数 {total_rows}，新增 {inserted_rows}，重复 {duplicate_rows}；"
-            f"有效IP行 {valid_ip_rows}，唯一IP合计 {unique_ips}，缺IP行 {missing_ip_rows}。"
+            f"有效IP行 {valid_ip_rows}，合规终端键合计 {unique_terminal_keys}，唯一IP合计 {unique_ips}，缺IP行 {missing_ip_rows}。"
             f" 明细：{detail}"
         )
         self.send_html(encryption_terminals_page(self.config, message=message))

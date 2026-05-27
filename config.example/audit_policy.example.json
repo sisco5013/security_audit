@@ -51,7 +51,8 @@
   },
   "organization_aliases": [],
   "plm_login_audit": {
-    "constrained_departments": ["技术部", "研发部", "工艺部"]
+    "constrained_departments": ["技术部", "研发部", "工艺部"],
+    "terminal_match_fields": ["ip_address", "computer_name"]
   },
   "auth": {
     "policy_admin_userids": ["10056"],

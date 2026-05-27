@@ -76,6 +76,7 @@ class TerminalImportSummary:
     duplicate_rows: int = 0
     valid_ip_rows: int = 0
     unique_ips: int = 0
+    unique_terminal_keys: int = 0
     missing_ip_rows: int = 0
     errors: list[str] = field(default_factory=list)
 
@@ -240,12 +241,16 @@ def import_terminal_workbook(
     existing = existing_terminal_fingerprints(args, fingerprints)
     seen_in_file: set[str] = set()
     unique_ips: set[str] = set()
+    unique_terminal_keys: set[tuple[str, str]] = set()
     payload: list[dict[str, Any]] = []
     for row, fingerprint in zip(parsed_rows, fingerprints):
         ip = xlsx.normalize_text(row.get("ip_address"))
+        computer_name = xlsx.normalize_text(row.get("computer_name"))
         if ip:
             summary.valid_ip_rows += 1
             unique_ips.add(ip)
+            if computer_name:
+                unique_terminal_keys.add((ip, computer_name))
         else:
             summary.missing_ip_rows += 1
         if fingerprint in existing or fingerprint in seen_in_file:
@@ -263,7 +268,7 @@ def import_terminal_workbook(
                 "terminal_fingerprint": fingerprint,
                 "ip_address": ip,
                 "mac_address": xlsx.normalize_text(row.get("mac_address")),
-                "computer_name": xlsx.normalize_text(row.get("computer_name")),
+                "computer_name": computer_name,
                 "user_account": xlsx.normalize_text(row.get("user_account")),
                 "user_name": xlsx.normalize_text(row.get("user_name")),
                 "company": xlsx.normalize_text(row.get("company")),
@@ -278,6 +283,7 @@ def import_terminal_workbook(
     insert_terminal_rows(args, payload)
     summary.inserted_rows = len(payload)
     summary.unique_ips = len(unique_ips)
+    summary.unique_terminal_keys = len(unique_terminal_keys)
     return summary
 
 
