@@ -56,12 +56,12 @@ FIELD_ALIASES = {
     "ip_address": ["IP", "IP地址", "终端IP", "客户端IP", "设备IP", "主机IP", "登录IP", "IP Address"],
     "mac_address": ["MAC", "MAC地址", "物理地址", "网卡地址", "终端MAC", "MAC Address"],
     "computer_name": ["计算机名", "电脑名", "主机名", "终端名称", "设备名称", "机器名", "主机名称", "Computer Name"],
-    "user_account": ["账号", "用户账号", "登录账号", "域账号", "员工账号", "使用人账号", "User Account"],
-    "user_name": ["使用人", "用户名", "姓名", "用户姓名", "员工姓名", "终端使用人", "User Name"],
+    "user_account": ["账号", "用户账号", "登录账号", "域账号", "员工账号", "使用人账号", "资产责任者账号", "User Account"],
+    "user_name": ["使用人", "用户名", "姓名", "用户姓名", "员工姓名", "终端使用人", "资产责任者", "User Name"],
     "company": ["公司", "所属公司", "单位", "所属单位", "组织", "组织名称", "Company"],
     "department": ["部门", "所属部门", "用户部门", "Department"],
-    "os_version": ["操作系统", "操作系统版本", "OS", "系统版本", "OS Version"],
-    "client_version": ["客户端版本", "加密软件版本", "软件版本", "Agent版本", "终端版本", "Client Version"],
+    "os_version": ["操作系统", "操作系统版本", "操作系统类型", "OS", "系统版本", "OS Version"],
+    "client_version": ["客户端版本", "加密软件版本", "软件版本", "版本号", "Agent版本", "终端版本", "Client Version"],
     "encryption_status": ["状态", "加密状态", "客户端状态", "在线状态", "管控状态", "Status"],
     "last_seen": ["最后在线时间", "最近在线时间", "最后登录时间", "更新时间", "最近通讯时间", "在线时间", "Last Seen"],
 }
@@ -138,6 +138,20 @@ def parse_terminal_dt(value: Any) -> datetime | None:
     return datetime(1899, 12, 30) + timedelta(days=serial)
 
 
+def split_terminal_org_path(value: Any) -> tuple[str, str]:
+    text = xlsx.normalize_text(value)
+    if not text:
+        return "", ""
+    parts = [part.strip() for part in text.split("/") if part.strip()]
+    if len(parts) >= 3 and parts[0] == "大全集团":
+        return parts[1], parts[-1]
+    if len(parts) >= 2 and parts[0] == "大全集团":
+        return parts[0], parts[-1]
+    if len(parts) >= 2:
+        return parts[0], parts[-1]
+    return "", text
+
+
 def parse_terminal_workbook(path: Path) -> tuple[list[str], list[dict[str, Any]]]:
     iterator = iter(xlsx.iter_xlsx_rows(path))
     try:
@@ -158,6 +172,12 @@ def parse_terminal_workbook(path: Path) -> tuple[list[str], list[dict[str, Any]]
         item["ip_address"] = normalize_ip(item.get("ip_address"))
         item["mac_address"] = normalize_mac(item.get("mac_address"))
         item["last_seen"] = parse_terminal_dt(item.get("last_seen"))
+        if not xlsx.normalize_text(item.get("company")):
+            company, department = split_terminal_org_path(item.get("department"))
+            if company:
+                item["company"] = company
+            if department:
+                item["department"] = department
         rows.append(item)
     return headers, rows
 

@@ -4142,27 +4142,22 @@ def latest_encryption_terminal_pool(config: AppConfig) -> dict[str, Any]:
         config,
         """
 SELECT
-    any(import_batch) AS import_batch,
-    any(source_file) AS source_file,
+    import_batch,
+    anyLast(source_file) AS source_file,
     max(import_time) AS import_time,
     count() AS rows,
-    uniqExactIf(ip_address, ip_address != '') AS ips,
-    uniqExactIf(company, company != '') AS companies
+    uniqExactIf(ip_address, notEmpty(ip_address)) AS ips,
+    uniqExactIf(company, notEmpty(company)) AS companies
 FROM encryption_terminal_inventory FINAL
-WHERE import_batch = (
-    SELECT import_batch
-    FROM encryption_terminal_inventory FINAL
-    GROUP BY import_batch
-    ORDER BY max(import_time) DESC
-    LIMIT 1
-)
+GROUP BY import_batch
+ORDER BY import_time DESC
+LIMIT 1
 FORMAT JSONEachRow
 """,
     )
     if not rows or int(rows[0].get("rows") or 0) <= 0:
         return {}
     return rows[0]
-
 
 def decrypt_org_candidates(config: AppConfig, policy_doc: dict[str, Any], limit: int = 80) -> list[dict[str, Any]]:
     aliases = decrypt_records.normalize_aliases(policy_doc)
