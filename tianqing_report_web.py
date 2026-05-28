@@ -1407,10 +1407,6 @@ def inject_global_management_summary(data: bytes, config: AppConfig | None = Non
         if live_metrics:
             decrypt_metrics = live_metrics
     tianqing_metrics = _fallback_tianqing_management_metrics(text)
-    if config is not None and period:
-        live_tianqing_metrics = _live_tianqing_management_metrics(config, period[0], period[1])
-        if live_tianqing_metrics:
-            tianqing_metrics = live_tianqing_metrics
     review_metrics = (
         _terminal_review_management_metrics(config, period[0], period[1])
         if config is not None and period
