@@ -282,6 +282,17 @@ def is_external_mailbox(mailbox: str) -> bool:
     return bool(domain and domain != "daqo.com")
 
 
+def candidate_scope_event(event: dict[str, Any]) -> bool:
+    channel = display_channel(event)
+    reasons = {str(reason) for reason in event.get("reasons") or []}
+    relation = str(event.get("recipient_relation") or "").strip().lower()
+    if channel == "内部系统上传" or "内部系统上传" in reasons:
+        return False
+    if relation == "internal":
+        return False
+    return True
+
+
 def event_object_counts(event: dict[str, Any], three_d: set[str], two_d: set[str], archives: set[str], patterns: list[tuple[str, re.Pattern[str]]]) -> Counter:
     counts: Counter = Counter()
     names = [str(item) for item in event.get("file_names") or []]
@@ -325,6 +336,9 @@ WHERE ts >= parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
   AND ts < parseDateTime64BestEffort({ch_quote(end.isoformat())}, 3)
   AND topic IN ('mail_audit','im_audit','file_audit')
   AND length(file_names) > 0
+  AND recipient_relation != 'internal'
+  AND channel != '内部系统上传'
+  AND NOT has(reasons, '内部系统上传')
   AND (
       hasAny(file_exts, {ch_array(signal_exts)})
       OR hasAny(reasons, ['外设拷贝','外部站点上传','外部上传/下载地址','个人邮箱域名','外部收件域名','网盘/高风险外联目标'])
@@ -339,7 +353,8 @@ FORMAT JSONEachRow
             continue
         row = json.loads(line)
         row["parsed_ts"] = parse_ts(row.get("ts"))
-        events.append(row)
+        if candidate_scope_event(row):
+            events.append(row)
     return events
 
 
@@ -378,6 +393,9 @@ WHERE ts >= parseDateTime64BestEffort({ch_quote(baseline_start.isoformat())}, 3)
   AND ts < parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
   AND topic IN ('mail_audit','im_audit','file_audit')
   AND length(file_names) > 0
+  AND recipient_relation != 'internal'
+  AND channel != '内部系统上传'
+  AND NOT has(reasons, '内部系统上传')
   AND (hasAny(file_exts, {ch_array(signal_exts)}) OR hasAny(reasons, ['外设拷贝','外部站点上传','外部上传/下载地址','个人邮箱域名','外部收件域名','网盘/高风险外联目标']) OR level = 'HIGH')
 GROUP BY client_name, client_ip
 FORMAT JSONEachRow
