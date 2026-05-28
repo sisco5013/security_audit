@@ -167,6 +167,28 @@ DEFAULT_PLM_TERMINAL_MATCH_FIELDS = ["ip_address", "computer_name"]
 ENCRYPTION_TERMINAL_TRUST_DAYS = 7
 
 
+def encryption_terminal_trust_condition(prefix: str = "") -> str:
+    base = f"{prefix}." if prefix else ""
+    return (
+        f"notEmpty({base}ip_address) "
+        f"AND notEmpty({base}computer_name) "
+        f"AND NOT isNull({base}last_seen) "
+        f"AND {base}last_seen >= now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY"
+    )
+
+
+def encryption_terminal_trust_status_sql(prefix: str = "") -> str:
+    base = f"{prefix}." if prefix else ""
+    return (
+        "multiIf("
+        f"empty({base}ip_address), '缺少IP地址', "
+        f"empty({base}computer_name), '缺少计算机名', "
+        f"isNull({base}last_seen), '无最后在线时间', "
+        f"{base}last_seen < now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY, '最后在线超过{ENCRYPTION_TERMINAL_TRUST_DAYS}天', "
+        "'授信有效')"
+    )
+
+
 @dataclass
 class AppConfig:
     host: str
@@ -4183,6 +4205,7 @@ FORMAT JSONEachRow
 
 
 def encryption_terminal_batches(config: AppConfig, limit: int = 20) -> list[dict[str, Any]]:
+    trust_condition = encryption_terminal_trust_condition()
     return encryption_terminal_query(
         config,
         f"""
@@ -4192,10 +4215,11 @@ SELECT
     min(import_time) AS import_time,
     count() AS rows,
     uniqExactIf(tuple(ip_address, computer_name), notEmpty(ip_address) AND notEmpty(computer_name)) AS terminal_keys,
-    uniqExactIf(tuple(ip_address, computer_name), notEmpty(ip_address) AND notEmpty(computer_name) AND last_seen >= now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY) AS trusted_terminal_keys,
+    uniqExactIf(tuple(ip_address, computer_name), {trust_condition}) AS trusted_terminal_keys,
     uniqExactIf(ip_address, notEmpty(ip_address)) AS ips,
-    uniqExactIf(ip_address, notEmpty(ip_address) AND last_seen >= now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY) AS trusted_ips,
-    countIf(isNull(last_seen) OR last_seen < now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY) AS expired_rows,
+    uniqExactIf(ip_address, {trust_condition}) AS trusted_ips,
+    countIf(NOT ({trust_condition})) AS excluded_rows,
+    countIf((isNull(last_seen) OR last_seen < now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY) AND notEmpty(ip_address) AND notEmpty(computer_name)) AS expired_rows,
     uniqExactIf(company, notEmpty(company)) AS companies
 FROM encryption_terminal_inventory FINAL
 GROUP BY import_batch
@@ -4207,6 +4231,7 @@ FORMAT JSONEachRow
 
 
 def latest_encryption_terminal_pool(config: AppConfig) -> dict[str, Any]:
+    trust_condition = encryption_terminal_trust_condition()
     rows = encryption_terminal_query(
         config,
         f"""
@@ -4216,10 +4241,11 @@ SELECT
     max(import_time) AS import_time,
     count() AS rows,
     uniqExactIf(tuple(ip_address, computer_name), notEmpty(ip_address) AND notEmpty(computer_name)) AS terminal_keys,
-    uniqExactIf(tuple(ip_address, computer_name), notEmpty(ip_address) AND notEmpty(computer_name) AND last_seen >= now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY) AS trusted_terminal_keys,
+    uniqExactIf(tuple(ip_address, computer_name), {trust_condition}) AS trusted_terminal_keys,
     uniqExactIf(ip_address, notEmpty(ip_address)) AS ips,
-    uniqExactIf(ip_address, notEmpty(ip_address) AND last_seen >= now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY) AS trusted_ips,
-    countIf(isNull(last_seen) OR last_seen < now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY) AS expired_rows,
+    uniqExactIf(ip_address, {trust_condition}) AS trusted_ips,
+    countIf(NOT ({trust_condition})) AS excluded_rows,
+    countIf((isNull(last_seen) OR last_seen < now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY) AND notEmpty(ip_address) AND notEmpty(computer_name)) AS expired_rows,
     uniqExactIf(company, notEmpty(company)) AS companies
 FROM encryption_terminal_inventory FINAL
 GROUP BY import_batch
@@ -4242,6 +4268,8 @@ def encryption_terminal_duplicates(config: AppConfig, batch_id: str, limit: int 
     if not batch_id:
         return []
     quoted_batch = decrypt_records.clickhouse_quote(batch_id)
+    trust_condition = encryption_terminal_trust_condition()
+    trust_status_sql = encryption_terminal_trust_status_sql()
     return encryption_terminal_query(
         config,
         f"""
@@ -4275,10 +4303,10 @@ FROM
         client_version,
         encryption_status,
         last_seen,
-        if(last_seen >= now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY, 1, 0) AS is_trusted,
-        multiIf(isNull(last_seen), '无最后在线时间', last_seen < now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY, '超过{ENCRYPTION_TERMINAL_TRUST_DAYS}天未在线', '授信有效') AS trust_status
+        if({trust_condition}, 1, 0) AS is_trusted,
+        {trust_status_sql} AS trust_status
     FROM encryption_terminal_inventory FINAL
-    WHERE import_batch = {quoted_batch} AND notEmpty(ip_address)
+    WHERE import_batch = {quoted_batch} AND {trust_condition}
 ) AS t
 INNER JOIN
 (
@@ -4287,7 +4315,7 @@ INNER JOIN
         count() AS ip_rows,
         uniqExactIf(tuple(ip_address, computer_name), notEmpty(computer_name)) AS terminal_keys
     FROM encryption_terminal_inventory FINAL
-    WHERE import_batch = {quoted_batch} AND notEmpty(ip_address)
+    WHERE import_batch = {quoted_batch} AND {trust_condition}
     GROUP BY ip_address
     HAVING ip_rows > 1
 ) AS d USING ip_address
@@ -4308,6 +4336,7 @@ def encryption_terminal_duplicate_ip_count(config: AppConfig, batch_id: str) -> 
     if not batch_id:
         return 0
     quoted_batch = decrypt_records.clickhouse_quote(batch_id)
+    trust_condition = encryption_terminal_trust_condition()
     rows = encryption_terminal_query(
         config,
         f"""
@@ -4316,7 +4345,7 @@ FROM
 (
     SELECT ip_address
     FROM encryption_terminal_inventory FINAL
-    WHERE import_batch = {quoted_batch} AND notEmpty(ip_address)
+    WHERE import_batch = {quoted_batch} AND {trust_condition}
     GROUP BY ip_address
     HAVING count() > 1
 )
@@ -4326,17 +4355,28 @@ FORMAT JSONEachRow
     return int(rows[0].get("rows") or 0) if rows else 0
 
 
-def encryption_terminal_count(config: AppConfig, batch_id: str, duplicate_ip_only: bool = False) -> int:
+def encryption_terminal_count(
+    config: AppConfig,
+    batch_id: str,
+    duplicate_ip_only: bool = False,
+    trust_state: str = "all",
+) -> int:
     if not batch_id:
         return 0
     quoted_batch = decrypt_records.clickhouse_quote(batch_id)
+    trust_condition = encryption_terminal_trust_condition()
+    state_filter = ""
+    if trust_state == "trusted":
+        state_filter = f"AND {trust_condition}"
+    elif trust_state == "excluded":
+        state_filter = f"AND NOT ({trust_condition})"
     duplicate_filter = ""
     if duplicate_ip_only:
         duplicate_filter = f"""
 AND ip_address IN (
     SELECT ip_address
     FROM encryption_terminal_inventory FINAL
-    WHERE import_batch = {quoted_batch} AND notEmpty(ip_address)
+    WHERE import_batch = {quoted_batch} AND {trust_condition}
     GROUP BY ip_address
     HAVING count() > 1
 )
@@ -4347,6 +4387,7 @@ AND ip_address IN (
 SELECT count() AS rows
 FROM encryption_terminal_inventory FINAL
 WHERE import_batch = {quoted_batch}
+{state_filter}
 {duplicate_filter}
 FORMAT JSONEachRow
 """,
@@ -4360,6 +4401,7 @@ def encryption_terminal_records(
     page: int = 1,
     page_size: int = 100,
     duplicate_ip_only: bool = False,
+    trust_state: str = "all",
 ) -> list[dict[str, Any]]:
     if not batch_id:
         return []
@@ -4367,13 +4409,20 @@ def encryption_terminal_records(
     page_size = min(200, max(50, int(page_size or 100)))
     offset = (page - 1) * page_size
     quoted_batch = decrypt_records.clickhouse_quote(batch_id)
+    trust_condition = encryption_terminal_trust_condition()
+    trust_status_sql = encryption_terminal_trust_status_sql()
+    state_filter = ""
+    if trust_state == "trusted":
+        state_filter = f"AND {trust_condition}"
+    elif trust_state == "excluded":
+        state_filter = f"AND NOT ({trust_condition})"
     duplicate_filter = ""
     if duplicate_ip_only:
         duplicate_filter = f"""
 AND ip_address IN (
     SELECT ip_address
     FROM encryption_terminal_inventory FINAL
-    WHERE import_batch = {quoted_batch} AND notEmpty(ip_address)
+    WHERE import_batch = {quoted_batch} AND {trust_condition}
     GROUP BY ip_address
     HAVING count() > 1
 )
@@ -4410,17 +4459,18 @@ FROM
         client_version,
         encryption_status,
         last_seen,
-        if(last_seen >= now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY, 1, 0) AS is_trusted,
-        multiIf(isNull(last_seen), '无最后在线时间', last_seen < now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY, '超过{ENCRYPTION_TERMINAL_TRUST_DAYS}天未在线', '授信有效') AS trust_status
+        if({trust_condition}, 1, 0) AS is_trusted,
+        {trust_status_sql} AS trust_status
     FROM encryption_terminal_inventory FINAL
     WHERE import_batch = {quoted_batch}
+    {state_filter}
     {duplicate_filter}
 ) AS t
 LEFT JOIN
 (
     SELECT ip_address, count() AS ip_rows
     FROM encryption_terminal_inventory FINAL
-    WHERE import_batch = {quoted_batch} AND notEmpty(ip_address)
+    WHERE import_batch = {quoted_batch} AND {trust_condition}
     GROUP BY ip_address
 ) AS d USING ip_address
 ORDER BY
@@ -5069,12 +5119,16 @@ def decrypt_records_page(config: AppConfig, message: str = "", error: str = "") 
     return page_shell("解密记录导入", body)
 
 
-def parse_settings_page_params(params: dict[str, list[str]] | None) -> tuple[int, int, bool]:
+def parse_settings_page_params(params: dict[str, list[str]] | None) -> tuple[int, int, int, bool]:
     params = params or {}
     try:
-        page = int((params.get("page") or ["1"])[-1] or "1")
+        trusted_page = int((params.get("trusted_page") or params.get("page") or ["1"])[-1] or "1")
     except ValueError:
-        page = 1
+        trusted_page = 1
+    try:
+        excluded_page = int((params.get("excluded_page") or ["1"])[-1] or "1")
+    except ValueError:
+        excluded_page = 1
     try:
         page_size = int((params.get("page_size") or ["100"])[-1] or "100")
     except ValueError:
@@ -5082,7 +5136,7 @@ def parse_settings_page_params(params: dict[str, list[str]] | None) -> tuple[int
     if page_size not in {50, 100, 200}:
         page_size = 100
     duplicate_ip_only = str((params.get("duplicate_ip") or [""])[-1]).lower() in {"1", "true", "yes", "on"}
-    return max(1, page), page_size, duplicate_ip_only
+    return max(1, trusted_page), max(1, excluded_page), page_size, duplicate_ip_only
 
 
 def encryption_terminals_page(
@@ -5094,13 +5148,17 @@ def encryption_terminals_page(
     batches = encryption_terminal_batches(config, 30)
     latest_pool = latest_encryption_terminal_pool(config)
     latest_batch = str(latest_pool.get("import_batch") or "") if latest_pool else ""
-    page, page_size, duplicate_ip_only = parse_settings_page_params(params)
-    total_records = encryption_terminal_count(config, latest_batch, duplicate_ip_only)
-    page_count = max(1, (total_records + page_size - 1) // page_size)
-    page = min(page, page_count)
-    terminal_records = encryption_terminal_records(config, latest_batch, page, page_size, duplicate_ip_only)
+    trusted_page, excluded_page, page_size, duplicate_ip_only = parse_settings_page_params(params)
+    trusted_total = encryption_terminal_count(config, latest_batch, duplicate_ip_only, "trusted")
+    excluded_total = encryption_terminal_count(config, latest_batch, False, "excluded")
+    trusted_page_count = max(1, (trusted_total + page_size - 1) // page_size)
+    excluded_page_count = max(1, (excluded_total + page_size - 1) // page_size)
+    trusted_page = min(trusted_page, trusted_page_count)
+    excluded_page = min(excluded_page, excluded_page_count)
+    trusted_records = encryption_terminal_records(config, latest_batch, trusted_page, page_size, duplicate_ip_only, "trusted")
+    excluded_records = encryption_terminal_records(config, latest_batch, excluded_page, page_size, False, "excluded")
     duplicate_ip_count = encryption_terminal_duplicate_ip_count(config, latest_batch)
-    duplicate_rows = encryption_terminal_duplicates(config, latest_batch, 200)
+    duplicate_record_count = encryption_terminal_count(config, latest_batch, True, "trusted")
     rows = []
     for item in batches:
         rows.append(
@@ -5111,48 +5169,20 @@ def encryption_terminals_page(
             f"<td>{esc(item.get('rows') or 0)}</td>"
             f"<td>{esc(item.get('trusted_terminal_keys') or 0)}</td>"
             f"<td>{esc(item.get('terminal_keys') or 0)}</td>"
+            f"<td>{esc(item.get('trusted_ips') or 0)}</td>"
             f"<td>{esc(item.get('ips') or 0)}</td>"
-            f"<td>{esc(item.get('expired_rows') or 0)}</td>"
+            f"<td>{esc(item.get('excluded_rows') or item.get('expired_rows') or 0)}</td>"
             f"<td>{esc(item.get('companies') or 0)}</td>"
             "</tr>"
         )
-    batch_table = "".join(rows) or '<tr><td colspan="9" class="muted">暂无导入批次。</td></tr>'
-    duplicate_html = []
-    for item in duplicate_rows:
+    batch_table = "".join(rows) or '<tr><td colspan="10" class="muted">暂无导入批次。</td></tr>'
+    trusted_html = []
+    for item in trusted_records:
         ip_rows = int(item.get("ip_rows") or 0)
-        trust_badge = (
-            '<span class="mini-badge">授信</span>'
-            if int(item.get("is_trusted") or 0)
-            else f'<span class="mini-badge danger" title="{esc(item.get("trust_status") or "失效")}">失效</span>'
-        )
-        duplicate_html.append(
-            '<tr class="duplicate-ip-row">'
-            f"<td>{esc(item.get('ip_address') or '-')}</td>"
-            f'<td><span class="mini-badge danger">重复 {ip_rows}</span></td>'
-            f"<td>{esc(item.get('computer_name') or '-')}</td>"
-            f"<td>{esc(item.get('mac_address') or '-')}</td>"
-            f"<td>{esc(item.get('user_name') or '-')}</td>"
-            f"<td>{esc(item.get('user_account') or '-')}</td>"
-            f"<td>{esc(item.get('company') or '-')}</td>"
-            f"<td>{esc(item.get('department') or '-')}</td>"
-            f"<td>{esc(item.get('os_version') or '-')}</td>"
-            f"<td>{esc(item.get('encryption_status') or '-')}</td>"
-            f"<td>{trust_badge}</td>"
-            f"<td>{esc(item.get('last_seen') or '-')}</td>"
-            "</tr>"
-        )
-    duplicate_table = "".join(duplicate_html) or '<tr><td colspan="12" class="muted">最新批次未发现重复 IP。</td></tr>'
-    terminal_html = []
-    for item in terminal_records:
-        ip_rows = int(item.get("ip_rows") or 0)
-        duplicate_badge = f'<span class="mini-badge warn">重复 {ip_rows}</span>' if ip_rows > 1 else '<span class="mini-badge">唯一</span>'
-        trust_badge = (
-            '<span class="mini-badge">授信</span>'
-            if int(item.get("is_trusted") or 0)
-            else f'<span class="mini-badge danger" title="{esc(item.get("trust_status") or "失效")}">失效</span>'
-        )
-        terminal_html.append(
-            "<tr>"
+        duplicate_badge = f'<span class="mini-badge danger">重复 {ip_rows}</span>' if ip_rows > 1 else '<span class="mini-badge">唯一</span>'
+        row_class = ' class="duplicate-ip-row"' if ip_rows > 1 else ""
+        trusted_html.append(
+            f"<tr{row_class}>"
             f"<td>{esc(item.get('ip_address') or '-')}</td>"
             f"<td>{esc(item.get('computer_name') or '-')}</td>"
             f"<td>{duplicate_badge}</td>"
@@ -5164,14 +5194,38 @@ def encryption_terminals_page(
             f"<td>{esc(item.get('os_version') or '-')}</td>"
             f"<td>{esc(item.get('client_version') or '-')}</td>"
             f"<td>{esc(item.get('encryption_status') or '-')}</td>"
-            f"<td>{trust_badge}</td>"
             f"<td>{esc(item.get('last_seen') or '-')}</td>"
             "</tr>"
         )
-    terminal_table = "".join(terminal_html) or '<tr><td colspan="13" class="muted">暂无终端记录。</td></tr>'
-    def list_url(target_page: int = 1, size: int | None = None, duplicate: bool | None = None) -> str:
+    trusted_table = "".join(trusted_html) or '<tr><td colspan="12" class="muted">暂无授信终端记录。</td></tr>'
+    excluded_html = []
+    for item in excluded_records:
+        excluded_html.append(
+            "<tr>"
+            f"<td>{esc(item.get('ip_address') or '-')}</td>"
+            f"<td>{esc(item.get('computer_name') or '-')}</td>"
+            f"<td>{esc(item.get('mac_address') or '-')}</td>"
+            f"<td>{esc(item.get('user_name') or '-')}</td>"
+            f"<td>{esc(item.get('user_account') or '-')}</td>"
+            f"<td>{esc(item.get('company') or '-')}</td>"
+            f"<td>{esc(item.get('department') or '-')}</td>"
+            f"<td>{esc(item.get('os_version') or '-')}</td>"
+            f"<td>{esc(item.get('client_version') or '-')}</td>"
+            f"<td>{esc(item.get('encryption_status') or '-')}</td>"
+            f"<td>{esc(item.get('last_seen') or '-')}</td>"
+            f'<td><span class="mini-badge danger">{esc(item.get("trust_status") or "不进入授信池")}</span></td>'
+            "</tr>"
+        )
+    excluded_table = "".join(excluded_html) or '<tr><td colspan="12" class="muted">暂无排除记录。</td></tr>'
+    def list_url(
+        target_trusted_page: int | None = None,
+        target_excluded_page: int | None = None,
+        size: int | None = None,
+        duplicate: bool | None = None,
+    ) -> str:
         query = {
-            "page": str(max(1, target_page)),
+            "trusted_page": str(max(1, target_trusted_page if target_trusted_page is not None else trusted_page)),
+            "excluded_page": str(max(1, target_excluded_page if target_excluded_page is not None else excluded_page)),
             "page_size": str(size if size is not None else page_size),
         }
         if duplicate if duplicate is not None else duplicate_ip_only:
@@ -5179,27 +5233,34 @@ def encryption_terminals_page(
         return "/settings/encryption-terminals?" + urlencode(query)
 
     mode_actions = (
-        f'<a class="button {"primary" if not duplicate_ip_only else ""}" href="{esc(list_url(1, page_size, False))}">全部终端</a>'
-        f'<a class="button {"primary" if duplicate_ip_only else ""}" href="{esc(list_url(1, page_size, True))}">仅重复IP</a>'
+        f'<a class="button {"primary" if not duplicate_ip_only else ""}" href="{esc(list_url(1, 1, page_size, False))}">授信池全部</a>'
+        f'<a class="button {"primary" if duplicate_ip_only else ""}" href="{esc(list_url(1, 1, page_size, True))}">仅重复IP</a>'
     )
     size_actions = "".join(
-        f'<a class="button {"primary" if page_size == size else ""}" href="{esc(list_url(1, size, duplicate_ip_only))}">{size}/页</a>'
+        f'<a class="button {"primary" if page_size == size else ""}" href="{esc(list_url(1, 1, size, duplicate_ip_only))}">{size}/页</a>'
         for size in (50, 100, 200)
     )
-    prev_link = list_url(page - 1, page_size, duplicate_ip_only)
-    next_link = list_url(page + 1, page_size, duplicate_ip_only)
-    pager_actions = (
-        (f'<a class="button" href="{esc(prev_link)}">上一页</a>' if page > 1 else '<span class="mini-badge">上一页</span>')
-        + (f'<a class="button" href="{esc(next_link)}">下一页</a>' if page < page_count else '<span class="mini-badge">下一页</span>')
+    trusted_prev_link = list_url(trusted_page - 1, excluded_page, page_size, duplicate_ip_only)
+    trusted_next_link = list_url(trusted_page + 1, excluded_page, page_size, duplicate_ip_only)
+    trusted_pager_actions = (
+        (f'<a class="button" href="{esc(trusted_prev_link)}">上一页</a>' if trusted_page > 1 else '<span class="mini-badge">上一页</span>')
+        + (f'<a class="button" href="{esc(trusted_next_link)}">下一页</a>' if trusted_page < trusted_page_count else '<span class="mini-badge">下一页</span>')
+    )
+    excluded_prev_link = list_url(trusted_page, excluded_page - 1, page_size, duplicate_ip_only)
+    excluded_next_link = list_url(trusted_page, excluded_page + 1, page_size, duplicate_ip_only)
+    excluded_pager_actions = (
+        (f'<a class="button" href="{esc(excluded_prev_link)}">上一页</a>' if excluded_page > 1 else '<span class="mini-badge">上一页</span>')
+        + (f'<a class="button" href="{esc(excluded_next_link)}">下一页</a>' if excluded_page < excluded_page_count else '<span class="mini-badge">下一页</span>')
     )
     pool_text = "尚未导入终端列表"
     if latest_pool:
         pool_text = (
             f"最新批次 {latest_pool.get('import_batch') or '-'}："
             f"{int(latest_pool.get('trusted_terminal_keys') or 0)} 个授信终端键，"
+            f"{int(latest_pool.get('trusted_ips') or 0)} 个授信 IP；"
             f"{int(latest_pool.get('terminal_keys') or 0)} 个全部终端键，"
-            f"{int(latest_pool.get('ips') or 0)} 个去重 IP，"
-            f"{int(latest_pool.get('expired_rows') or 0)} 条超过{ENCRYPTION_TERMINAL_TRUST_DAYS}天未在线/无在线时间记录，"
+            f"{int(latest_pool.get('ips') or 0)} 个全部 IP，"
+            f"{int(latest_pool.get('excluded_rows') or latest_pool.get('expired_rows') or 0)} 条排除记录，"
             f"{int(latest_pool.get('rows') or 0)} 条终端记录。"
         )
     msg = f'<p class="muted">{esc(message)}</p>' if message else ""
@@ -5226,25 +5287,30 @@ def encryption_terminals_page(
     <section class="panel">
       <div class="settings-toolbar">
         <div>
-          <h2>重复 IP 概览</h2>
-          <p class="muted">每条终端记录单独成行，按 IP 地址排序；红色标注表示该 IP 在最新批次中出现多次。</p>
+          <h2>授信 IP 池</h2>
+          <p class="muted">只展示最后在线时间在 {ENCRYPTION_TERMINAL_TRUST_DAYS} 天内，且同时具备 IP 地址和计算机名的终端；重复 IP 仅按授信池计算。</p>
         </div>
-        <span class="mini-badge danger">{duplicate_ip_count} 个重复IP / {len(duplicate_rows)} 条记录</span>
+        <div class="actions">{mode_actions}{size_actions}</div>
       </div>
-      <div class="table-wrap"><table><thead><tr><th>IP地址</th><th>重复标注</th><th>计算机名</th><th>MAC地址</th><th>使用人</th><th>账号</th><th>公司</th><th>部门</th><th>操作系统</th><th>状态</th><th>授信状态</th><th>最后在线</th></tr></thead><tbody>{duplicate_table}</tbody></table></div>
+      <p class="muted"><span class="mini-badge">授信记录 {trusted_total}</span> <span class="mini-badge">授信池重复IP {duplicate_ip_count}</span> <span class="mini-badge">重复记录 {duplicate_record_count}</span></p>
+      <div class="table-wrap"><table><thead><tr><th>IP地址</th><th>计算机名</th><th>IP状态</th><th>MAC地址</th><th>使用人</th><th>账号</th><th>公司</th><th>部门</th><th>操作系统</th><th>客户端版本</th><th>加密状态</th><th>最后在线</th></tr></thead><tbody>{trusted_table}</tbody></table></div>
+      <div class="pager">
+        <span>授信池第 {trusted_page} / {trusted_page_count} 页，每页 {page_size} 条</span>
+        <div class="actions">{trusted_pager_actions}</div>
+      </div>
     </section>
     <section class="panel">
       <div class="settings-toolbar">
         <div>
-          <h2>最新批次终端清单</h2>
-          <p class="muted">当前显示 {esc('仅重复IP' if duplicate_ip_only else '全部终端')}，共 {total_records} 条；授信终端键为 `IP地址 + 计算机名` 且最后在线时间在 {ENCRYPTION_TERMINAL_TRUST_DAYS} 天内。</p>
+          <h2>排除 IP / 终端</h2>
+          <p class="muted">不进入授信池的最新批次记录，最后一列给出排除原因，例如最后在线超过 {ENCRYPTION_TERMINAL_TRUST_DAYS} 天、缺少 IP 或缺少计算机名。</p>
         </div>
-        <div class="actions">{mode_actions}{size_actions}</div>
+        <span class="mini-badge danger">排除记录 {excluded_total}</span>
       </div>
-      <div class="table-wrap"><table><thead><tr><th>IP地址</th><th>计算机名</th><th>IP状态</th><th>MAC地址</th><th>使用人</th><th>账号</th><th>公司</th><th>部门</th><th>操作系统</th><th>客户端版本</th><th>状态</th><th>授信状态</th><th>最后在线</th></tr></thead><tbody>{terminal_table}</tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>IP地址</th><th>计算机名</th><th>MAC地址</th><th>使用人</th><th>账号</th><th>公司</th><th>部门</th><th>操作系统</th><th>客户端版本</th><th>加密状态</th><th>最后在线</th><th>备注原因</th></tr></thead><tbody>{excluded_table}</tbody></table></div>
       <div class="pager">
-        <span>第 {page} / {page_count} 页，每页 {page_size} 条</span>
-        <div class="actions">{pager_actions}</div>
+        <span>排除池第 {excluded_page} / {excluded_page_count} 页，每页 {page_size} 条</span>
+        <div class="actions">{excluded_pager_actions}</div>
       </div>
     </section>
     <section class="panel">
@@ -5259,7 +5325,7 @@ def encryption_terminals_page(
     </section>
     <section class="panel">
       <h2>最近导入批次</h2>
-      <div class="table-wrap"><table><thead><tr><th>批次</th><th>源文件</th><th>导入时间</th><th>终端记录</th><th>授信终端键</th><th>全部终端键</th><th>IP数</th><th>失效记录</th><th>公司数</th></tr></thead><tbody>{batch_table}</tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>批次</th><th>源文件</th><th>导入时间</th><th>终端记录</th><th>授信终端键</th><th>全部终端键</th><th>授信IP</th><th>全部IP</th><th>排除记录</th><th>公司数</th></tr></thead><tbody>{batch_table}</tbody></table></div>
     </section>
 """
     return page_shell("加密终端列表导入", body)
