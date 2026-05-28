@@ -4763,6 +4763,25 @@ def live_decrypt_detail_page(config: AppConfig, start: datetime, end: datetime, 
     return html_text.encode("utf-8")
 
 
+def live_decrypt_loading_placeholder_html(start: datetime, end: datetime) -> str:
+    return f"""
+<div class="live-decrypt-stage" aria-live="polite">
+  <div class="live-decrypt-stage-head">
+    <div>
+      <span>Decrypt Audit</span>
+      <strong>加密软件解密审计正在刷新</strong>
+      <p>统计周期：{esc(start.strftime('%Y-%m-%d %H:%M'))} 至 {esc(end.strftime('%Y-%m-%d %H:%M'))}。先刷新一级风险数字，随后补齐趋势、公司矩阵和流转链路。</p>
+    </div>
+    <em>实时计算</em>
+  </div>
+  <div class="live-decrypt-stage-grid">
+    <i></i><i></i><i></i><i></i><i></i><i></i>
+  </div>
+  <div class="live-decrypt-stage-bar" aria-hidden="true"></div>
+</div>
+"""
+
+
 def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
     if b'id="decrypt-risk-tracking"' not in data or b'id="tq-live-decrypt-loader"' in data:
         return data
@@ -4776,10 +4795,118 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
         return data
     summary_url = live_decrypt_url("/api/decrypt-risk-summary-fragment", start, end)
     detail_url = live_decrypt_url("/api/decrypt-risk-fragment", start, end)
+    placeholder = live_decrypt_loading_placeholder_html(start, end)
+    placeholder_json = json.dumps(placeholder, ensure_ascii=False)
     prehide_style = """
 <style id="tq-live-decrypt-prehide">
-  #decrypt-risk-tracking .decrypt-trend-panel {
+  #decrypt-risk-tracking[data-live-decrypt-state="loading"] > :not(.live-decrypt-stage) {
     display: none !important;
+  }
+  #decrypt-risk-tracking[data-live-decrypt-state="summary"] .live-decrypt-stage {
+    margin-top: 14px;
+  }
+  #decrypt-risk-tracking[data-live-decrypt-state="summary"] .decrypt-trend-panel,
+  #decrypt-risk-tracking[data-live-decrypt-state="summary"] .decrypt-company-matrix,
+  #decrypt-risk-tracking[data-live-decrypt-state="summary"] .rename-empty {
+    display: none !important;
+  }
+  .live-decrypt-stage {
+    position: relative;
+    overflow: hidden;
+    border: 1px solid #d8e4f2;
+    border-radius: 16px;
+    padding: 18px 20px;
+    background: linear-gradient(180deg, #ffffff 0%, #f7fbff 100%);
+    box-shadow: 0 12px 28px rgba(18, 32, 51, 0.055);
+  }
+  .live-decrypt-stage::before {
+    content: "";
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 4px;
+    background: linear-gradient(180deg, #7c3aed, #175cd3, #08746f);
+  }
+  .live-decrypt-stage-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 18px;
+  }
+  .live-decrypt-stage-head span {
+    display: block;
+    color: #667085;
+    font-size: 12px;
+    font-weight: 900;
+    letter-spacing: .03em;
+    text-transform: uppercase;
+  }
+  .live-decrypt-stage-head strong {
+    display: block;
+    margin-top: 4px;
+    color: #122033;
+    font-size: 19px;
+    line-height: 1.25;
+    font-weight: 920;
+  }
+  .live-decrypt-stage-head p {
+    max-width: 860px;
+    margin: 8px 0 0;
+    color: #475467;
+    font-size: 13px;
+    font-weight: 720;
+    line-height: 1.7;
+  }
+  .live-decrypt-stage-head em {
+    flex: 0 0 auto;
+    border-radius: 999px;
+    padding: 7px 11px;
+    background: #eef4ff;
+    color: #175cd3;
+    font-size: 12px;
+    font-style: normal;
+    font-weight: 900;
+  }
+  .live-decrypt-stage-grid {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 10px;
+    margin-top: 16px;
+  }
+  .live-decrypt-stage-grid i {
+    display: block;
+    height: 58px;
+    border-radius: 12px;
+    background: linear-gradient(110deg, #edf3fb 8%, #f8fbff 28%, #edf3fb 46%);
+    background-size: 220% 100%;
+    animation: liveDecryptShimmer 1.35s ease-in-out infinite;
+  }
+  .live-decrypt-stage-bar {
+    height: 5px;
+    margin-top: 16px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: #e6eef8;
+  }
+  .live-decrypt-stage-bar::after {
+    content: "";
+    display: block;
+    width: 34%;
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, #7c3aed, #175cd3, #11a69c);
+    animation: liveDecryptBar 1.45s ease-in-out infinite;
+  }
+  @keyframes liveDecryptShimmer {
+    0% { background-position: 180% 0; }
+    100% { background-position: -60% 0; }
+  }
+  @keyframes liveDecryptBar {
+    0% { transform: translateX(-110%); }
+    100% { transform: translateX(300%); }
+  }
+  @media (max-width: 980px) {
+    .live-decrypt-stage-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .live-decrypt-stage-head { flex-direction: column; }
   }
 </style>
 """
@@ -4788,6 +4915,8 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
 (function() {{
   var summaryUrl = {json.dumps(summary_url, ensure_ascii=False)};
   var detailUrl = {json.dumps(detail_url, ensure_ascii=False)};
+  var placeholderHtml = {placeholder_json};
+  var detailLoadingHtml = '<div class="live-decrypt-stage" aria-live="polite"><div class="live-decrypt-stage-head"><div><span>Live Detail</span><strong>一级风险数字已刷新，正在补齐趋势和链路</strong><p>完整趋势、公司矩阵和后续流转链路计算完成后会自动替换当前模块。</p></div><em>继续计算</em></div><div class="live-decrypt-stage-bar" aria-hidden="true"></div></div>';
   function removePrehide() {{
     var style = document.getElementById("tq-live-decrypt-prehide");
     if (style && style.parentNode) {{
@@ -4798,21 +4927,20 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
     var section = document.getElementById("decrypt-risk-tracking");
     if (!section || section.getAttribute("data-live-decrypt-loaded") === "1") return;
     section.setAttribute("data-live-decrypt-loaded", "1");
-    var original = section.innerHTML;
-    var note = document.createElement("p");
-    note.className = "note live-decrypt-loading";
-    note.textContent = "解密图纸风险追踪正在刷新数字，趋势和链路稍后补齐...";
-    section.insertBefore(note, section.firstChild);
+    section.setAttribute("data-live-decrypt-state", "loading");
+    var stage = section.querySelector(".live-decrypt-stage");
+    if (!stage) {{
+      section.insertAdjacentHTML("afterbegin", placeholderHtml);
+    }}
+    var summaryApplied = false;
     function applySummary(html) {{
       var wrapper = document.createElement("div");
       wrapper.innerHTML = html;
-      var freshOverview = wrapper.querySelector("#decrypt-risk-overview");
-      var oldOverview = document.getElementById("decrypt-risk-overview");
-      if (freshOverview && oldOverview) oldOverview.replaceWith(freshOverview);
-      var freshCards = wrapper.querySelector(".decrypt-card-grid");
-      var oldCards = section.querySelector(".decrypt-card-grid");
-      if (freshCards && oldCards) oldCards.replaceWith(freshCards);
-      if (note && note.parentNode) note.textContent = "数字已刷新，趋势、公司矩阵和后续流转链路正在继续计算...";
+      if (wrapper.textContent && wrapper.textContent.trim()) {{
+        section.innerHTML = html + detailLoadingHtml;
+        section.setAttribute("data-live-decrypt-state", "summary");
+        summaryApplied = true;
+      }}
     }}
     function applyDetail(html) {{
       var wrapper = document.createElement("div");
@@ -4830,13 +4958,19 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
     }}
     function showError(err) {{
       removePrehide();
-      if (note && note.parentNode) {{
-        note.textContent = "解密实时计算暂不可用，当前显示报告生成时的静态快照：" + err.message;
-      }} else {{
+      section.removeAttribute("data-live-decrypt-state");
+      if (summaryApplied) {{
         var error = document.createElement("p");
         error.className = "note";
-        error.textContent = "解密实时计算暂不可用，当前显示报告生成时的静态快照：" + err.message;
-        section.insertBefore(error, section.firstChild);
+        error.textContent = "完整趋势和链路暂未刷新：" + err.message;
+        section.appendChild(error);
+      }} else {{
+        section.innerHTML = placeholderHtml;
+        var stage = section.querySelector(".live-decrypt-stage");
+        if (stage) {{
+          stage.querySelector("strong").textContent = "解密实时计算暂不可用";
+          stage.querySelector("p").textContent = "当前没有展示旧快照空态，请稍后刷新重试：" + err.message;
+        }}
       }}
     }}
     fetch(summaryUrl, {{credentials: "same-origin", cache: "no-store"}})
@@ -4853,7 +4987,6 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
       }})
       .then(applyDetail)
       .catch(function(err) {{
-        section.innerHTML = original;
         showError(err);
       }});
   }}
@@ -4868,6 +5001,20 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
     text = data.decode("utf-8", errors="replace")
     if 'id="tq-live-decrypt-prehide"' not in text:
         text = text.replace("</head>", prehide_style + "</head>", 1)
+    if 'class="live-decrypt-stage"' not in text:
+        def add_live_decrypt_placeholder(match: re.Match[str]) -> str:
+            open_tag = match.group(1)
+            if "data-live-decrypt-state=" not in open_tag:
+                open_tag = open_tag[:-1] + ' data-live-decrypt-state="loading">'
+            return open_tag + placeholder
+
+        text = re.sub(
+            r'(<section\b(?=[^>]*\bid="decrypt-risk-tracking")[^>]*>)',
+            add_live_decrypt_placeholder,
+            text,
+            count=1,
+            flags=re.IGNORECASE,
+        )
     text = text.replace("</body>", script + "</body>", 1)
     return text.encode("utf-8")
 
