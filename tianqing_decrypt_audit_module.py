@@ -99,7 +99,6 @@ def decrypt_rule_risk_overview_html(
     links: dict[str, str],
 ) -> str:
     records = analysis.records
-    total = len(records)
     object_counts: Counter = Counter(record.object_bucket for record in records)
     structure_count = int(object_counts.get("结构", 0) or 0)
     electrical_count = int(object_counts.get("电气", 0) or 0)
@@ -108,42 +107,36 @@ def decrypt_rule_risk_overview_html(
     dwg_count = int(object_counts.get("DWG图纸", 0) or 0)
     archive_count = int(object_counts.get("压缩包", 0) or 0)
     linked_records = [record for record in records if decrypt_has_followup(record)]
+    standard_records = [record for record in records if record.object_bucket in {"结构", "电气"}]
+    standard_linked_count = sum(1 for record in standard_records if decrypt_has_followup(record))
     linked_count = len(linked_records)
-    unmatched_count = sum(1 for record in records if not record.org_matched)
-    top_object, top_object_count = risk_overview_top_label(object_counts)
-    company_counts = decrypt_counter_for(records, decrypt_company_label)
-    department_counts = decrypt_counter_for(records, decrypt_department_label)
+    unmatched_count = sum(1 for record in standard_records if not record.org_matched)
+    company_counts = decrypt_counter_for(standard_records, decrypt_company_label)
+    department_counts = decrypt_counter_for(standard_records, decrypt_department_label)
     top_company, top_company_count = risk_overview_top_label(company_counts)
     top_department, top_department_count = risk_overview_top_label(department_counts)
     followup_counts = Counter(record.followup_channel or "未发现后续外发/拷贝线索" for record in linked_records)
     top_followup, top_followup_count = risk_overview_top_label(followup_counts)
-    trend_total = len(analysis.trend_records)
-    trend_company_counts = decrypt_counter_for(analysis.trend_records, decrypt_company_label)
-    trend_company, trend_company_count = risk_overview_top_label(trend_company_counts)
 
-    if analysis.error and not total:
+    if analysis.error and not records:
         conclusions = [f"解密记录分析暂不可用：{analysis.error}。"]
-    elif total:
+    elif records:
         conclusions = [
             (
-                f"本期加密软件解密审计记录 {total} 条，其中标准图纸 {standard_count} 条"
-                f"（结构 {structure_count} / 电气 {electrical_count}）；标准图纸解密按最高关注对象复核。"
+                f"本期一级风险为标准图纸解密 {standard_count} 条，其中结构 {structure_count} 条、电气 {electrical_count} 条；"
+                "该口径与下方结构/电气卡片及标准图纸明细一致。"
             ),
             (
-                f"对象结构为三维模型 {three_d_count} 条、DWG图纸 {dwg_count} 条、压缩包 {archive_count} 条；"
-                f"最高频对象为 {decrypt_object_short_label(top_object)} {top_object_count} 条。"
+                f"普通对象作为辅助复核：三维模型 {three_d_count} 条、DWG图纸 {dwg_count} 条、压缩包 {archive_count} 条；"
+                "不计入本模块一级风险汇总。"
             ),
             (
-                f"组织侧优先看 {top_company} {top_company_count} 条、{top_department} {top_department_count} 条；"
+                f"标准图纸解密组织侧优先看 {top_company} {top_company_count} 条、{top_department} {top_department_count} 条；"
                 f"未完成组织映射 {unmatched_count} 条，不参与公司解密风险矩阵比较。"
             ),
             (
-                f"解密后 30 天内发现同名文件后续流转线索 {linked_count} 条，"
+                f"标准图纸解密后 30 天内发现同名文件后续流转线索 {standard_linked_count} 条；全部解密记录后续流转线索 {linked_count} 条，"
                 f"主要后续通道为 {top_followup} {top_followup_count} 条；该线索为疑似关联，需结合审批单和天擎附件复核。"
-            ),
-            (
-                f"近30天解密趋势累计 {trend_total} 条，趋势组织侧 Top 为 {trend_company} {trend_company_count} 条；"
-                "管理动作建议先复核标准图纸，再复核三维/DWG与后续流转链路。"
             ),
         ]
     else:

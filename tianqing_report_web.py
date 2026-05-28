@@ -1115,16 +1115,16 @@ def inject_report_navigation_patch(data: bytes, config: AppConfig | None = None,
         count=1,
         flags=re.IGNORECASE,
     )
-    terminal_link = f'<a class="top-action" href="{esc(terminal_check_href)}">异常终端行为核查</a>'
+    terminal_link = f'<a class="top-action" href="{esc(terminal_check_href)}">风险终端复核</a>'
     updated_with_period = re.sub(
-        r'<a\s+class="top-action"\s+href="[^"]*/terminal-check(?:\?[^"]*)?"\s*>异常终端行为核查</a>',
+        r'<a\s+class="top-action"\s+href="[^"]*/terminal-check(?:\?[^"]*)?"\s*>(?:异常终端行为核查|风险终端复核)</a>',
         terminal_link,
         updated,
         count=1,
         flags=re.IGNORECASE,
     )
     updated = updated_with_period
-    if "异常终端行为核查" not in updated:
+    if "风险终端复核" not in updated:
         updated = re.sub(
             r'(<a\s+class="top-action"\s+href="[^"]*/settings">策略管理</a>)',
             r"\1" + terminal_link,
@@ -1171,30 +1171,60 @@ def _first_regex_int(pattern: str, text: str, default: int = 0, group: int = 1) 
         return default
 
 
-def inject_global_management_summary(data: bytes) -> bytes:
-    text = data.decode("utf-8", errors="replace")
-    if 'id="decrypt-audit"' not in text and 'id="tianqing-audit"' not in text:
-        return data
-
+def _fallback_decrypt_management_metrics(text: str) -> dict[str, Any]:
     decrypt_section = _section_html(text, "decrypt-audit")
-    tianqing_section = _section_html(text, "tianqing-audit")
     decrypt_plain = _html_plain_text(decrypt_section)
-    tianqing_plain = _html_plain_text(tianqing_section)
     decrypt_standard = _first_regex_int(r"标准图纸\s*(\d+)\s*条", decrypt_plain)
     if not decrypt_standard:
         decrypt_standard = _first_regex_int(r"标准图纸解密总数\s*(\d+)", decrypt_plain)
-    decrypt_structure = _first_regex_int(r"结构\s*(\d+)", decrypt_plain)
-    decrypt_electrical = _first_regex_int(r"电气\s*(\d+)", decrypt_plain)
-    tianqing_structure = _first_regex_int(r"结构(?:标准方案)?\s*(\d+)", tianqing_plain)
-    tianqing_electrical = _first_regex_int(r"电气(?:标准方案)?\s*(\d+)", tianqing_plain)
-    tianqing_yb = _first_regex_int(r"油变(?:标准方案)?\s*(\d+)", tianqing_plain)
-    tianqing_critical = tianqing_structure + tianqing_electrical + tianqing_yb
-    lead = (
-        f"本周期一级风险概况：标准图纸解密 {decrypt_standard} 条；"
-        f"天擎标准图纸外发/拷贝 {tianqing_critical} 条；"
-        "PLM 登录审计待接入。"
-    )
-    style = """
+    return {
+        "standard": decrypt_standard,
+        "structure": _first_regex_int(r"结构\s*(\d+)", decrypt_plain),
+        "electrical": _first_regex_int(r"电气\s*(\d+)", decrypt_plain),
+    }
+
+
+def _fallback_tianqing_management_metrics(text: str) -> dict[str, Any]:
+    tianqing_section = _section_html(text, "tianqing-audit")
+    tianqing_plain = _html_plain_text(tianqing_section)
+    structure = _first_regex_int(r"结构(?:标准方案)?\s*(\d+)", tianqing_plain)
+    electrical = _first_regex_int(r"电气(?:标准方案)?\s*(\d+)", tianqing_plain)
+    yb = _first_regex_int(r"油变(?:标准方案)?\s*(\d+)", tianqing_plain)
+    return {
+        "critical_design": structure + electrical + yb,
+        "critical_structure": structure,
+        "critical_electrical": electrical,
+        "critical_yb": yb,
+    }
+
+
+def _live_decrypt_management_metrics(config: AppConfig, start: datetime, end: datetime) -> dict[str, Any] | None:
+    try:
+        rows = live_decrypt_summary_rows(config, start, end)
+    except Exception:
+        return None
+    object_counts = live_decrypt_object_counts(rows)
+    structure = int(object_counts.get("结构", 0) or 0)
+    electrical = int(object_counts.get("电气", 0) or 0)
+    return {
+        "records": len(rows),
+        "standard": structure + electrical,
+        "structure": structure,
+        "electrical": electrical,
+    }
+
+
+def _terminal_review_management_metrics(config: AppConfig, start: datetime, end: datetime) -> dict[str, int]:
+    try:
+        reviews = terminal_review.fetch_reviews(config, start, end, include_all_status=False)
+    except Exception:
+        return {"total": 0, "pending": 0, "reviewed": 0}
+    pending = sum(1 for review in reviews if str(review.status or "").strip() == "待核查")
+    return {"total": len(reviews), "pending": pending, "reviewed": max(len(reviews) - pending, 0)}
+
+
+def global_management_summary_style() -> str:
+    return """
 <style id="global-management-summary-style">
   .global-management-summary {
     position: relative;
@@ -1235,105 +1265,79 @@ def inject_global_management_summary(data: bytes) -> bytes:
     font-weight: 720;
     line-height: 1.75;
   }
-  .management-module-grid {
+  .management-summary-list { display: grid; gap: 10px; }
+  .management-summary-row {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 12px;
-  }
-  .management-module-card {
-    display: flex;
-    min-height: 150px;
-    flex-direction: column;
+    grid-template-columns: 150px minmax(0, 1fr);
+    align-items: center;
+    gap: 14px;
+    min-height: 54px;
     border: 1px solid #dbe6f3;
-    border-radius: 14px;
-    padding: 16px;
+    border-radius: 12px;
+    padding: 12px 15px;
     color: #122033;
     background: #fff;
-    box-shadow: 0 10px 24px rgba(18, 32, 51, 0.055);
+    box-shadow: 0 8px 18px rgba(18, 32, 51, 0.045);
     text-decoration: none;
   }
-  .management-module-card:hover {
-    transform: translateY(-1px);
-    border-color: #93c5fd;
-    box-shadow: 0 14px 30px rgba(18, 32, 51, 0.085);
-  }
-  .management-module-card span {
+  .management-summary-row:hover { border-color: #93c5fd; box-shadow: 0 10px 22px rgba(18, 32, 51, 0.065); }
+  .management-summary-row span {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 30px;
+    border-radius: 999px;
+    padding: 0 12px;
+    background: #eff6ff;
     color: #175cd3;
-    font-size: 12px;
-    font-weight: 850;
-  }
-  .management-module-card strong {
-    margin-top: 8px;
-    font-size: 30px;
-    font-weight: 920;
-    line-height: 1;
-  }
-  .management-module-card em {
-    margin-top: 7px;
-    color: #475467;
     font-size: 13px;
-    font-style: normal;
-    font-weight: 800;
-    line-height: 1.4;
+    font-weight: 900;
+    white-space: nowrap;
   }
-  .management-module-card p {
-    margin: auto 0 0;
-    padding-top: 12px;
-    color: #667085;
-    font-size: 13px;
-    font-weight: 680;
-    line-height: 1.65;
+  .management-summary-row p {
+    margin: 0;
+    color: #344054;
+    font-size: 15px;
+    font-weight: 780;
+    line-height: 1.6;
   }
-  .management-module-card-decrypt { border-color: rgba(124, 58, 237, 0.22); }
-  .management-module-card-tianqing { border-color: rgba(15, 118, 110, 0.22); }
-  .management-module-card-plm { border-color: rgba(180, 83, 9, 0.22); }
-  .global-management-action {
-    margin: 14px 0 0;
-    border-top: 1px solid #e6edf5;
-    padding-top: 13px;
-    color: #475467;
-    font-size: 13px;
-    font-weight: 760;
-    line-height: 1.7;
-  }
+  .management-summary-row-decrypt span { background: #f5f3ff; color: #6d28d9; }
+  .management-summary-row-tianqing span { background: #ecfdf3; color: #08746f; }
+  .management-summary-row-plm span { background: #fffbeb; color: #b45309; }
+  .management-summary-row-review span { background: #eef4ff; color: #175cd3; }
   @media (max-width: 900px) {
     .global-management-head { flex-direction: column; align-items: flex-start; }
-    .management-module-grid { grid-template-columns: 1fr; }
+    .management-summary-row { grid-template-columns: 1fr; align-items: flex-start; }
   }
 </style>
 """
-    block = f"""
-    <section id="global-management-summary" class="global-management-summary" aria-labelledby="global-management-summary-title">
-      <div class="global-management-head">
-        <div>
-          <span class="section-eyebrow">Management Summary</span>
-          <h2 id="global-management-summary-title">三大模块管理结论</h2>
-        </div>
-        <p>{esc(lead)}</p>
-      </div>
-      <div class="management-module-grid">
-        <a class="management-module-card management-module-card-decrypt" href="#decrypt-audit">
-          <span>加密软件解密审计</span>
-          <strong>{esc(decrypt_standard)}</strong>
-          <em>标准图纸解密：结构 {esc(decrypt_structure)} / 电气 {esc(decrypt_electrical)}</em>
-          <p>只汇总结构、电气等标准图纸解密；三维模型、DWG、压缩包及后续流转由解密模块详述。</p>
-        </a>
-        <a class="management-module-card management-module-card-tianqing" href="#tianqing-audit">
-          <span>天擎外发审计</span>
-          <strong>{esc(tianqing_critical)}</strong>
-          <em>标准图纸外发/拷贝：结构 {esc(tianqing_structure)} / 电气 {esc(tianqing_electrical)} / 油变 {esc(tianqing_yb)}</em>
-          <p>只汇总结构、电气、油变等标准图纸经邮件、IM、上传或外设拷贝的一级风险；其他对象由天擎模块详述。</p>
-        </a>
-        <div class="management-module-card management-module-card-plm">
-          <span>PLM登录审计</span>
-          <strong>未纳入</strong>
-          <em>待接入</em>
-          <p>接口接入后重点校验技术、研发、工艺账号是否从 MAC+计算机名授信终端登录。</p>
-        </div>
-      </div>
-      <p class="global-management-action">顶部只呈现各模块一级风险；普通三维、DWG、敏感名称、压缩包、趋势、组织和终端细节由各模块详述并下钻复核。</p>
-    </section>
-"""
+
+
+def inject_global_management_summary(data: bytes, config: AppConfig | None = None, target: Path | None = None) -> bytes:
+    text = data.decode("utf-8", errors="replace")
+    if 'id="decrypt-audit"' not in text and 'id="tianqing-audit"' not in text:
+        return data
+
+    period = report_period_for_html_or_path(config, target, data) if config is not None else None
+    decrypt_metrics = _fallback_decrypt_management_metrics(text)
+    if config is not None and period:
+        live_metrics = _live_decrypt_management_metrics(config, period[0], period[1])
+        if live_metrics:
+            decrypt_metrics = live_metrics
+    tianqing_metrics = _fallback_tianqing_management_metrics(text)
+    review_metrics = (
+        _terminal_review_management_metrics(config, period[0], period[1])
+        if config is not None and period
+        else {"total": 0, "pending": 0, "reviewed": 0}
+    )
+    block = report_gen.build_global_management_summary_html(
+        decrypt_metrics,
+        tianqing_metrics,
+        {"enabled": False},
+        review_metrics,
+    )
+    if period:
+        block = block.replace('href="/terminal-check"', f'href="{esc(terminal_check_period_url(period[0], period[1]))}"')
     existing_match = re.search(
         r'<section\b[^>]*\bid="global-management-summary"[\s\S]*?(?=<section\b[^>]*\bid="(?:decrypt-audit|tianqing-audit|plm-login-audit)"|<footer\b|</main>)',
         text,
@@ -1343,6 +1347,7 @@ def inject_global_management_summary(data: bytes) -> bytes:
     if not existing_match and not marker_match:
         return data
     if "global-management-summary-style" not in text:
+        style = global_management_summary_style()
         if re.search(r"</head>", text, flags=re.IGNORECASE):
             text = re.sub(r"</head>", style + r"\g<0>", text, count=1, flags=re.IGNORECASE)
         else:
@@ -1375,11 +1380,9 @@ def report_period_for_static_path(config: AppConfig, target: Path) -> tuple[date
 
 def inject_terminal_behavior_review_summary(data: bytes, config: AppConfig, target: Path) -> bytes:
     text = data.decode("utf-8", errors="replace")
-    if 'id="terminal-behavior-review-summary"' in text:
-        return data
     if 'id="decrypt-audit"' not in text and 'id="tianqing-audit"' not in text:
         return data
-    period = report_period_for_static_path(config, target)
+    period = report_period_for_html_or_path(config, target, data)
     if not period:
         return data
     start, end = period
@@ -1392,6 +1395,14 @@ def inject_terminal_behavior_review_summary(data: bytes, config: AppConfig, targ
             text = style + text
     marker = re.search(r'<section\b[^>]*\bid="(?:decrypt-audit|tianqing-audit)"', text, flags=re.IGNORECASE)
     summary_marker = re.search(r'<section\b[^>]*\bid="global-management-summary"[\s\S]*?</section>', text, flags=re.IGNORECASE)
+    existing_match = re.search(
+        r'<section\b[^>]*\bid="terminal-behavior-review-summary"[\s\S]*?(?=<section\b[^>]*\bid="(?:decrypt-audit|tianqing-audit|plm-login-audit)"|<footer\b|</main>)',
+        text,
+        flags=re.IGNORECASE,
+    )
+    if existing_match:
+        text = text[: existing_match.start()] + block + "\n" + text[existing_match.end() :]
+        return text.encode("utf-8")
     insert_at = summary_marker.end() if summary_marker else (marker.start() if marker else -1)
     if insert_at < 0:
         return data
@@ -4365,6 +4376,47 @@ def load_live_decrypt_analysis(
     return report_gen.load_decrypt_risk_analysis(args, start, end, tz, [], internal_domains)
 
 
+def live_decrypt_summary_rows(config: AppConfig, start: datetime, end: datetime) -> list[dict[str, Any]]:
+    live_decrypt_policy_context(config)
+    return decrypt_query(
+        config,
+        f"""
+SELECT file_name, file_ext
+FROM decrypt_records FINAL
+WHERE isNotNull(apply_time)
+  AND apply_time >= parseDateTime64BestEffort({decrypt_records.clickhouse_quote(start.isoformat())}, 3)
+  AND apply_time < parseDateTime64BestEffort({decrypt_records.clickhouse_quote(end.isoformat())}, 3)
+FORMAT JSONEachRow
+""",
+    )
+
+
+def live_decrypt_bucket_for_row(row: dict[str, Any]) -> str:
+    file_name = str(row.get("file_name") or "")
+    file_ext = str(row.get("file_ext") or report_gen.extension(file_name)).lower()
+    labels = set(report_gen.critical_design_labels_for_name(file_name))
+    if report_gen.CRITICAL_STRUCTURE_LABEL in labels:
+        return "结构"
+    if report_gen.CRITICAL_ELECTRICAL_LABEL in labels:
+        return "电气"
+    if report_gen.CRITICAL_YB_STANDARD_LABEL in labels:
+        return "电气" if file_ext in report_gen.CONTROLLED_2D_CAD_EXTS else "结构"
+    if file_ext in report_gen.CONTROLLED_3D_EXTS:
+        return "三维模型"
+    if file_ext in report_gen.CONTROLLED_2D_CAD_EXTS:
+        return "DWG图纸"
+    if file_ext in report_gen.ARCHIVE_EXTS:
+        return "压缩包"
+    return "其他"
+
+
+def live_decrypt_object_counts(rows: list[dict[str, Any]]) -> Counter:
+    counts: Counter = Counter()
+    for row in rows:
+        counts[live_decrypt_bucket_for_row(row)] += 1
+    return counts
+
+
 def live_decrypt_links(start: datetime, end: datetime) -> dict[str, str]:
     return {
         "all": live_decrypt_url("/api/decrypt-risk-detail", start, end, scope="all"),
@@ -4404,6 +4456,62 @@ def live_decrypt_fragment(config: AppConfig, start: datetime, end: datetime) -> 
     html_text = report_gen.decrypt_risk_home_html(analysis, links, company_links, tz, end)
     html_text = html_text.replace('<div class="decrypt-card-grid">', live_decrypt_meta_html(config) + '<div class="decrypt-card-grid">', 1)
     return html_text.encode("utf-8")
+
+
+def live_decrypt_summary_fragment(config: AppConfig, start: datetime, end: datetime) -> bytes:
+    rows = live_decrypt_summary_rows(config, start, end)
+    links = live_decrypt_links(start, end)
+    counts = live_decrypt_object_counts(rows)
+    structure = int(counts.get("结构", 0) or 0)
+    electrical = int(counts.get("电气", 0) or 0)
+    standard = structure + electrical
+    three_d = int(counts.get("三维模型", 0) or 0)
+    dwg = int(counts.get("DWG图纸", 0) or 0)
+    archive = int(counts.get("压缩包", 0) or 0)
+    conclusions = [
+        f"本期一级风险为标准图纸解密 {standard} 条，其中结构 {structure} 条、电气 {electrical} 条；该口径与下方结构/电气卡片及标准图纸明细一致。",
+        f"普通对象作为辅助复核：三维模型 {three_d} 条、DWG图纸 {dwg} 条、压缩包 {archive} 条；不计入本模块一级风险汇总。",
+        "后续流转链路、公司矩阵和趋势正在后台继续计算，完成后自动刷新本模块详情。",
+    ]
+    overview = f"""
+    <section id="decrypt-risk-overview" class="section-block risk-overview-shell decrypt-overview-shell">
+      <div class="section-title-row">
+        <div>
+          <span class="section-eyebrow">Rule Overview</span>
+          <h2>加密软件解密规则风险概览</h2>
+          <p>先按解密记录本周期文件名和后缀快速聚合一级风险；后续流转链路异步补充。</p>
+        </div>
+      </div>
+      <div class="risk-overview-hero">
+        <div class="risk-overview-conclusions">
+          <span>管理结论</span>
+          <ul>{"".join(f"<li>{esc(item)}</li>" for item in conclusions)}</ul>
+        </div>
+      </div>
+    </section>
+"""
+
+    def card(label: str, value: Any, note: str, href: str | None, tone: str) -> str:
+        inner = f"""
+        <div class="decrypt-mini-card-main">
+          <span>{esc(label)}</span>
+          <strong>{esc(value)}</strong>
+        </div>
+        <em>{esc(note)}</em>
+    """
+        if href:
+            return f'<a class="decrypt-mini-card decrypt-mini-card-{esc(tone)}" href="{esc(href)}" title="{esc(note)}">{inner}</a>'
+        return f'<div class="decrypt-mini-card decrypt-mini-card-{esc(tone)}" title="{esc(note)}">{inner}</div>'
+
+    cards = [
+        card("标准图纸解密总数", standard, "结构/电气/标准图纸解密，原则上不应发生", links.get("standard"), "red"),
+        card("结构", structure, "结构标准方案解密记录", links.get("structure"), "violet"),
+        card("电气", electrical, "电气标准方案解密记录", links.get("electrical"), "amber"),
+        card("三维模型", three_d, "PRT/ASM/SLDASM/SLDPRT/STEP 解密记录", links.get("three_d"), "blue"),
+        card("DWG图纸", dwg, "DWG 图纸解密记录", links.get("dwg"), "slate"),
+        card("发现后续流转", "计算中", "后续流转链路正在后台计算", links.get("linked"), "red"),
+    ]
+    return (overview + f'<div class="decrypt-card-grid">{"".join(cards)}</div>').encode("utf-8")
 
 
 def filter_live_decrypt_records(
@@ -4480,7 +4588,8 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
         end = parse_local_datetime(period[1], config.timezone)
     except ValueError:
         return data
-    api_url = live_decrypt_url("/api/decrypt-risk-fragment", start, end)
+    summary_url = live_decrypt_url("/api/decrypt-risk-summary-fragment", start, end)
+    detail_url = live_decrypt_url("/api/decrypt-risk-fragment", start, end)
     prehide_style = """
 <style id="tq-live-decrypt-prehide">
   #decrypt-risk-tracking .decrypt-trend-panel {
@@ -4491,7 +4600,8 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
     script = f"""
 <script id="tq-live-decrypt-loader">
 (function() {{
-  var apiUrl = {json.dumps(api_url, ensure_ascii=False)};
+  var summaryUrl = {json.dumps(summary_url, ensure_ascii=False)};
+  var detailUrl = {json.dumps(detail_url, ensure_ascii=False)};
   function removePrehide() {{
     var style = document.getElementById("tq-live-decrypt-prehide");
     if (style && style.parentNode) {{
@@ -4505,34 +4615,60 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
     var original = section.innerHTML;
     var note = document.createElement("p");
     note.className = "note live-decrypt-loading";
-    note.textContent = "解密图纸风险追踪正在按当前解密数据库实时计算...";
+    note.textContent = "解密图纸风险追踪正在刷新数字，趋势和链路稍后补齐...";
     section.insertBefore(note, section.firstChild);
-    fetch(apiUrl, {{credentials: "same-origin", cache: "no-store"}})
-      .then(function(resp) {{
-        if (!resp.ok) throw new Error("HTTP " + resp.status);
-        return resp.text();
-      }})
-      .then(function(html) {{
-        var wrapper = document.createElement("div");
-        wrapper.innerHTML = html;
-        var fresh = wrapper.querySelector("#decrypt-risk-tracking");
-        if (fresh) {{
-          section.replaceWith(fresh);
-          removePrehide();
-          Array.prototype.forEach.call(wrapper.querySelectorAll("script"), function(oldScript) {{
-            var script = document.createElement("script");
-            script.text = oldScript.text || oldScript.textContent || "";
-            document.body.appendChild(script);
-          }});
-        }}
-      }})
-      .catch(function(err) {{
-        section.innerHTML = original;
+    function applySummary(html) {{
+      var wrapper = document.createElement("div");
+      wrapper.innerHTML = html;
+      var freshOverview = wrapper.querySelector("#decrypt-risk-overview");
+      var oldOverview = document.getElementById("decrypt-risk-overview");
+      if (freshOverview && oldOverview) oldOverview.replaceWith(freshOverview);
+      var freshCards = wrapper.querySelector(".decrypt-card-grid");
+      var oldCards = section.querySelector(".decrypt-card-grid");
+      if (freshCards && oldCards) oldCards.replaceWith(freshCards);
+      if (note && note.parentNode) note.textContent = "数字已刷新，趋势、公司矩阵和后续流转链路正在继续计算...";
+    }}
+    function applyDetail(html) {{
+      var wrapper = document.createElement("div");
+      wrapper.innerHTML = html;
+      var fresh = wrapper.querySelector("#decrypt-risk-tracking");
+      if (fresh) {{
+        section.replaceWith(fresh);
         removePrehide();
+        Array.prototype.forEach.call(wrapper.querySelectorAll("script"), function(oldScript) {{
+          var script = document.createElement("script");
+          script.text = oldScript.text || oldScript.textContent || "";
+          document.body.appendChild(script);
+        }});
+      }}
+    }}
+    function showError(err) {{
+      removePrehide();
+      if (note && note.parentNode) {{
+        note.textContent = "解密实时计算暂不可用，当前显示报告生成时的静态快照：" + err.message;
+      }} else {{
         var error = document.createElement("p");
         error.className = "note";
         error.textContent = "解密实时计算暂不可用，当前显示报告生成时的静态快照：" + err.message;
         section.insertBefore(error, section.firstChild);
+      }}
+    }}
+    fetch(summaryUrl, {{credentials: "same-origin", cache: "no-store"}})
+      .then(function(resp) {{
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        return resp.text();
+      }})
+      .then(applySummary)
+      .catch(showError);
+    fetch(detailUrl, {{credentials: "same-origin", cache: "no-store"}})
+      .then(function(resp) {{
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        return resp.text();
+      }})
+      .then(applyDetail)
+      .catch(function(err) {{
+        section.innerHTML = original;
+        showError(err);
       }});
   }}
   if (document.readyState === "loading") {{
@@ -5177,7 +5313,7 @@ def settings_page(config: AppConfig) -> bytes:
         <div class="actions"><a class="button primary" href="/settings/plm-login">维护PLM策略</a></div>
       </div>
       <div class="settings-card">
-        <h3>异常终端核查策略</h3>
+        <h3>风险终端复核策略</h3>
         <p class="metric">{'启用' if terminal_review.normalized_review_policy(policy_doc).get('enabled', True) else '关闭'}</p>
         <p class="muted">候选只保留标准图纸流转、普通图纸高频和敏感文件高频，人工确认后才进报告。</p>
         <div class="actions"><a class="button primary" href="/settings/terminal-behavior-review">维护核查阈值</a></div>
@@ -5791,7 +5927,7 @@ def terminal_check_page(config: AppConfig, session: AuthSession, params: dict[st
     body = f"""
     <header>
       <div>
-        <h1>异常终端行为核查</h1>
+        <h1>风险终端复核</h1>
         <div class="muted">按当前报告周期提取一级风险与终端高频明细候选，人工确认后进入日报/周报核查记录。</div>
       </div>
       <div class="actions">
@@ -5833,7 +5969,7 @@ def terminal_check_page(config: AppConfig, session: AuthSession, params: dict[st
       {terminal_reviews_table(reviews)}
     </section>
 """
-    return page_shell("异常终端行为核查", body)
+    return page_shell("风险终端复核", body)
 
 
 def terminal_check_events_page(config: AppConfig, params: dict[str, list[str]]) -> bytes:
@@ -5856,7 +5992,7 @@ def terminal_check_events_page(config: AppConfig, params: dict[str, list[str]]) 
     body = f"""
     <header>
       <div><h1>{esc(title)}</h1><div class="muted">本页直接复用报表重点明细事件与报表同款清单渲染，不再单独查询 ClickHouse 拼接简表。</div></div>
-      <div class="actions"><a class="button" href="/terminal-check?start={esc(datetime_input_value(start))}&end={esc(datetime_input_value(end))}&preset=custom">返回核查工作台</a></div>
+      <div class="actions"><a class="button" href="/terminal-check?start={esc(datetime_input_value(start))}&end={esc(datetime_input_value(end))}&preset=custom">返回复核工作台</a></div>
     </header>
     {table_html}
 """
@@ -5877,8 +6013,8 @@ def terminal_behavior_policy_page(config: AppConfig, message: str = "", error: s
     )
     body = f"""
     <header>
-      <div><h1>异常终端核查策略</h1><div class="muted">候选只取标准图纸流转、普通图纸超过阈值、敏感文件超过阈值三类；同一终端同一周期只生成一条候选。</div></div>
-      <div class="actions"><a class="button" href="/settings">策略中心</a><a class="button" href="/terminal-check">核查工作台</a></div>
+      <div><h1>风险终端复核策略</h1><div class="muted">候选只取标准图纸流转、普通图纸超过阈值、敏感文件超过阈值三类；同一终端同一周期只生成一条候选。</div></div>
+      <div class="actions"><a class="button" href="/settings">策略中心</a><a class="button" href="/terminal-check">复核工作台</a></div>
     </header>
     {f'<p class="badge on">{esc(message)}</p>' if message else ''}
     {f'<p class="badge off danger">{esc(error)}</p>' if error else ''}
@@ -5891,10 +6027,10 @@ def terminal_behavior_policy_page(config: AppConfig, message: str = "", error: s
       </label>
       {inputs}
       <p class="muted full">当前口径：标准图纸经邮件、IM、外部站点上传或外设拷贝等通道流转即入候选；普通三维/DWG 图纸默认超过 100 条入候选；敏感名称文件默认超过 1000 条入候选。</p>
-      <div class="actions"><button class="primary" type="submit">保存核查策略</button></div>
+      <div class="actions"><button class="primary" type="submit">保存复核策略</button></div>
     </form>
 """
-    return page_shell("异常终端核查策略", body)
+    return page_shell("风险终端复核策略", body)
 
 
 def keywords_page(config: AppConfig, message: str = "") -> bytes:
@@ -6956,13 +7092,13 @@ class ReportHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/terminal-check":
             if session.role not in {"admin", "global"}:
-                self.send_forbidden("仅授权查看全集团报告的用户可以进行异常终端行为核查。")
+                self.send_forbidden("仅授权查看全集团报告的用户可以进行风险终端复核。")
                 return
             self.send_html(terminal_check_page(self.config, session, parse_qs(parsed.query)))
             return
         if parsed.path == "/terminal-check/events":
             if session.role not in {"admin", "global"}:
-                self.send_forbidden("仅授权查看全集团报告的用户可以查看异常终端核查证据。")
+                self.send_forbidden("仅授权查看全集团报告的用户可以查看风险终端复核证据。")
                 return
             self.send_html(terminal_check_events_page(self.config, parse_qs(parsed.query)))
             return
@@ -7046,7 +7182,7 @@ class ReportHandler(BaseHTTPRequestHandler):
                 return
             self.send_html(job_page(self.config, job_id))
             return
-        if parsed.path in {"/api/decrypt-risk-fragment", "/api/decrypt-risk-detail"}:
+        if parsed.path in {"/api/decrypt-risk-summary-fragment", "/api/decrypt-risk-fragment", "/api/decrypt-risk-detail"}:
             params = parse_qs(parsed.query)
             try:
                 start = parse_local_datetime((params.get("start") or [""])[-1], self.config.timezone)
@@ -7062,7 +7198,10 @@ class ReportHandler(BaseHTTPRequestHandler):
                 if parsed.path == "/api/decrypt-risk-detail":
                     self.send_html(live_decrypt_detail_page(self.config, start, end, params))
                     return
-                data = live_decrypt_fragment(self.config, start, end)
+                if parsed.path == "/api/decrypt-risk-summary-fragment":
+                    data = live_decrypt_summary_fragment(self.config, start, end)
+                else:
+                    data = live_decrypt_fragment(self.config, start, end)
             except Exception as exc:
                 data = (
                     '<section id="decrypt-risk-tracking" class="section-block decrypt-risk-shell">'
@@ -7175,7 +7314,7 @@ class ReportHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/terminal-check/review":
             if session.role not in {"admin", "global"}:
-                self.send_forbidden("仅授权查看全集团报告的用户可以保存异常终端核查记录。")
+                self.send_forbidden("仅授权查看全集团报告的用户可以保存风险终端复核记录。")
                 return
             self.handle_terminal_check_review_post(form, session)
             return
@@ -7822,7 +7961,7 @@ class ReportHandler(BaseHTTPRequestHandler):
                 data = suppress_static_ai_section(data)
             data = inject_identity_bar(data, session)
             data = inject_report_navigation_patch(data, self.config, target)
-            data = inject_global_management_summary(data)
+            data = inject_global_management_summary(data, self.config, target)
             data = inject_terminal_behavior_review_summary(data, self.config, target)
             data = inject_home_history_dropdown(data, self.config, session)
             data = inject_temporary_report_cleanup(data, self.config, target)

@@ -11181,6 +11181,64 @@ def build_html_report(
       font-weight: 720;
       line-height: 1.75;
     }}
+    .management-summary-list {{
+      display: grid;
+      gap: 10px;
+    }}
+    .management-summary-row {{
+      display: grid;
+      grid-template-columns: 150px minmax(0, 1fr);
+      align-items: center;
+      gap: 14px;
+      min-height: 54px;
+      border: 1px solid #dbe6f3;
+      border-radius: 12px;
+      padding: 12px 15px;
+      color: #122033;
+      background: #ffffff;
+      box-shadow: 0 8px 18px rgba(18, 32, 51, 0.045);
+      text-decoration: none;
+    }}
+    .management-summary-row:hover {{
+      border-color: #93c5fd;
+      box-shadow: 0 10px 22px rgba(18, 32, 51, 0.065);
+    }}
+    .management-summary-row span {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 30px;
+      border-radius: 999px;
+      padding: 0 12px;
+      background: #eff6ff;
+      color: #175cd3;
+      font-size: 13px;
+      font-weight: 900;
+      white-space: nowrap;
+    }}
+    .management-summary-row p {{
+      margin: 0;
+      color: #344054;
+      font-size: 15px;
+      font-weight: 780;
+      line-height: 1.6;
+    }}
+    .management-summary-row-decrypt span {{
+      background: #f5f3ff;
+      color: #6d28d9;
+    }}
+    .management-summary-row-tianqing span {{
+      background: #ecfdf3;
+      color: #08746f;
+    }}
+    .management-summary-row-plm span {{
+      background: #fffbeb;
+      color: #b45309;
+    }}
+    .management-summary-row-review span {{
+      background: #eef4ff;
+      color: #175cd3;
+    }}
     .management-module-grid {{
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -11549,6 +11607,7 @@ def build_html_report(
       .section-block {{ padding: 18px; }}
       .section-title-row {{ flex-direction: column; }}
       .global-management-head {{ flex-direction: column; align-items: flex-start; }}
+      .management-summary-row {{ grid-template-columns: 1fr; align-items: flex-start; }}
       .management-module-grid {{ grid-template-columns: 1fr; }}
       .audit-domain-head {{ flex-direction: column; align-items: flex-start; }}
       .audit-domain-source {{ text-align: left; }}
@@ -11588,7 +11647,7 @@ def build_html_report(
         </div>
         <div class="top-actions">
           <a class="top-action" href="{esc(settings_url)}">策略管理</a>
-          <a class="top-action" href="{esc(terminal_check_url)}">异常终端行为核查</a>
+          <a class="top-action" href="{esc(terminal_check_url)}">风险终端复核</a>
           <a class="top-action" href="{esc(home_url)}">当前报告首页</a>
         </div>
       </div>

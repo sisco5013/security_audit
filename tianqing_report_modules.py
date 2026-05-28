@@ -166,6 +166,7 @@ def build_global_management_summary_html(
     decrypt_metrics: dict[str, Any] | None,
     tianqing_metrics: dict[str, Any] | None,
     plm_metrics: dict[str, Any] | None = None,
+    review_metrics: dict[str, Any] | None = None,
 ) -> str:
     decrypt_standard = _metric_int(decrypt_metrics, "standard")
     decrypt_structure = _metric_int(decrypt_metrics, "structure")
@@ -185,6 +186,9 @@ def build_global_management_summary_html(
         if plm_enabled
         else "接口接入后重点校验技术、研发、工艺账号是否从 MAC+计算机名授信终端登录。"
     )
+    review_total = _metric_int(review_metrics, "total")
+    review_pending = _metric_int(review_metrics, "pending")
+    review_done = _metric_int(review_metrics, "reviewed")
 
     if decrypt_standard or tianqing_critical or plm_risks:
         lead = (
@@ -195,38 +199,41 @@ def build_global_management_summary_html(
     else:
         lead = "本周期三大审计模块暂无一级风险数据，仍按标准图纸解密、天擎标准图纸外发/拷贝和 PLM 池外登录保留持续监测。"
 
-    action = (
-        "顶部只呈现各模块一级风险；普通三维、DWG、敏感名称、压缩包、趋势、组织和终端细节由各模块详述并下钻复核。"
-    )
+    def row_html(label: str, body: str, href: str = "", tone: str = "blue") -> str:
+        tag = "a" if href else "div"
+        href_attr = f' href="{_esc(href)}"' if href else ""
+        return f"""
+        <{tag} class="management-summary-row management-summary-row-{_esc(tone)}"{href_attr}>
+          <span>{_esc(label)}</span>
+          <p>{_esc(body)}</p>
+        </{tag}>"""
 
-    cards = "".join(
-        [
-            _summary_card_html(
-                "加密软件解密审计",
-                f"{decrypt_standard}",
-                f"标准图纸解密：结构 {decrypt_structure} / 电气 {decrypt_electrical}",
-                "只汇总结构、电气等标准图纸解密；三维模型、DWG、压缩包及后续流转由解密模块详述。",
-                "#decrypt-audit",
-                "decrypt",
-            ),
-            _summary_card_html(
-                "天擎外发审计",
-                f"{tianqing_critical}",
-                f"标准图纸外发/拷贝：结构 {tianqing_structure} / 电气 {tianqing_electrical} / 油变 {tianqing_yb}",
-                "只汇总结构、电气、油变等标准图纸经邮件、IM、上传或外设拷贝的一级风险；其他对象由天擎模块详述。",
-                "#tianqing-audit",
-                "tianqing",
-            ),
-            _summary_card_html(
-                "PLM登录审计",
-                plm_value,
-                plm_label,
-                plm_detail,
-                "#plm-login-audit" if plm_enabled else "",
-                "plm",
-            ),
-        ]
-    )
+    rows = [
+        row_html(
+            "加密软件解密审计",
+            f"一级风险：标准图纸解密 {decrypt_standard} 条，其中结构 {decrypt_structure} 条、电气 {decrypt_electrical} 条。",
+            "#decrypt-audit",
+            "decrypt",
+        ),
+        row_html(
+            "天擎外发审计",
+            f"一级风险：标准图纸外发/拷贝 {tianqing_critical} 条，其中结构 {tianqing_structure} 条、电气 {tianqing_electrical} 条、油变 {tianqing_yb} 条。",
+            "#tianqing-audit",
+            "tianqing",
+        ),
+        row_html(
+            "PLM登录审计",
+            f"一级风险：{plm_label}{(' ' + str(plm_risks) + ' 条') if plm_enabled else '，当前未纳入统计'}。{plm_detail}",
+            "#plm-login-audit" if plm_enabled else "",
+            "plm",
+        ),
+        row_html(
+            "风险终端复核记录",
+            f"本周期人工复核记录 {review_total} 条，待复核 {review_pending} 条，已复核 {review_done} 条。",
+            "/terminal-check",
+            "review",
+        ),
+    ]
 
     return f"""
     <section id="global-management-summary" class="global-management-summary" aria-labelledby="global-management-summary-title">
@@ -237,10 +244,9 @@ def build_global_management_summary_html(
         </div>
         <p>{_esc(lead)}</p>
       </div>
-      <div class="management-module-grid">
-        {cards}
+      <div class="management-summary-list">
+        {"".join(rows)}
       </div>
-      <p class="global-management-action">{_esc(action)}</p>
     </section>
 """
 

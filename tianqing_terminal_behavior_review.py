@@ -923,7 +923,7 @@ def report_summary_html(config: Any, start: datetime, end: datetime) -> str:
         return f"""
     <section id="terminal-behavior-review-summary" class="section-block terminal-review-summary">
       <div class="section-title-row">
-        <div><span class="section-eyebrow">Manual Review</span><h2>人工异常终端核查</h2><p>核查记录暂不可用：{esc(exc)}</p></div>
+        <div><span class="section-eyebrow">Manual Review</span><h2>风险终端复核</h2><p>复核记录暂不可用：{esc(exc)}</p></div>
       </div>
     </section>
 """
@@ -931,8 +931,8 @@ def report_summary_html(config: Any, start: datetime, end: datetime) -> str:
         return """
     <section id="terminal-behavior-review-summary" class="section-block terminal-review-summary">
       <div class="section-title-row">
-        <div><span class="section-eyebrow">Manual Review</span><h2>人工异常终端核查</h2><p>本周期暂无人工确认进入报告的异常终端核查记录；候选线索请进入工作台处理。</p></div>
-        <a class="section-action" href="/terminal-check">进入核查工作台</a>
+        <div><span class="section-eyebrow">Manual Review</span><h2>风险终端复核</h2><p>本周期暂无人工确认进入报告的风险终端复核记录；候选线索请进入复核工作台处理。</p></div>
+        <a class="section-action" href="/terminal-check">进入复核工作台</a>
       </div>
     </section>
 """
@@ -953,10 +953,10 @@ def report_summary_html(config: Any, start: datetime, end: datetime) -> str:
       <div class="section-title-row">
         <div>
           <span class="section-eyebrow">Manual Review</span>
-          <h2>人工异常终端核查</h2>
-          <p>仅展示审核员人工确认进入报告的核查记录；周报按事件发生时间自动汇总日报核查结果。</p>
+          <h2>风险终端复核</h2>
+          <p>仅展示审核员人工确认进入报告的复核记录；周报按事件发生时间自动汇总日报复核结果。</p>
         </div>
-        <a class="section-action" href="/terminal-check">进入核查工作台</a>
+        <a class="section-action" href="/terminal-check">进入复核工作台</a>
       </div>
       <div class="terminal-review-chip-grid">{chip_html}</div>
       <p class="note">本周期核查集中公司：{esc(top_company)}；高频终端：{esc(top_terminal)}。候选未人工确认前不进入正式报告。</p>
