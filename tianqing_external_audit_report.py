@@ -367,6 +367,7 @@ IM_FILE_SEND_PROCESS_NAMES = {
     "wxwork.exe",
     "wxwork",
 }
+WECOM_PROCESS_NAMES = {"wxwork.exe", "wxwork", "wecom.exe", "wecom"}
 UPLOAD_NOISE_HINTS = {
     "bugreport",
     "cos.ap-beijing.myqcloud.com",
@@ -2000,9 +2001,20 @@ def apply_report_policies(
         apply_mail_sender_policy(event, internal_domains)
         apply_design_control_policy(event)
         apply_sensitive_keyword_policy(event)
+        normalize_untrusted_internal_im_relation(event)
     enrich_file_audit_im_recipients(events)
     for event in events:
+        normalize_untrusted_internal_im_relation(event)
         assign_event_priority(event, internal_domains)
+
+
+def normalize_untrusted_internal_im_relation(event: AuditEvent) -> None:
+    if event.recipient_relation != "internal":
+        return
+    if event.topic == "im_audit" and not is_wecom_process_name(event.process_name):
+        event.recipient_relation = "unknown"
+    elif is_im_file_audit_event(event) and not is_wecom_process_name(event.process_name):
+        event.recipient_relation = "unknown"
 
 
 def is_im_file_audit_event(event: AuditEvent) -> bool:
@@ -2826,6 +2838,18 @@ def is_file_rename_event(event: AuditEvent) -> bool:
     return event.topic == "file_audit" and (event.channel == "文件重命名" or "文件重命名" in event.reasons)
 
 
+def is_trusted_internal_flow_event(event: AuditEvent) -> bool:
+    if event.recipient_relation != "internal":
+        return False
+    if event.topic == "mail_audit":
+        return True
+    if event.topic == "im_audit":
+        return is_wecom_process_name(event.process_name)
+    if is_im_file_audit_event(event):
+        return is_wecom_process_name(event.process_name)
+    return False
+
+
 def is_leadership_focus_event(event: AuditEvent, internal_domains: set[str] | None = None) -> bool:
     internal_domains = internal_domains or DEFAULT_INTERNAL_DOMAINS
     if is_normal_procurement_inquiry_event(event):
@@ -2834,7 +2858,7 @@ def is_leadership_focus_event(event: AuditEvent, internal_domains: set[str] | No
         return False
     if is_upload_noise_event(event, set(internal_domains)):
         return False
-    if event.recipient_relation == "internal" and not is_peripheral_copy_event(event):
+    if is_trusted_internal_flow_event(event) and not is_peripheral_copy_event(event):
         return False
 
     names = non_image_file_names(event.file_names)
@@ -3498,6 +3522,7 @@ def load_wecom_directory_items(args: argparse.Namespace) -> tuple[list[dict[str,
 
 def build_wecom_recipient_map(items: list[dict[str, Any]]) -> dict[tuple[str, str], RecipientEntry]:
     mapping: dict[tuple[str, str], RecipientEntry] = {}
+    name_counts = Counter(str(item.get("name") or "").strip() for item in items if str(item.get("name") or "").strip())
     for item in items:
         name = str(item.get("name") or "").strip()
         userid = str(item.get("userid") or "").strip()
@@ -3513,12 +3538,71 @@ def build_wecom_recipient_map(items: list[dict[str, Any]]) -> dict[tuple[str, st
             organization=org_label or "企业微信通讯录",
             note="wecom_directory",
         )
-        if name:
+        if name and name_counts[name] == 1:
             mapping.setdefault(("im_nickname", normalize_key(name)), entry)
             mapping.setdefault(("recipient", normalize_key(name)), entry)
         if userid:
             mapping.setdefault(("im_account", normalize_key(userid)), entry)
             mapping.setdefault(("recipient", normalize_key(userid)), entry)
+    return mapping
+
+
+def load_observed_wecom_account_recipient_map(
+    args: argparse.Namespace,
+    wecom_people_map: dict[tuple[str, str], PeopleEntry],
+) -> dict[tuple[str, str], RecipientEntry]:
+    if not wecom_people_map or not getattr(args, "use_clickhouse", False):
+        return {}
+    process_names = clickhouse_array_literal(sorted(WECOM_PROCESS_NAMES))
+    query = f"""
+SELECT local_account, local_nickname, max(ts) AS last_ts
+FROM
+(
+    SELECT
+        JSONExtractString(raw_json, 'local_account') AS local_account,
+        JSONExtractString(raw_json, 'local_nickname') AS local_nickname,
+        lowerUTF8(JSONExtractString(raw_json, 'process_name')) AS process_name,
+        ts
+    FROM raw_syslog
+    WHERE topic = 'im_audit'
+      AND length(JSONExtractString(raw_json, 'local_account')) > 0
+      AND length(JSONExtractString(raw_json, 'local_nickname')) > 0
+      AND lowerUTF8(JSONExtractString(raw_json, 'process_name')) IN {process_names}
+)
+GROUP BY local_account, local_nickname
+FORMAT JSONEachRow
+"""
+    try:
+        text = clickhouse_query(args, query)
+    except Exception:
+        return {}
+    mapping: dict[tuple[str, str], RecipientEntry] = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        account = str(row.get("local_account") or "").strip()
+        nickname = str(row.get("local_nickname") or "").strip()
+        if not account or not nickname:
+            continue
+        entry = (
+            wecom_people_map.get(("im_nickname", normalize_key(nickname)))
+            or wecom_people_map.get(("person", normalize_key(nickname)))
+            or wecom_people_map.get(("identity_hint", normalize_key(nickname)))
+        )
+        if not entry:
+            continue
+        org_label = " / ".join([value for value in [entry.company, entry.department] if value])
+        recipient = RecipientEntry(
+            match_type="im_account",
+            match_value=account,
+            relation="internal",
+            recipient_name=entry.person_name or nickname,
+            organization=org_label or "企业微信通讯录",
+            note="wecom_observed_account",
+        )
+        mapping.setdefault(("im_account", normalize_key(account)), recipient)
+        mapping.setdefault(("recipient", normalize_key(account)), recipient)
     return mapping
 
 
@@ -3726,6 +3810,12 @@ def split_im_target(target: str) -> tuple[str, str]:
     match = re.fullmatch(r"\s*(.*?)\s*<([^<>]+)>\s*", target)
     if match:
         return match.group(1).strip(), match.group(2).strip()
+    match = re.fullmatch(r"\s*(.*?)\s*[（(]([^()（）<>]+)[）)]\s*", target)
+    if match:
+        nickname = match.group(1).strip()
+        account = match.group(2).strip()
+        if re.fullmatch(r"[A-Za-z0-9_-]{5,64}", account):
+            return nickname, account
     return target.strip(), target.strip()
 
 
@@ -3742,6 +3832,54 @@ def looks_like_im_recipient_token(value: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9_-]{5,64}", text))
 
 
+def is_wecom_process_name(process_name: Any) -> bool:
+    return normalize_key(process_name) in WECOM_PROCESS_NAMES
+
+
+def recipient_entry_trusted_for_im(entry: RecipientEntry, trust_wecom_directory: bool) -> bool:
+    if trust_wecom_directory:
+        return True
+    if entry.note in {"wecom_directory", "wecom_observed_account"}:
+        return False
+    if entry.relation == "internal":
+        return False
+    return True
+
+
+def im_recipient_entry_for_target(
+    nickname: str,
+    account: str,
+    target: str,
+    recipient_map: dict[tuple[str, str], RecipientEntry],
+    trust_wecom_directory: bool,
+) -> RecipientEntry | None:
+    account_entry = recipient_entry_for("im_account", account, recipient_map)
+    if account_entry:
+        if recipient_entry_trusted_for_im(account_entry, trust_wecom_directory):
+            return account_entry
+    if account:
+        for entry in (
+            recipient_entry_for("im_nickname", nickname, recipient_map),
+            recipient_entry_for("recipient", target, recipient_map),
+        ):
+            if (
+                entry
+                and entry.note not in {"wecom_directory", "wecom_observed_account"}
+                and entry.relation != "internal"
+                and recipient_entry_trusted_for_im(entry, trust_wecom_directory)
+            ):
+                return entry
+        return None
+    for entry in (recipient_entry_for("im_nickname", nickname, recipient_map), recipient_entry_for("recipient", target, recipient_map)):
+        if not entry:
+            continue
+        if entry.note in {"wecom_directory", "wecom_observed_account"}:
+            continue
+        if recipient_entry_trusted_for_im(entry, trust_wecom_directory):
+            return entry
+    return None
+
+
 def classify_recipients(
     topic: str,
     targets: list[str],
@@ -3749,6 +3887,7 @@ def classify_recipients(
     internal_domains: set[str],
     recipient_map: dict[tuple[str, str], RecipientEntry],
     wecom_directory_authoritative: bool = False,
+    trust_wecom_directory: bool = True,
 ) -> tuple[list[str], str]:
     external_like: list[str] = []
     internal_like: list[str] = []
@@ -3780,11 +3919,7 @@ def classify_recipients(
     elif topic == "im_audit":
         for target in targets:
             nickname, account = split_im_target(target)
-            entry = (
-                recipient_entry_for("im_account", account, recipient_map)
-                or recipient_entry_for("im_nickname", nickname, recipient_map)
-                or recipient_entry_for("recipient", target, recipient_map)
-            )
+            entry = im_recipient_entry_for_target(nickname, account, target, recipient_map, trust_wecom_directory)
             if entry:
                 if entry.relation == "internal":
                     has_internal = True
@@ -3802,11 +3937,7 @@ def classify_recipients(
     else:
         for target in targets:
             nickname, account = split_im_target(target)
-            im_entry = (
-                recipient_entry_for("im_account", account, recipient_map)
-                or recipient_entry_for("im_nickname", nickname, recipient_map)
-                or recipient_entry_for("recipient", target, recipient_map)
-            )
+            im_entry = im_recipient_entry_for_target(nickname, account, target, recipient_map, trust_wecom_directory)
             if im_entry:
                 if im_entry.relation == "internal":
                     has_internal = True
@@ -4046,6 +4177,7 @@ def build_event(
         internal_domains,
         recipient_map,
         wecom_directory_authoritative=wecom_directory_authoritative,
+        trust_wecom_directory=topic not in {"im_audit", "file_audit"} or is_wecom_process_name(process_name),
     )
     if recipient_relation == "internal" and not external_sender_mailbox and topic not in {"im_audit", "file_audit"}:
         return None
@@ -4338,7 +4470,7 @@ def event_department_label(event: AuditEvent) -> str:
 
 def im_channel_label(event: AuditEvent) -> str:
     process = normalize_key(event.process_name)
-    if process in {"wxwork.exe", "wxwork", "wecom.exe", "wecom"}:
+    if process in WECOM_PROCESS_NAMES:
         return "企业微信"
     if process in {"dingtalk.exe", "dingtalk"}:
         return "钉钉"
@@ -11869,9 +12001,10 @@ def main() -> int:
         if not wecom_meta.get("ok"):
             return 1
         return 0
-    recipient_map = build_wecom_recipient_map(wecom_items)
-    recipient_map.update(load_recipient_map(args.recipient_map))
     wecom_people_map = build_wecom_people_map(wecom_items)
+    recipient_map = build_wecom_recipient_map(wecom_items)
+    recipient_map.update(load_observed_wecom_account_recipient_map(args, wecom_people_map))
+    recipient_map.update(load_recipient_map(args.recipient_map))
     args.people_map_loaded = people_map
     args.wecom_people_map_loaded = wecom_people_map
     disposition_by_event_id, disposition_by_search_id = load_dispositions(args.disposition_file)

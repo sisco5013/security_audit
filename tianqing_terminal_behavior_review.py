@@ -300,15 +300,48 @@ def is_external_mailbox(mailbox: str) -> bool:
     return bool(domain and domain != "daqo.com")
 
 
+def is_wecom_process_name(process_name: Any) -> bool:
+    return normalize_key(process_name) in {"wxwork.exe", "wxwork", "wecom.exe", "wecom"}
+
+
+def trusted_internal_sql() -> str:
+    wecom_processes = "('wxwork.exe','wxwork','wecom.exe','wecom')"
+    return (
+        "(recipient_relation = 'internal' AND ("
+        "topic = 'mail_audit' "
+        f"OR (topic = 'im_audit' AND lowerUTF8(process_name) IN {wecom_processes}) "
+        f"OR (topic = 'file_audit' AND channel = '应用发送/传输' AND lowerUTF8(process_name) IN {wecom_processes})"
+        "))"
+    )
+
+
+def is_im_file_send_row(event: dict[str, Any]) -> bool:
+    return (
+        str(event.get("topic") or "") == "file_audit"
+        and str(event.get("channel") or "") == "应用发送/传输"
+        and is_wecom_process_name(event.get("process_name"))
+    )
+
+
+def trusted_internal_row(event: dict[str, Any]) -> bool:
+    if str(event.get("recipient_relation") or "").strip().lower() != "internal":
+        return False
+    topic = str(event.get("topic") or "")
+    if topic == "mail_audit":
+        return True
+    if topic == "im_audit":
+        return is_wecom_process_name(event.get("process_name"))
+    return is_im_file_send_row(event)
+
+
 def candidate_scope_event(event: dict[str, Any]) -> bool:
     channel = display_channel(event)
     reasons = {str(reason) for reason in event.get("reasons") or []}
-    relation = str(event.get("recipient_relation") or "").strip().lower()
     if channel == "内部系统上传" or "内部系统上传" in reasons:
         return False
     if channel == "文件重命名" or "文件重命名" in reasons:
         return False
-    if relation == "internal":
+    if trusted_internal_row(event):
         return False
     return True
 
@@ -523,7 +556,6 @@ WHERE ts >= parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
   AND ts < parseDateTime64BestEffort({ch_quote(end.isoformat())}, 3)
   AND topic IN ('mail_audit','im_audit','file_audit')
   AND length(file_names) > 0
-  AND recipient_relation != 'internal'
   AND channel != '内部系统上传'
   AND channel != '文件重命名'
   AND NOT has(reasons, '内部系统上传')
@@ -576,7 +608,7 @@ WHERE ts >= parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
   AND ts < parseDateTime64BestEffort({ch_quote(end.isoformat())}, 3)
   AND topic IN ('mail_audit','im_audit','file_audit')
   AND length(file_names) > 0
-  AND recipient_relation != 'internal'
+  AND NOT {trusted_internal_sql()}
   AND channel != '内部系统上传'
   AND channel != '文件重命名'
   AND NOT has(reasons, '内部系统上传')
@@ -642,7 +674,7 @@ WHERE ts >= parseDateTime64BestEffort({ch_quote(baseline_start.isoformat())}, 3)
   AND ts < parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
   AND topic IN ('mail_audit','im_audit','file_audit')
   AND length(file_names) > 0
-  AND recipient_relation != 'internal'
+  AND NOT {trusted_internal_sql()}
   AND channel != '内部系统上传'
   AND channel != '文件重命名'
   AND NOT has(reasons, '内部系统上传')

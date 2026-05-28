@@ -327,7 +327,7 @@ def strategy_fingerprint(args: argparse.Namespace) -> str:
         "audit_policy": file_digest(args.audit_policy_file),
         "exclusions": file_digest(args.exclusion_file),
         "recipient_map": file_digest(args.recipient_map),
-        "schema": 5,
+        "schema": 6,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -513,9 +513,10 @@ def load_context(args: argparse.Namespace):
             wecom_items = [item for item in items if isinstance(item, dict)]
     except Exception:
         wecom_items = []
-    recipient_map = report.build_wecom_recipient_map(wecom_items)
-    recipient_map.update(report.load_recipient_map(args.recipient_map))
     wecom_people_map = report.build_wecom_people_map(wecom_items)
+    recipient_map = report.build_wecom_recipient_map(wecom_items)
+    recipient_map.update(report.load_observed_wecom_account_recipient_map(args, wecom_people_map))
+    recipient_map.update(report.load_recipient_map(args.recipient_map))
     disposition_by_event_id, disposition_by_search_id = report.load_dispositions(args.disposition_file)
     return exclusion_rules, people_map, wecom_people_map, recipient_map, disposition_by_event_id, disposition_by_search_id
 

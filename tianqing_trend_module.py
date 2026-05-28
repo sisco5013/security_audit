@@ -287,7 +287,14 @@ def clickhouse_matrix_classification_exprs(internal_domains: set[str] | None = N
     )
     focus_expr = (
         "("
-        "recipient_relation != 'internal' "
+        "NOT ("
+        "recipient_relation = 'internal' "
+        "AND ("
+        "topic = 'mail_audit' "
+        "OR (topic = 'im_audit' AND lowerUTF8(process_name) IN ('wxwork.exe','wxwork','wecom.exe','wecom')) "
+        "OR (topic = 'file_audit' AND channel = '应用发送/传输' AND lowerUTF8(process_name) IN ('wxwork.exe','wxwork','wecom.exe','wecom'))"
+        ")"
+        ") "
         f"AND NOT ({rename_expr}) "
         f"AND NOT ({upload_noise_expr}) "
         "AND NOT ("
