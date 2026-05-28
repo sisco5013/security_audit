@@ -6154,6 +6154,80 @@ def terminal_check_css() -> str:
   .terminal-check-hidden {
     display: none;
   }
+  .terminal-check-live-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 16px 0 4px;
+    color: #475467;
+    font-size: 13px;
+    font-weight: 760;
+  }
+  .terminal-check-live-status::before {
+    content: "";
+    width: 7px;
+    height: 7px;
+    border-radius: 999px;
+    background: #175cd3;
+    box-shadow: 11px 0 0 rgba(23, 92, 211, .38), 22px 0 0 rgba(23, 92, 211, .18);
+    animation: terminalCheckDots 1.05s infinite ease-in-out;
+  }
+  .terminal-check-dot-value {
+    position: relative;
+    display: inline-flex;
+    min-width: 22px;
+    min-height: 20px;
+    align-items: center;
+    justify-content: center;
+    color: transparent !important;
+  }
+  .terminal-check-dot-value::after {
+    content: "...";
+    position: absolute;
+    inset: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: #175cd3;
+    font-weight: 900;
+    letter-spacing: 1px;
+    animation: terminalCheckTextDots 1.05s infinite ease-in-out;
+  }
+  .terminal-check-skeleton-text {
+    display: block;
+    width: 72%;
+    height: 10px;
+    margin: 0 auto;
+    border-radius: 999px;
+    background: linear-gradient(110deg, #edf3fb 8%, #f8fbff 28%, #edf3fb 46%);
+    background-size: 220% 100%;
+    animation: terminalCheckShimmer 1.35s ease-in-out infinite;
+  }
+  .terminal-check-skeleton-text.short { width: 46%; }
+  .terminal-check-live[data-terminal-check-loading="1"] .terminal-check-chip strong,
+  .terminal-check-live[data-terminal-check-loading="1"] .terminal-check-chip span {
+    position: relative;
+    color: transparent !important;
+  }
+  .terminal-check-live[data-terminal-check-loading="1"] .terminal-check-chip strong::after {
+    content: "...";
+    position: absolute;
+    inset: 0;
+    display: inline-flex;
+    align-items: center;
+    color: #175cd3;
+    font-weight: 900;
+    letter-spacing: 1px;
+    animation: terminalCheckTextDots 1.05s infinite ease-in-out;
+  }
+  .terminal-check-live[data-terminal-check-loading="1"] .terminal-check-chip span::after {
+    content: attr(data-loading-label);
+    position: absolute;
+    inset: 0;
+    display: inline-flex;
+    align-items: center;
+    color: #667085;
+  }
   .terminal-check-loading {
     margin-top: 18px;
     border: 1px solid #d8e4f2;
@@ -6190,6 +6264,19 @@ def terminal_check_css() -> str:
   @keyframes terminalCheckLoading {
     0% { transform: translateX(-105%); }
     100% { transform: translateX(275%); }
+  }
+  @keyframes terminalCheckDots {
+    0%, 100% { box-shadow: 11px 0 0 rgba(23, 92, 211, .38), 22px 0 0 rgba(23, 92, 211, .18); }
+    33% { box-shadow: 11px 0 0 #175cd3, 22px 0 0 rgba(23, 92, 211, .38); }
+    66% { box-shadow: 11px 0 0 rgba(23, 92, 211, .38), 22px 0 0 #175cd3; }
+  }
+  @keyframes terminalCheckTextDots {
+    0%, 100% { opacity: .42; }
+    50% { opacity: 1; }
+  }
+  @keyframes terminalCheckShimmer {
+    0% { background-position: 180% 0; }
+    100% { background-position: -60% 0; }
   }
   @media (max-width: 980px) {
     .terminal-check-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -6252,6 +6339,14 @@ def terminal_check_metrics_html(candidates: list[terminal_review.TerminalBehavio
     ]
     return '<div class="terminal-check-grid">' + "".join(
         f'<div class="terminal-check-chip"><span>{esc(label)}</span><strong>{esc(value)}</strong></div>' for label, value in chips
+    ) + "</div>"
+
+
+def terminal_check_loading_metrics_html() -> str:
+    labels = ["候选异常终端", "已人工确认", "进入报告", "最高频类型"]
+    return '<div class="terminal-check-grid">' + "".join(
+        f'<div class="terminal-check-chip"><span data-loading-label="{esc(label)}">{esc(label)}</span><strong>...</strong></div>'
+        for label in labels
     ) + "</div>"
 
 
@@ -6390,6 +6485,76 @@ def terminal_candidates_table(candidates: list[terminal_review.TerminalBehaviorC
 """
 
 
+def terminal_check_matrix_colgroup(channels: list[str], columns: list[str]) -> str:
+    return (
+        '<colgroup>'
+        '<col class="rank-col"><col class="company-col"><col class="department-col"><col class="person-col"><col class="ip-col">'
+        + "".join('<col class="number-col">' for _ in range(len(channels) * len(columns)))
+        + '<col class="total-col"><col class="action-col"><col class="action-col">'
+        '</colgroup>'
+    )
+
+
+def terminal_check_matrix_headers(channels: list[str], columns: list[str]) -> tuple[str, str]:
+    channel_headers = "".join(
+        f'<th class="channel-head" colspan="{len(columns)}" title="{esc(channel)}">{esc(report_gen.CHANNEL_MATRIX_SHORT_LABELS.get(channel, channel))}</th>'
+        for channel in channels
+    )
+    object_headers = "".join(
+        f'<th title="{esc(channel)} / {esc(column)}">{esc(terminal_check_short_label(column))}</th>'
+        for channel in channels
+        for column in columns
+    )
+    return channel_headers, object_headers
+
+
+def terminal_candidates_loading_table(row_count: int = 8) -> str:
+    channels = list(report_gen.CHANNEL_MATRIX_BASE_ROWS)
+    columns = list(report_gen.CHANNEL_MATRIX_COLUMNS)
+    channel_headers, object_headers = terminal_check_matrix_headers(channels, columns)
+    colgroup = terminal_check_matrix_colgroup(channels, columns)
+    matrix_cell_count = len(channels) * len(columns)
+    rows: list[str] = []
+    for idx in range(1, row_count + 1):
+        matrix_cells = "".join('<td><span class="terminal-check-dot-value">...</span></td>' for _ in range(matrix_cell_count))
+        rows.append(
+            f"""
+<tr>
+  <td class="rank-cell">{idx}</td>
+  <td class="identity-cell"><span class="terminal-check-skeleton-text"></span></td>
+  <td class="identity-cell"><span class="terminal-check-skeleton-text short"></span></td>
+  <td class="identity-cell"><span class="terminal-check-skeleton-text short"></span></td>
+  <td class="ip-cell"><span class="terminal-check-skeleton-text"></span></td>
+  {matrix_cells}
+  <td><span class="terminal-check-dot-value">...</span></td>
+  <td class="review-action-cell"><span class="terminal-check-action">待核查</span></td>
+  <td class="review-action-cell"><span class="terminal-check-action">填写</span></td>
+</tr>"""
+        )
+    return f"""
+<div class="terminal-check-matrix-wrap">
+  <table class="terminal-check-matrix" data-matrix-data-cols="{matrix_cell_count}">
+    {colgroup}
+    <thead>
+      <tr>
+        <th rowspan="2">#</th>
+        <th rowspan="2">公司</th>
+        <th rowspan="2">部门</th>
+        <th rowspan="2">使用人</th>
+        <th rowspan="2">IP地址</th>
+        {channel_headers}
+        <th rowspan="2">合计</th>
+        <th rowspan="2">核查状态</th>
+        <th rowspan="2">核查结果</th>
+      </tr>
+      <tr>{object_headers}</tr>
+    </thead>
+    <tbody>{''.join(rows)}</tbody>
+  </table>
+</div>
+"""
+
+
 def terminal_reviews_table(reviews: list[terminal_review.TerminalBehaviorReview]) -> str:
     if not reviews:
         return '<p class="muted">当前周期暂无已保存核查记录。</p>'
@@ -6408,6 +6573,34 @@ def terminal_reviews_table(reviews: list[terminal_review.TerminalBehaviorReview]
   <td class="compact" title="{esc(review.conclusion)}">{esc(review.conclusion or "-")}</td>
   <td>{esc(review.reviewer_name or review.reviewer_userid)}<br><span class="muted">{esc(review.review_time[:19])}</span></td>
   <td>{esc('是' if review.include_in_report else '否')}</td>
+</tr>"""
+        )
+    return f"""
+<div class="table-wrap">
+  <table class="terminal-check-table">
+    <thead><tr><th>事件时间</th><th>入选原因</th><th>公司/部门</th><th>使用人</th><th>IP地址</th><th>事件数</th><th>核查状态</th><th>核查结果</th><th>审核人</th><th>进入报告</th></tr></thead>
+    <tbody>{''.join(rows)}</tbody>
+  </table>
+</div>
+"""
+
+
+def terminal_reviews_loading_table(row_count: int = 3) -> str:
+    rows = []
+    for _idx in range(row_count):
+        rows.append(
+            """
+<tr>
+  <td><span class="terminal-check-skeleton-text"></span></td>
+  <td><span class="terminal-check-skeleton-text"></span></td>
+  <td><span class="terminal-check-skeleton-text"></span></td>
+  <td><span class="terminal-check-skeleton-text short"></span></td>
+  <td><span class="terminal-check-skeleton-text"></span></td>
+  <td><span class="terminal-check-dot-value">...</span></td>
+  <td><span class="terminal-check-action">待核查</span></td>
+  <td><span class="terminal-check-skeleton-text short"></span></td>
+  <td><span class="terminal-check-skeleton-text"></span></td>
+  <td><span class="terminal-check-dot-value">...</span></td>
 </tr>"""
         )
     return f"""
@@ -6454,10 +6647,28 @@ def terminal_check_work_area_html(
 
 def terminal_check_loading_html(start: datetime, end: datetime) -> str:
     return f"""
-<div class="terminal-check-loading" data-terminal-check-loading="1">
-  <strong>正在生成风险终端候选</strong>
-  <div>统计周期：{esc(start.strftime('%Y-%m-%d %H:%M'))} 至 {esc(end.strftime('%Y-%m-%d %H:%M'))}。页面已打开，候选会在后台完成后自动显示。</div>
-  <div class="terminal-check-loading-bar" aria-hidden="true"></div>
+<div class="terminal-check-live" data-terminal-check-loading="1">
+  <p class="terminal-check-live-status">风险终端候选正在计算，矩阵结构已就绪，数字和候选行稍后自动刷新</p>
+  {terminal_check_loading_metrics_html()}
+  <form class="terminal-check-review-form" method="post" action="/terminal-check/review" aria-busy="true">
+    <input type="hidden" name="start" value="{esc(datetime_input_value(start))}">
+    <input type="hidden" name="end" value="{esc(datetime_input_value(end))}">
+    <section class="terminal-check-section">
+      <div class="terminal-check-section-head">
+        <div>
+          <h2>候选异常终端</h2>
+          <p class="muted">候选按当前报告周期后台聚合；完成后可点击矩阵数字查看证据并保存核查结果。</p>
+        </div>
+        <div class="actions"><button class="primary" type="button" disabled>保存核查结果</button></div>
+      </div>
+      {terminal_candidates_loading_table()}
+    </section>
+  </form>
+  <section>
+    <h2>已保存核查记录</h2>
+    <p class="muted">已保存记录会随候选计算一起刷新。</p>
+    {terminal_reviews_loading_table()}
+  </section>
 </div>
 """
 
