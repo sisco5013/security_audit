@@ -1049,6 +1049,9 @@ def inject_report_navigation_patch(data: bytes, config: AppConfig | None = None,
     text = data.decode("utf-8", errors="replace")
     period = report_period_for_html_or_path(config, target, data) if config is not None else None
     terminal_check_href = terminal_check_period_url(*period) if period else "/terminal-check"
+    settings_href = "/settings"
+    if config is not None:
+        settings_href = f"{config.public_base_url.rstrip('/')}/settings" if config.public_base_url else "/settings"
     updated = re.sub(
         r'\s*<a\s+class="top-action(?:\s+primary)?"\s+href="[^"]*/reports">历史报告</a>',
         "",
@@ -1063,9 +1066,16 @@ def inject_report_navigation_patch(data: bytes, config: AppConfig | None = None,
         count=1,
         flags=re.IGNORECASE,
     )
-    terminal_link = f'<a class="top-action" href="{esc(terminal_check_href)}">风险终端复核</a>'
+    updated = re.sub(
+        r'\s*<a\s+class="top-action(?:\s+primary)?"\s+href="[^"]*/settings"\s*>策略管理</a>',
+        "",
+        updated,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    terminal_link = f'<a class="top-action danger" href="{esc(terminal_check_href)}">风险终端复核</a>'
     updated_with_period = re.sub(
-        r'<a\s+class="top-action"\s+href="[^"]*/terminal-check(?:\?[^"]*)?"\s*>(?:异常终端行为核查|风险终端复核)</a>',
+        r'<a\s+class="top-action(?:\s+danger)?"\s+href="[^"]*/terminal-check(?:\?[^"]*)?"\s*>(?:异常终端行为核查|风险终端复核)</a>',
         terminal_link,
         updated,
         count=1,
@@ -1074,12 +1084,59 @@ def inject_report_navigation_patch(data: bytes, config: AppConfig | None = None,
     updated = updated_with_period
     if "风险终端复核" not in updated:
         updated = re.sub(
-            r'(<a\s+class="top-action"\s+href="[^"]*/settings">策略管理</a>)',
+            r'(<div\s+class="top-actions"\s*>)',
             r"\1" + terminal_link,
             updated,
             count=1,
             flags=re.IGNORECASE,
         )
+    settings_card = (
+        f'<aside class="stamp"><a href="{esc(settings_href)}">'
+        '<strong>策略管理</strong><span>规则、账号与数据源维护</span>'
+        "</a></aside>"
+    )
+    updated = re.sub(
+        r'<aside\s+class="stamp"[\s\S]*?</aside>',
+        settings_card,
+        updated,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    if "top-navigation-polish-style" not in updated:
+        style = """
+<style id="top-navigation-polish-style">
+  header .stamp {
+    min-width: 200px;
+    border-left-color: #93c5fd;
+    border-radius: 12px;
+    padding: 12px 14px;
+  }
+  header .stamp a {
+    display: block;
+    color: inherit;
+    text-decoration: none;
+  }
+  header .stamp strong {
+    font-size: 17px;
+    margin-bottom: 4px;
+    letter-spacing: 0;
+  }
+  header .top-action.danger {
+    border-color: rgba(248, 113, 113, 0.62);
+    color: #fff;
+    background: linear-gradient(180deg, #ef4444 0%, #dc2626 100%);
+    box-shadow: 0 10px 22px rgba(220, 38, 38, 0.22);
+  }
+  header .top-action.danger:hover {
+    border-color: rgba(254, 202, 202, 0.9);
+    background: linear-gradient(180deg, #f87171 0%, #dc2626 100%);
+  }
+</style>
+"""
+        if re.search(r"</head>", updated, flags=re.IGNORECASE):
+            updated = re.sub(r"</head>", style + r"\g<0>", updated, count=1, flags=re.IGNORECASE)
+        else:
+            updated = style + updated
     return updated.encode("utf-8") if updated != text else data
 
 

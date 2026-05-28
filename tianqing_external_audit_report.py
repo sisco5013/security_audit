@@ -9137,21 +9137,27 @@ def build_html_report(
       line-height: 1.7;
     }}
     .stamp {{
-      min-width: 210px;
-      border: 1px solid rgba(255, 255, 255, 0.18);
-      border-left: 4px solid #6ee7b7;
-      border-radius: 10px;
-      padding: 13px 15px;
+      min-width: 190px;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      border-left: 4px solid #93c5fd;
+      border-radius: 12px;
+      padding: 12px 14px;
       color: rgba(255, 255, 255, 0.72);
       background: rgba(255, 255, 255, 0.08);
       font-size: 13px;
       line-height: 1.65;
     }}
+    .stamp a {{
+      display: block;
+      color: inherit;
+      text-decoration: none;
+    }}
     .stamp strong {{
       display: block;
       color: #fff;
-      font-size: 15px;
-      margin-bottom: 5px;
+      font-size: 17px;
+      margin-bottom: 4px;
+      letter-spacing: 0;
     }}
     .top-actions {{
       display: flex;
@@ -9185,6 +9191,16 @@ def build_html_report(
     }}
     .top-action.primary:hover {{
       background: #eef6ff;
+    }}
+    .top-action.danger {{
+      border-color: rgba(248, 113, 113, 0.62);
+      color: #fff;
+      background: linear-gradient(180deg, #ef4444 0%, #dc2626 100%);
+      box-shadow: 0 10px 22px rgba(220, 38, 38, 0.22);
+    }}
+    .top-action.danger:hover {{
+      border-color: rgba(254, 202, 202, 0.9);
+      background: linear-gradient(180deg, #f87171 0%, #dc2626 100%);
     }}
     .kpis {{
       display: grid;
@@ -10860,7 +10876,7 @@ def build_html_report(
       padding-left: 10px;
     }}
     .stamp {{
-      min-width: 260px;
+      min-width: 200px;
       backdrop-filter: blur(6px);
     }}
     .top-actions {{
@@ -11546,15 +11562,15 @@ def build_html_report(
           <span>{esc(home_evidence_text)}</span>
         </div>
         <div class="top-actions">
-          <a class="top-action" href="{esc(settings_url)}">策略管理</a>
-          <a class="top-action" href="{esc(terminal_check_url)}">风险终端复核</a>
+          <a class="top-action danger" href="{esc(terminal_check_url)}">风险终端复核</a>
           <a class="top-action" href="{esc(home_url)}">当前报告首页</a>
         </div>
       </div>
       <aside class="stamp">
-        <strong>审计阅览版</strong>
-        <span>生成时间：{esc(generated_at)}</span><br>
-        <span>重点看风险、责任和闭环。</span>
+        <a href="{esc(settings_url)}">
+          <strong>策略管理</strong>
+          <span>规则、账号与数据源维护</span>
+        </a>
       </aside>
     </header>
 
