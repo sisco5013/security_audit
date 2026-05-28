@@ -189,6 +189,11 @@ def encryption_terminal_trust_status_sql(prefix: str = "") -> str:
     )
 
 
+def encryption_terminal_mac_key_sql(prefix: str = "") -> str:
+    base = f"{prefix}." if prefix else ""
+    return f"lowerUTF8(replaceAll(replaceAll(replaceAll({base}mac_address, '-', ''), ':', ''), ' ', ''))"
+
+
 @dataclass
 class AppConfig:
     host: str
@@ -4411,6 +4416,7 @@ def encryption_terminal_records(
     quoted_batch = decrypt_records.clickhouse_quote(batch_id)
     trust_condition = encryption_terminal_trust_condition()
     trust_status_sql = encryption_terminal_trust_status_sql()
+    mac_key_sql = encryption_terminal_mac_key_sql()
     state_filter = ""
     if trust_state == "trusted":
         state_filter = f"AND {trust_condition}"
@@ -4444,7 +4450,9 @@ SELECT
     t.last_seen,
     t.is_trusted,
     t.trust_status,
-    ifNull(d.ip_rows, 0) AS ip_rows
+    ifNull(d.ip_rows, 0) AS ip_rows,
+    ifNull(m.trusted_mac_rows, 0) AS trusted_mac_rows,
+    ifNull(m.trusted_mac_refs, '') AS trusted_mac_refs
 FROM
 (
     SELECT
@@ -4460,7 +4468,8 @@ FROM
         encryption_status,
         last_seen,
         if({trust_condition}, 1, 0) AS is_trusted,
-        {trust_status_sql} AS trust_status
+        {trust_status_sql} AS trust_status,
+        {mac_key_sql} AS mac_key
     FROM encryption_terminal_inventory FINAL
     WHERE import_batch = {quoted_batch}
     {state_filter}
@@ -4473,6 +4482,16 @@ LEFT JOIN
     WHERE import_batch = {quoted_batch} AND {trust_condition}
     GROUP BY ip_address
 ) AS d USING ip_address
+LEFT JOIN
+(
+    SELECT
+        {mac_key_sql} AS mac_key,
+        count() AS trusted_mac_rows,
+        arrayStringConcat(groupUniqArray(concat(ip_address, ' / ', computer_name)), '；') AS trusted_mac_refs
+    FROM encryption_terminal_inventory FINAL
+    WHERE import_batch = {quoted_batch} AND {trust_condition} AND notEmpty({mac_key_sql})
+    GROUP BY mac_key
+) AS m USING mac_key
 ORDER BY
     toUInt16OrZero(splitByChar('.', ip_address)[1]),
     toUInt16OrZero(splitByChar('.', ip_address)[2]),
@@ -5200,6 +5219,15 @@ def encryption_terminals_page(
     trusted_table = "".join(trusted_html) or '<tr><td colspan="12" class="muted">暂无授信终端记录。</td></tr>'
     excluded_html = []
     for item in excluded_records:
+        trusted_mac_rows = int(item.get("trusted_mac_rows") or 0)
+        mac_value = str(item.get("mac_address") or "").strip()
+        if not mac_value:
+            mac_check = '<span class="mini-badge warn">无MAC</span>'
+        elif trusted_mac_rows > 0:
+            refs = esc(item.get("trusted_mac_refs") or "")
+            mac_check = f'<span class="mini-badge danger" title="{refs}">授信MAC重复 {trusted_mac_rows}</span>'
+        else:
+            mac_check = '<span class="mini-badge">未重复</span>'
         excluded_html.append(
             "<tr>"
             f"<td>{esc(item.get('ip_address') or '-')}</td>"
@@ -5214,9 +5242,10 @@ def encryption_terminals_page(
             f"<td>{esc(item.get('encryption_status') or '-')}</td>"
             f"<td>{esc(item.get('last_seen') or '-')}</td>"
             f'<td><span class="mini-badge danger">{esc(item.get("trust_status") or "不进入授信池")}</span></td>'
+            f"<td>{mac_check}</td>"
             "</tr>"
         )
-    excluded_table = "".join(excluded_html) or '<tr><td colspan="12" class="muted">暂无排除记录。</td></tr>'
+    excluded_table = "".join(excluded_html) or '<tr><td colspan="13" class="muted">暂无排除记录。</td></tr>'
     def list_url(
         target_trusted_page: int | None = None,
         target_excluded_page: int | None = None,
@@ -5307,7 +5336,7 @@ def encryption_terminals_page(
         </div>
         <span class="mini-badge danger">排除记录 {excluded_total}</span>
       </div>
-      <div class="table-wrap"><table><thead><tr><th>IP地址</th><th>计算机名</th><th>MAC地址</th><th>使用人</th><th>账号</th><th>公司</th><th>部门</th><th>操作系统</th><th>客户端版本</th><th>加密状态</th><th>最后在线</th><th>备注原因</th></tr></thead><tbody>{excluded_table}</tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>IP地址</th><th>计算机名</th><th>MAC地址</th><th>使用人</th><th>账号</th><th>公司</th><th>部门</th><th>操作系统</th><th>客户端版本</th><th>加密状态</th><th>最后在线</th><th>备注原因</th><th>授信MAC检查</th></tr></thead><tbody>{excluded_table}</tbody></table></div>
       <div class="pager">
         <span>排除池第 {excluded_page} / {excluded_page_count} 页，每页 {page_size} 条</span>
         <div class="actions">{excluded_pager_actions}</div>
