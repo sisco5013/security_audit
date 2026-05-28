@@ -82,8 +82,8 @@ DEFAULT_REVIEW_POLICY: dict[str, Any] = {
     "baseline_days": 90,
     "baseline_multiplier": 5,
     "baseline_min_events": 30,
-    "top_terminal_limit": 10,
-    "top_terminal_min_events": 100,
+    "other_drawing_min_events": 100,
+    "sensitive_name_min_events": 1000,
     "candidate_limit": 300,
 }
 DEFAULT_THREE_D_EXTS = {"prt", "asm", "sldasm", "sldprt", "step"}
@@ -369,6 +369,21 @@ def primary_risk_event(event: dict[str, Any], three_d: set[str], two_d: set[str]
     return bool(counts["structure"] or counts["electrical"])
 
 
+def standard_drawing_event(event: dict[str, Any], three_d: set[str], two_d: set[str], archives: set[str], patterns: list[tuple[str, re.Pattern[str]]]) -> bool:
+    return event_matrix_bucket(event, three_d, two_d, archives, patterns) in report_gen.CRITICAL_DESIGN_LABELS
+
+
+def ordinary_drawing_event(event: dict[str, Any], three_d: set[str], two_d: set[str], archives: set[str], patterns: list[tuple[str, re.Pattern[str]]]) -> bool:
+    if standard_drawing_event(event, three_d, two_d, archives, patterns):
+        return False
+    bucket = event_matrix_bucket(event, three_d, two_d, archives, patterns)
+    return bucket in {"三维模型", "DWG二维图纸"}
+
+
+def sensitive_name_event(event: dict[str, Any], three_d: set[str], two_d: set[str], archives: set[str], patterns: list[tuple[str, re.Pattern[str]]]) -> bool:
+    return event_matrix_bucket(event, three_d, two_d, archives, patterns) == "敏感名称"
+
+
 def report_arg_namespace(config: Any) -> SimpleNamespace:
     app_dir = Path(getattr(config, "app_dir", "."))
     return SimpleNamespace(
@@ -438,6 +453,7 @@ def report_detail_row(event: Any, internal_domains: set[str]) -> dict[str, Any]:
         "client_name": str(getattr(event, "client_name", "") or ""),
         "client_ip": str(getattr(event, "client_ip", "") or ""),
         "process_name": str(getattr(event, "process_name", "") or ""),
+        "mail_subject": str(getattr(event, "mail_subject", "") or ""),
         "sender_mailbox": str(getattr(event, "sender_mailbox", "") or ""),
         "recipient_relation": str(getattr(event, "recipient_relation", "") or ""),
         "targets": [str(item) for item in getattr(event, "targets", []) or []],
@@ -446,6 +462,7 @@ def report_detail_row(event: Any, internal_domains: set[str]) -> dict[str, Any]:
         "file_names": [str(item) for item in getattr(event, "file_names", []) or []],
         "file_exts": [str(item) for item in getattr(event, "file_exts", []) or []],
         "file_size": getattr(event, "file_size", None),
+        "lookup_keys": [str(item) for item in getattr(event, "lookup_keys", []) or []],
         "reasons": [str(item) for item in getattr(event, "reasons", []) or []],
         "parsed_ts": getattr(event, "ts", None),
     }
@@ -714,7 +731,7 @@ def build_candidate(
         sample_files=list(dict.fromkeys(files))[:8],
         event_ids=[item for item in dict.fromkeys(event_ids) if item],
         matrix_counts=dict(matrix_counts),
-        evidence_events=ordered[:80],
+        evidence_events=ordered,
         basis=basis,
     )
 
@@ -740,6 +757,8 @@ def generate_candidates(config: Any, policy_doc: dict[str, Any], start: datetime
     events = fetch_audit_events(config, start, end, policy_doc)
     three_d, two_d, archives, patterns = policy_exts(policy_doc)
     mac_map = fetch_mac_map(config)
+    other_drawing_min = max(1, policy_int(policy, "other_drawing_min_events") or 100)
+    sensitive_min = max(1, policy_int(policy, "sensitive_name_min_events") or 1000)
     groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for event in events:
         ts = event.get("parsed_ts")
@@ -748,28 +767,43 @@ def generate_candidates(config: Any, policy_doc: dict[str, Any], start: datetime
         key = (str(event.get("client_name") or ""), str(event.get("client_ip") or ""), str(event.get("resolved_person") or event.get("person") or ""))
         groups[key].append(event)
     candidates: dict[str, TerminalBehaviorCandidate] = {}
-    significant_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for key, group in groups.items():
         significant = [event for event in group if significant_event(event, three_d, two_d, archives, patterns)]
         if not significant:
             continue
-        significant_groups[key] = significant
-        primary_events = [event for event in significant if primary_risk_event(event, three_d, two_d, archives, patterns)]
-        if primary_events:
-            candidate = build_candidate("一级风险：标准图纸流转", primary_events, policy_doc, mac_map, "命中结构/电气等标准图纸一级风险对象。")
-            candidates[candidate.candidate_id] = candidate
+        selected_events: dict[str, dict[str, Any]] = {}
+        reason_labels: list[str] = []
+        reason_basis: list[str] = []
 
-    top_limit = max(1, policy_int(policy, "top_terminal_limit") or 10)
-    top_min_events = max(1, policy_int(policy, "top_terminal_min_events") or 100)
-    top_groups = sorted(significant_groups.values(), key=len, reverse=True)[:top_limit]
-    for significant in top_groups:
-        if len(significant) >= top_min_events:
-            candidate = build_candidate("终端TOP10：明细数量过大", significant, policy_doc, mac_map, f"本报告周期终端重点明细数进入 Top{top_limit}，且达到 {top_min_events} 条阈值。")
+        standard_events = [event for event in significant if standard_drawing_event(event, three_d, two_d, archives, patterns)]
+        if standard_events:
+            reason_labels.append("一级风险：标准图纸流转")
+            reason_basis.append("标准图纸经邮件、IM、外部站点上传或外设拷贝等通道流转。")
+            for event in standard_events:
+                selected_events[str(event.get("event_id") or id(event))] = event
+
+        ordinary_drawing_events = [event for event in significant if ordinary_drawing_event(event, three_d, two_d, archives, patterns)]
+        if len(ordinary_drawing_events) >= other_drawing_min:
+            reason_labels.append("普通图纸高频流转")
+            reason_basis.append(f"非标准三维模型或 DWG 图纸流转达到 {other_drawing_min} 条阈值。")
+            for event in ordinary_drawing_events:
+                selected_events[str(event.get("event_id") or id(event))] = event
+
+        sensitive_events = [event for event in significant if sensitive_name_event(event, three_d, two_d, archives, patterns)]
+        if len(sensitive_events) >= sensitive_min:
+            reason_labels.append("敏感文件高频流转")
+            reason_basis.append(f"敏感名称文件流转达到 {sensitive_min} 条阈值。")
+            for event in sensitive_events:
+                selected_events[str(event.get("event_id") or id(event))] = event
+
+        if selected_events:
+            candidate = build_candidate("；".join(reason_labels), list(selected_events.values()), policy_doc, mac_map, "；".join(reason_basis))
             candidates[candidate.candidate_id] = candidate
     result = sorted(
         candidates.values(),
         key=lambda item: (
             0 if item.anomaly_type.startswith("一级风险") else 1,
+            1 if item.anomaly_type.startswith("普通图纸") else 2 if item.anomaly_type.startswith("敏感文件") else 3,
             -item.event_count,
             -(item.structure_count + item.electrical_count),
             -item.three_d_count,
@@ -928,17 +962,3 @@ def report_summary_style() -> str:
   @media (max-width: 620px) { .terminal-review-chip-grid { grid-template-columns: 1fr; } }
 </style>
 """
-
-
-def event_detail_rows(config: Any, event_ids: list[str]) -> list[dict[str, Any]]:
-    if not event_ids:
-        return []
-    query = f"""
-SELECT event_id, ts, topic, channel, company, department, resolved_person, client_name, client_ip,
-       targets, target_domains, recipients, file_names, file_size, reasons
-FROM audit_events
-WHERE event_id IN ({','.join(ch_quote(item) for item in event_ids[:500])})
-ORDER BY ts DESC
-FORMAT JSONEachRow
-"""
-    return [json.loads(line) for line in clickhouse_query(config, query).splitlines() if line.strip()]

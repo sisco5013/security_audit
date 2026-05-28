@@ -5174,7 +5174,7 @@ def settings_page(config: AppConfig) -> bytes:
       <div class="settings-card">
         <h3>异常终端核查策略</h3>
         <p class="metric">{'启用' if terminal_review.normalized_review_policy(policy_doc).get('enabled', True) else '关闭'}</p>
-        <p class="muted">候选只保留一级风险和终端 Top10 中明细数量特别大的终端；候选需人工确认后才进报告。</p>
+        <p class="muted">候选只保留标准图纸流转、普通图纸高频和敏感文件高频，人工确认后才进报告。</p>
         <div class="actions"><a class="button primary" href="/settings/terminal-behavior-review">维护核查阈值</a></div>
       </div>
         </div>
@@ -5533,6 +5533,38 @@ def terminal_check_matrix_count(candidate: terminal_review.TerminalBehaviorCandi
     return int((candidate.matrix_counts or {}).get(f"{channel}\u241f{bucket}", 0) or 0)
 
 
+def terminal_check_audit_event_from_row(row: dict[str, Any], tz: Any) -> report_gen.AuditEvent:
+    event = report_gen.AuditEvent(
+        event_id=str(row.get("event_id") or ""),
+        ts=report_gen.parse_clickhouse_ts(row.get("ts"), tz) or row.get("parsed_ts"),
+        topic=str(row.get("topic") or ""),
+        channel=str(row.get("channel") or ""),
+        person=str(row.get("person") or ""),
+        account="",
+        client_name=str(row.get("client_name") or ""),
+        client_ip=str(row.get("client_ip") or ""),
+        department=str(row.get("department") or ""),
+        org_path="",
+        process_name=str(row.get("process_name") or ""),
+        mail_subject=str(row.get("mail_subject") or ""),
+        sender_mailbox=str(row.get("sender_mailbox") or ""),
+        targets=[str(item) for item in row.get("targets") or []],
+        target_domains=[str(item) for item in row.get("target_domains") or []],
+        recipients=[str(item) for item in row.get("recipients") or []],
+        recipient_relation=str(row.get("recipient_relation") or "unknown"),
+        file_names=[str(item) for item in row.get("file_names") or []],
+        file_exts=[str(item) for item in row.get("file_exts") or []],
+        file_size=row.get("file_size"),
+        lookup_keys=[str(item) for item in row.get("lookup_keys") or []],
+        reasons=[str(item) for item in row.get("reasons") or []],
+        resolved_person=str(row.get("resolved_person") or row.get("person") or ""),
+        resolved_company=str(row.get("company") or ""),
+        resolved_department=str(row.get("department") or ""),
+        level=str(row.get("level") or "LOW"),
+    )
+    return event
+
+
 def terminal_candidates_table(candidates: list[terminal_review.TerminalBehaviorCandidate], start: datetime, end: datetime) -> str:
     if not candidates:
         return '<p class="muted">当前周期暂无候选异常终端。</p>'
@@ -5729,31 +5761,24 @@ def terminal_check_page(config: AppConfig, session: AuthSession, params: dict[st
 def terminal_check_events_page(config: AppConfig, params: dict[str, list[str]]) -> bytes:
     start, end, _preset = terminal_check_period_from_params(config, params)
     candidate_id = (params.get("candidate_id") or [""])[-1]
-    event_ids: list[str] = []
+    detail_events: list[report_gen.AuditEvent] = []
     title = "异常终端候选证据"
     if candidate_id:
         candidates = terminal_review.generate_candidates(config, load_policy_doc(config), start, end)
         for candidate in candidates:
             if candidate.candidate_id == candidate_id:
-                event_ids = candidate.event_ids
                 title = f"{candidate.anomaly_type} / {candidate.client_ip}"
+                tz = local_tz(config.timezone)
+                detail_events = [terminal_check_audit_event_from_row(row, tz) for row in candidate.evidence_events]
                 break
-    rows = terminal_review.event_detail_rows(config, event_ids)
-    table_rows = []
-    for row in rows:
-        files = "；".join(str(item) for item in row.get("file_names") or [])
-        targets = "；".join(str(item) for key in ("recipients", "targets", "target_domains") for item in (row.get(key) or []))
-        table_rows.append(
-            f"<tr><td>{esc(str(row.get('ts') or '')[:19])}</td><td>{esc(row.get('channel') or row.get('topic') or '')}</td><td>{esc(row.get('company') or '')}</td><td>{esc(row.get('department') or '')}</td><td>{esc(row.get('resolved_person') or '')}</td><td>{esc(row.get('client_ip') or '')}</td><td title=\"{esc(files)}\">{esc(files[:120])}</td><td title=\"{esc(targets)}\">{esc(targets[:120])}</td></tr>"
-        )
     table_html = (
         '<p class="muted">未找到候选证据，可能候选周期已变化。</p>'
-        if not table_rows
-        else f'<div class="table-wrap"><table><thead><tr><th>时间</th><th>通道</th><th>公司</th><th>部门</th><th>人员</th><th>IP</th><th>文件</th><th>目标</th></tr></thead><tbody>{"".join(table_rows)}</tbody></table></div>'
+        if not detail_events
+        else report_gen.event_detail_table_html(detail_events, local_tz(config.timezone), page_size=50)
     )
     body = f"""
     <header>
-      <div><h1>{esc(title)}</h1><div class="muted">仅展示候选关联的代表证据事件；完整证据仍以 ClickHouse 审计底稿为准。</div></div>
+      <div><h1>{esc(title)}</h1><div class="muted">本页直接复用报表重点明细事件与报表同款清单渲染，不再单独查询 ClickHouse 拼接简表。</div></div>
       <div class="actions"><a class="button" href="/terminal-check?start={esc(datetime_input_value(start))}&end={esc(datetime_input_value(end))}&preset=custom">返回核查工作台</a></div>
     </header>
     {table_html}
@@ -5765,8 +5790,8 @@ def terminal_behavior_policy_page(config: AppConfig, message: str = "", error: s
     doc = load_policy_doc(config)
     policy = terminal_review.normalized_review_policy(doc)
     field_labels = [
-        ("top_terminal_limit", "终端排行范围"),
-        ("top_terminal_min_events", "TOP终端明细数量阈值"),
+        ("other_drawing_min_events", "普通图纸流转阈值"),
+        ("sensitive_name_min_events", "敏感文件流转阈值"),
         ("candidate_limit", "候选列表上限"),
     ]
     inputs = "".join(
@@ -5775,7 +5800,7 @@ def terminal_behavior_policy_page(config: AppConfig, message: str = "", error: s
     )
     body = f"""
     <header>
-      <div><h1>异常终端核查策略</h1><div class="muted">候选只取一级风险和终端 Top10 中明细数量特别大的终端；不会自动把候选写入日报/周报。</div></div>
+      <div><h1>异常终端核查策略</h1><div class="muted">候选只取标准图纸流转、普通图纸超过阈值、敏感文件超过阈值三类；同一终端同一周期只生成一条候选。</div></div>
       <div class="actions"><a class="button" href="/settings">策略中心</a><a class="button" href="/terminal-check">核查工作台</a></div>
     </header>
     {f'<p class="badge on">{esc(message)}</p>' if message else ''}
@@ -5788,6 +5813,7 @@ def terminal_behavior_policy_page(config: AppConfig, message: str = "", error: s
         </select>
       </label>
       {inputs}
+      <p class="muted full">当前口径：标准图纸经邮件、IM、外部站点上传或外设拷贝等通道流转即入候选；普通三维/DWG 图纸默认超过 100 条入候选；敏感名称文件默认超过 1000 条入候选。</p>
       <div class="actions"><button class="primary" type="submit">保存核查策略</button></div>
     </form>
 """
