@@ -190,12 +190,10 @@ MODEL_3D_EXTS = {"asm", "prt", "sldasm", "sldprt", "step"}
 PCB_ECAD_EXTS: set[str] = set()
 CRITICAL_STRUCTURE_LABEL = "结构标准方案"
 CRITICAL_ELECTRICAL_LABEL = "电气标准方案"
-CRITICAL_YB_STANDARD_LABEL = "油变标准方案"
-CRITICAL_DESIGN_LABELS = [CRITICAL_STRUCTURE_LABEL, CRITICAL_ELECTRICAL_LABEL, CRITICAL_YB_STANDARD_LABEL]
+CRITICAL_DESIGN_LABELS = [CRITICAL_STRUCTURE_LABEL, CRITICAL_ELECTRICAL_LABEL]
 HTML_DISPLAY_LABEL_ALIASES = {
     CRITICAL_STRUCTURE_LABEL: "结构",
     CRITICAL_ELECTRICAL_LABEL: "电气",
-    CRITICAL_YB_STANDARD_LABEL: "油变",
     "网盘/高风险外联目标": "高风险外联目标",
 }
 CRITICAL_DESIGN_REASON_PREFIX = "最高预警:"
@@ -207,24 +205,6 @@ DEFAULT_CRITICAL_DESIGN_PATTERNS = [
         "description": "结构方案图号主体为三段点号命名，每段固定三位，第一段以 3/5/6/8 开头，后缀为 SLDASM/SLDPRT/STEP。",
         "match_examples": ["356.123.456.sldprt", "5AB.CD1.999.SLDASM", "8XY.abc.DEF.step"],
         "miss_examples": ["123.456.789.sldprt", "356.1234.456.sldprt", "356.123.456.dwg"],
-        "enabled": True,
-    },
-    {
-        "key": "yb_standard_long",
-        "label": CRITICAL_YB_STANDARD_LABEL,
-        "regex": r"^(?:3yb|5yb|8yb)\.[^\\/\.]{3}\.[^\\/\.]{5}\.[^\\/\.]{2}\.(?:dwg|prt|asm|sldasm|sldprt|step)$",
-        "description": "标准图纸图号为 3YB/5YB/8YB.三位.五位.两位，二维 DWG 和三维 PRT/ASM/SLDASM/SLDPRT/STEP 均适用。",
-        "match_examples": ["3YB.ABC.12345.01.dwg", "5YB.001.AB345.Z9.sldprt", "8YB.A1B.CD345.0X.step"],
-        "miss_examples": ["3YB.AB.12345.01.dwg", "3YB.ABC.1234.01.dwg", "6YB.ABC.12345.01.dwg"],
-        "enabled": True,
-    },
-    {
-        "key": "yb_standard_short",
-        "label": CRITICAL_YB_STANDARD_LABEL,
-        "regex": r"^(?:5yb|8yb)\.[^\\/\.]{3}\.[^\\/\.]{4}\.(?:dwg|prt|asm|sldasm|sldprt|step)$",
-        "description": "标准图纸图号为 5YB/8YB.三位.四位，二维 DWG 和三维 PRT/ASM/SLDASM/SLDPRT/STEP 均适用。",
-        "match_examples": ["8YB.123.ABCD.prt", "5YB.XYZ.0001.DWG"],
-        "miss_examples": ["3YB.ABC.1234.dwg", "8YB.ABC.12345.dwg", "5YB.ABC.1234.pdf"],
         "enabled": True,
     },
     {
@@ -1642,6 +1622,8 @@ def normalize_critical_design_patterns(value: Any) -> list[dict[str, Any]]:
         key = str(item.get("key") or "").strip()
         default = default_by_key.get(key, {})
         label = str(item.get("label") or default.get("label") or "").strip()
+        if key.lower().startswith("yb_standard"):
+            continue
         regex = str(item.get("regex") or default.get("regex") or "").strip()
         if not label or not regex:
             continue
@@ -7164,7 +7146,6 @@ def sh_quote(value: str) -> str:
 CHANNEL_MATRIX_COLUMNS = [
     CRITICAL_STRUCTURE_LABEL,
     CRITICAL_ELECTRICAL_LABEL,
-    CRITICAL_YB_STANDARD_LABEL,
     "三维模型",
     "DWG二维图纸",
     "敏感名称",
@@ -7205,11 +7186,10 @@ RISK_OVERVIEW_OBJECT_ORDER = CHANNEL_MATRIX_COLUMNS
 RISK_OVERVIEW_OBJECT_IMPORTANCE = {
     CRITICAL_STRUCTURE_LABEL: "最高预警",
     CRITICAL_ELECTRICAL_LABEL: "最高预警",
-    CRITICAL_YB_STANDARD_LABEL: "最高预警",
     "三维模型": "最高关注",
     "DWG二维图纸": "重点关注",
-    "敏感名称": "优先复核",
-    "压缩包": "持续观察",
+    "敏感名称": "重点关注",
+    "压缩包": "重点关注",
 }
 TREND_GRANULARITY_LABELS = {
     "hour": "按小时",
@@ -7823,75 +7803,6 @@ def build_terminal_risk_findings(
     )
 
 
-def terminal_risk_table_rows(
-    findings: list[TerminalRiskFinding],
-    terminal_links: dict[tuple[str, str], str],
-    tz: timezone,
-    limit: int | None = None,
-) -> list[list[Any]]:
-    rows: list[list[Any]] = []
-    heat_thresholds = terminal_count_heat_thresholds(findings)
-    for idx, finding in enumerate(findings[:limit] if limit else findings, 1):
-        key = terminal_key(finding.client_name, finding.client_ip)
-        event_href = terminal_links.get(key, "")
-        rows.append(
-            [
-                str(idx),
-                tooltip_cell(finding.company or UNMATCHED_COMPANY_LABEL, finding.company or UNMATCHED_COMPANY_LABEL),
-                tooltip_cell(finding.department or UNMATCHED_DEPARTMENT_LABEL, finding.department or UNMATCHED_DEPARTMENT_LABEL),
-                tooltip_cell(finding.person or "未匹配使用人", finding.person or "未匹配使用人"),
-                tooltip_cell(finding.client_name or "-", finding.client_name or "-"),
-                finding.client_ip or "-",
-                terminal_count_cell(finding.action_count, event_href, "查看该终端重点处置事件", heat_thresholds),
-                terminal_count_cell(finding.review_count, event_href, "查看该终端优先复核事件", heat_thresholds),
-                terminal_count_cell(finding.general_count, event_href, "查看该终端一般复核事件", heat_thresholds),
-                terminal_count_cell(finding.watch_count, event_href, "查看该终端持续观察线索", heat_thresholds),
-                terminal_count_cell(finding.three_d_count, event_href, "查看该终端三维模型事件", heat_thresholds),
-                terminal_count_cell(finding.two_d_cad_count, event_href, "查看该终端DWG图纸事件", heat_thresholds),
-                terminal_count_cell(finding.sensitive_name_count, event_href, "查看该终端敏感名称事件", heat_thresholds),
-                format_ts(finding.latest_seen, tz) if finding.latest_seen else "-",
-            ]
-        )
-    return rows
-
-
-TERMINAL_RISK_HEADERS = ["#", "公司", "部门", "使用人", "计算机名", "IP地址", "重点处置", "优先复核", "一般复核", "持续观察", "三维模型", "DWG图纸", "敏感名称", "最近时间"]
-TERMINAL_RISK_RAW_COLUMNS = {6, 7, 8, 9, 10, 11, 12}
-TERMINAL_HEAT_FIELDS = (
-    "action_count",
-    "review_count",
-    "general_count",
-    "watch_count",
-    "three_d_count",
-    "two_d_cad_count",
-    "sensitive_name_count",
-)
-
-
-def terminal_count_heat_thresholds(findings: list[TerminalRiskFinding]) -> dict[str, int]:
-    values: list[int] = []
-    for finding in findings:
-        for field_name in TERMINAL_HEAT_FIELDS:
-            value = int(getattr(finding, field_name, 0) or 0)
-            if value > 0:
-                values.append(value)
-    return heat_thresholds_from_counts(values)
-
-
-def terminal_count_cell(count: int, href: str, title: str, thresholds: dict[str, int]) -> HtmlCell:
-    count = int(count or 0)
-    heat_class = heat_class_for_count(count, thresholds)
-    if count > 0:
-        title = (
-            f"{title}；数字颜色按当前表格范围内正数事件数量分位计算："
-            f"P50={thresholds.get('p50', 0)}，P75={thresholds.get('p75', 0)}，P90={thresholds.get('p90', 0)}。"
-        )
-    inner = f'<span class="terminal-count terminal-count-{esc(heat_class)}">{esc(count)}</span>'
-    if count and href:
-        return HtmlCell(f'<a class="terminal-count-link" href="{esc(href)}" title="{esc(title)}">{inner}</a>', title, raw=True)
-    return HtmlCell(inner, title if count else "", raw=True)
-
-
 def terminal_matrix_detail_key(
     finding: TerminalRiskFinding,
     channel: str,
@@ -8035,38 +7946,6 @@ def terminal_matrix_html(
         </table>
       </div>
 """
-
-
-def terminal_risk_header_html() -> str:
-    return """
-      <tr class="terminal-risk-group-row">
-        <th class="terminal-group-basic" colspan="6">基本信息</th>
-        <th class="terminal-group-disposition" colspan="4">处置口径</th>
-        <th class="terminal-group-object" colspan="3">风险对象</th>
-        <th class="terminal-group-time" colspan="1">时间</th>
-      </tr>
-      <tr class="terminal-risk-sub-row">
-        <th>#</th><th>公司</th><th>部门</th><th>使用人</th><th>计算机名</th><th>IP地址</th>
-        <th class="terminal-sub-disposition">重点处置</th><th class="terminal-sub-disposition">优先复核</th><th class="terminal-sub-disposition">一般复核</th><th class="terminal-sub-disposition">持续观察</th>
-        <th class="terminal-sub-object">三维模型</th><th class="terminal-sub-object">DWG图纸</th><th class="terminal-sub-object">敏感名称</th>
-        <th>最近时间</th>
-      </tr>
-"""
-
-
-def terminal_risk_table_html(
-    rows: list[list[Any]],
-    page_size: int | None = None,
-    class_name: str = "terminal-risk",
-) -> str:
-    return html_table(
-        TERMINAL_RISK_HEADERS,
-        rows,
-        class_name,
-        raw_columns=TERMINAL_RISK_RAW_COLUMNS,
-        page_size=page_size,
-        header_html=terminal_risk_header_html(),
-    )
 
 
 TERMINAL_RISK_COUNT_NOTE = "终端矩阵按“通道 × 对象”展示真实外发、上传和外设拷贝事实；同一事件只落在一个通道，但可按资料类型进入对应对象列。数字颜色按当前矩阵正数分位计算：P50及以下为绿色，P50-P75为黄绿，P75-P90为橙色，P90以上为红色。"
@@ -8264,7 +8143,7 @@ def organization_issue_tags(finding: OrganizationRiskFinding) -> list[str]:
     ):
         tags.append("身份匹配不足")
     if not tags:
-        tags.append("持续观察")
+        tags.append("常规关注")
     return tags
 
 
@@ -8368,83 +8247,6 @@ def build_organization_risk_analysis(
         company_departments=finalize_organization_findings(company_department_buckets, company_department_asset_counts, "company_department"),
         department_types=finalize_organization_findings(department_type_buckets, department_type_asset_counts, "department_type"),
     )
-
-
-def organization_tags_cell(tags: list[str], href: str | None = None) -> HtmlCell:
-    tag_html = "".join(f'<span>{esc(tag)}</span>' for tag in tags[:4])
-    if href:
-        tag_html = f'<a class="org-tags-link" href="{esc(href)}" title="查看组织画像">{tag_html}</a>'
-    return HtmlCell(f'<div class="org-tags">{tag_html}</div>', "、".join(tags), raw=True)
-
-
-ORG_TABLE_HEAT_FIELDS = (
-    "risk_terminal_count",
-    "action_count",
-    "review_count",
-    "general_count",
-    "watch_count",
-    "three_d_count",
-    "two_d_cad_count",
-    "sensitive_name_count",
-    "peripheral_copy_count",
-)
-
-
-def organization_table_heat_thresholds(findings: list[OrganizationRiskFinding]) -> dict[str, dict[str, int]]:
-    return {
-        field_name: heat_thresholds_from_counts(int(getattr(finding, field_name, 0) or 0) for finding in findings)
-        for field_name in ORG_TABLE_HEAT_FIELDS
-    }
-
-
-def detail_count_cell(count: int, href: str, title: str, thresholds: dict[str, int]) -> HtmlCell:
-    count = int(count or 0)
-    heat_class = heat_class_for_count(count, thresholds)
-    inner = f'<span class="detail-count detail-count-{esc(heat_class)}">{esc(count)}</span>'
-    if count <= 0:
-        return HtmlCell(inner, "", raw=True)
-    title_text = (
-        f"{title}；颜色按当前详情列表该列正数分位计算："
-        f"P50={thresholds.get('p50', 0)}，P75={thresholds.get('p75', 0)}，P90={thresholds.get('p90', 0)}。"
-    )
-    if href:
-        return HtmlCell(f'<a class="detail-count-link" href="{esc(href)}" title="{esc(title_text)}">{inner}</a>', title_text, raw=True)
-    return HtmlCell(inner, title_text, raw=True)
-
-
-def organization_table_rows(
-    findings: list[OrganizationRiskFinding],
-    profile_links: dict[tuple[str, str, str], str],
-    tz: timezone,
-    limit: int | None = None,
-) -> list[list[Any]]:
-    rows: list[list[Any]] = []
-    thresholds = organization_table_heat_thresholds(findings)
-    for idx, finding in enumerate(findings[:limit] if limit else findings, 1):
-        href = profile_links.get(organization_key(finding), "")
-        company_list = "、".join(name for name, _ in finding.covered_companies.most_common(5))
-        if len(finding.covered_companies) > 5:
-            company_list += f" 等{len(finding.covered_companies)}家"
-        label = finding.label
-        rows.append(
-            [
-                str(idx),
-                link_cell(label, href, "查看组织画像") if href else tooltip_cell(label),
-                tooltip_cell(company_list or "-", "、".join(finding.covered_companies.keys()) or "-"),
-                detail_count_cell(finding.risk_terminal_count, href, "查看组织画像", thresholds["risk_terminal_count"]),
-                detail_count_cell(finding.action_count, href, "查看组织重点处置事件", thresholds["action_count"]),
-                detail_count_cell(finding.review_count, href, "查看组织优先复核事件", thresholds["review_count"]),
-                detail_count_cell(finding.general_count, href, "查看组织一般复核事件", thresholds["general_count"]),
-                detail_count_cell(finding.watch_count, href, "查看组织持续观察线索", thresholds["watch_count"]),
-                detail_count_cell(finding.three_d_count, href, "查看组织三维模型事件", thresholds["three_d_count"]),
-                detail_count_cell(finding.two_d_cad_count, href, "查看组织DWG图纸事件", thresholds["two_d_cad_count"]),
-                detail_count_cell(finding.sensitive_name_count, href, "查看组织敏感名称事件", thresholds["sensitive_name_count"]),
-                detail_count_cell(finding.peripheral_copy_count, href, "查看组织外设拷贝事件", thresholds["peripheral_copy_count"]),
-                organization_tags_cell(finding.issue_tags, href),
-                format_ts(finding.latest_seen, tz) if finding.latest_seen else "-",
-            ]
-        )
-    return rows
 
 
 ORG_MATRIX_OBJECT_SHORT_LABELS = {
@@ -12070,17 +11872,6 @@ def main() -> int:
     parser.add_argument("--format", choices=["markdown", "html"], default="markdown", help="Output format. Use html for leadership-facing report.")
     parser.add_argument("--output", help="Write report to this path instead of stdout.")
     parser.add_argument("--public-base-url", default=os.getenv("TIANQING_REPORT_PUBLIC_URL", DEFAULT_PUBLIC_BASE_URL), help="Public intranet base URL used by report navigation links.")
-    parser.add_argument("--enable-ai-analysis", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--ai-provider", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--ai-model", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--ai-ssh-host", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--ai-ssh-container", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--ai-timeout", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--ai-retries", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--ai-retry-backoff", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--ai-context-max-events", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--ai-context-max-behaviors", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--ai-context-max-chars", default="", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     tz = get_tz(args.timezone)

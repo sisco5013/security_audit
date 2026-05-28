@@ -27,10 +27,6 @@ def decrypt_object_bucket_for(file_name: str, file_ext: str = "") -> tuple[str, 
         return "结构", labels
     if CRITICAL_ELECTRICAL_LABEL in labels:
         return "电气", labels
-    if CRITICAL_YB_STANDARD_LABEL in labels:
-        if ext in CONTROLLED_2D_CAD_EXTS:
-            return "电气", labels
-        return "结构", labels
     if ext in CONTROLLED_3D_EXTS:
         return "三维模型", labels
     if ext in CONTROLLED_2D_CAD_EXTS:

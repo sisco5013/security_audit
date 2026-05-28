@@ -658,7 +658,7 @@ def build_decrypt_audit_module_result(
             tz,
             report_period,
             source_label,
-            "仅展示结构/电气标准图纸解密记录；3YB/5YB/8YB 油变标准方案按后缀并入结构或电气，原则上不允许发生。",
+            "仅展示结构/电气标准图纸解密记录，原则上不允许发生。",
         ),
         page_names["structure"]: build_decrypt_risk_detail_page(
             "结构解密明细",
@@ -666,7 +666,7 @@ def build_decrypt_audit_module_result(
             tz,
             report_period,
             source_label,
-            "结构标准方案解密记录；三维后缀的 3YB/5YB/8YB 油变标准方案并入本页。",
+            "结构标准方案解密记录。",
         ),
         page_names["electrical"]: build_decrypt_risk_detail_page(
             "电气解密明细",
@@ -674,7 +674,7 @@ def build_decrypt_audit_module_result(
             tz,
             report_period,
             source_label,
-            "电气标准方案解密记录；DWG 后缀的 3YB/5YB/8YB 油变标准方案并入本页。",
+            "电气标准方案解密记录。",
         ),
         page_names["three_d"]: build_decrypt_risk_detail_page(
             "三维模型解密明细",

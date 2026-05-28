@@ -158,7 +158,6 @@ def _standard_design_total_from_metrics(metrics: dict[str, Any] | None) -> int:
     return (
         _metric_int(metrics, "critical_structure")
         + _metric_int(metrics, "critical_electrical")
-        + _metric_int(metrics, "critical_yb")
     )
 
 
@@ -175,7 +174,6 @@ def build_global_management_summary_html(
     tianqing_critical = _standard_design_total_from_metrics(tianqing_metrics)
     tianqing_structure = _metric_int(tianqing_metrics, "critical_structure")
     tianqing_electrical = _metric_int(tianqing_metrics, "critical_electrical")
-    tianqing_yb = _metric_int(tianqing_metrics, "critical_yb")
 
     plm_enabled = bool(plm_metrics and plm_metrics.get("enabled"))
     plm_risks = _metric_int(plm_metrics, "risk_count")
@@ -217,7 +215,7 @@ def build_global_management_summary_html(
         ),
         row_html(
             "天擎外发审计",
-            f"一级风险：标准图纸外发/拷贝 {tianqing_critical} 条，其中结构 {tianqing_structure} 条、电气 {tianqing_electrical} 条、油变 {tianqing_yb} 条。",
+            f"一级风险：标准图纸外发/拷贝 {tianqing_critical} 条，其中结构 {tianqing_structure} 条、电气 {tianqing_electrical} 条。",
             "#tianqing-audit",
             "tianqing",
         ),
@@ -435,11 +433,10 @@ def build_tianqing_outbound_module_result(
             "matrix_events": sum(channel_matrix_result.row_totals.values()),
             "critical_design": sum(
                 int(channel_matrix_result.object_totals.get(label, 0) or 0)
-                for label in ("结构标准方案", "电气标准方案", "油变标准方案")
+                for label in ("结构标准方案", "电气标准方案")
             ),
             "critical_structure": int(channel_matrix_result.object_totals.get("结构标准方案", 0) or 0),
             "critical_electrical": int(channel_matrix_result.object_totals.get("电气标准方案", 0) or 0),
-            "critical_yb": int(channel_matrix_result.object_totals.get("油变标准方案", 0) or 0),
             "top_channel": channel_matrix_result.row_totals.most_common(1)[0][0] if channel_matrix_result.row_totals else "",
             "top_channel_count": channel_matrix_result.row_totals.most_common(1)[0][1] if channel_matrix_result.row_totals else 0,
             "channel_pages": len(channel_matrix_result.sidecar_pages),

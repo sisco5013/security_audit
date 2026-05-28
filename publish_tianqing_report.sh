@@ -26,10 +26,21 @@ mkdir -p reports
 log "Ensuring remote report directories on $REMOTE_HOST"
 ssh -o BatchMode=yes "$REMOTE_HOST" "mkdir -p '$REMOTE_DIR' '$REMOTE_APP_DIR'"
 APP_FILES=(
+  tianqing_channel_matrix_module.py
   tianqing_external_audit_report.py
   tianqing_clickhouse_ingest.py
+  tianqing_decrypt_audit_module.py
+  tianqing_decrypt_data_module.py
   tianqing_decrypt_records.py
   tianqing_encryption_terminals.py
+  tianqing_evidence_detail_module.py
+  tianqing_organization_risk_module.py
+  tianqing_rename_data_module.py
+  tianqing_rename_tracking_module.py
+  tianqing_report_modules.py
+  tianqing_risk_overview_module.py
+  tianqing_terminal_behavior_review.py
+  tianqing_trend_module.py
   generate_tianqing_period_report.sh
   backfill_tianqing_archives.sh
   people_mapping.csv

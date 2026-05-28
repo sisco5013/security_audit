@@ -23,7 +23,7 @@ import secrets
 import subprocess
 import threading
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from http import HTTPStatus
@@ -58,15 +58,11 @@ DEFAULT_AUTH_CALLBACK_URL = "https://ai.daqo.com/audit/auth/callback"
 DEFAULT_AUTH_COOKIE_DOMAIN = ".daqo.com"
 DEFAULT_AUTH_PROXY_BASE_URL = "http://172.88.49.60:19001"
 CANONICAL_HOSTS = {"audit.daqo.com", "ai.daqo.com", "127.0.0.1", "localhost"}
-DEFAULT_AI_HOST = "root@172.88.49.60"
-DEFAULT_AI_CONTAINER = "docker-api-1"
-DEFAULT_AI_MODEL = "gpt-5.5"
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 FIXED_POLICY_ADMIN_USERID = "10056"
 ROLE_LABELS = {
     "admin": "策略管理员",
     "global": "集团查看",
-    "company": "公司审核员",
 }
 DEFAULT_ARCHIVE_SUFFIXES = ["zip", "rar", "7z", "tar", "gz", "gzip", "tgz", "bz2", "tbz", "tbz2", "xz", "txz", "zst", "zipx", "cab", "iso", "arj", "lzh", "001"]
 DEFAULT_CRITICAL_DESIGN_PATTERNS = [
@@ -80,24 +76,6 @@ DEFAULT_CRITICAL_DESIGN_PATTERNS = [
         "enabled": True,
     },
     {
-        "key": "yb_standard_long",
-        "label": "油变标准方案",
-        "regex": r"^(?:3yb|5yb|8yb)\.[^\\/\.]{3}\.[^\\/\.]{5}\.[^\\/\.]{2}\.(?:dwg|prt|asm|sldasm|sldprt|step)$",
-        "description": "标准图纸图号为 3YB/5YB/8YB.三位.五位.两位，二维 DWG 和三维 PRT/ASM/SLDASM/SLDPRT/STEP 均适用。",
-        "match_examples": ["3YB.ABC.12345.01.dwg", "5YB.001.AB345.Z9.sldprt", "8YB.A1B.CD345.0X.step"],
-        "miss_examples": ["3YB.AB.12345.01.dwg", "3YB.ABC.1234.01.dwg", "6YB.ABC.12345.01.dwg"],
-        "enabled": True,
-    },
-    {
-        "key": "yb_standard_short",
-        "label": "油变标准方案",
-        "regex": r"^(?:5yb|8yb)\.[^\\/\.]{3}\.[^\\/\.]{4}\.(?:dwg|prt|asm|sldasm|sldprt|step)$",
-        "description": "标准图纸图号为 5YB/8YB.三位.四位，二维 DWG 和三维 PRT/ASM/SLDASM/SLDPRT/STEP 均适用。",
-        "match_examples": ["8YB.123.ABCD.prt", "5YB.XYZ.0001.DWG"],
-        "miss_examples": ["3YB.ABC.1234.dwg", "8YB.ABC.12345.dwg", "5YB.ABC.1234.pdf"],
-        "enabled": True,
-    },
-    {
         "key": "electrical_standard",
         "label": "电气标准方案",
         "regex": r"^dq[^\\/\-]+-[^\\/\-]+-[^\\/\-]+-[^\\/\-]+\.dwg$",
@@ -107,54 +85,21 @@ DEFAULT_CRITICAL_DESIGN_PATTERNS = [
         "enabled": True,
     },
 ]
-AI_CONTEXT_PLACEHOLDER = "{audit_context_json}"
-MAX_AI_PROMPT_TEMPLATE_CHARS = 20000
-DEFAULT_AI_PROMPT_TEMPLATE = """你是面向集团管理层的数据安全审计顾问。你的任务不是罗列明细，而是把本周期奇安信天擎审计结果归纳成管理层可以快速理解的安全态势摘要，并结合历史趋势判断风险是否上升、下降、集中或迁移。
 
-请按这个顺序阅读 audit_context_json：
-1. matrix_summary：当前周期确定性事实，包含外发通道矩阵、公司矩阵、部门矩阵和终端 Top10。
-2. trend_summary：近7天/30天/90天趋势观察窗口，用于和历史周期、近期趋势做比较。
-3. behavior_signals 与 top_events：只作为支撑证据，不要把首页写成事件明细清单。
 
-首页摘要定位：
-- executive_summary 必须恰好3条，面向领导首页展示。
-- 每条必须至少包含一个明确数字或比例，不能只写“偏高、高位、需关注、较集中”等空泛判断。
-- 第1条说明本周期总体安全态势：风险规模、最集中的通道/对象/组织。
-- 第2条说明与历史周期或近期趋势相比的变化：上升、下降、持平、峰值、迁移或历史数据不足。
-- 第3条说明管理层应关注的治理方向：组织短板、通道约束、图纸/压缩包/敏感名称、外设拷贝或身份数据质量。
-- 语言要像管理层汇报，不要堆字段名，不要逐条复述日志。
+def sanitize_critical_design_patterns(rows: Any) -> list[dict[str, Any]]:
+    source = rows if isinstance(rows, list) else DEFAULT_CRITICAL_DESIGN_PATTERNS
+    sanitized: list[dict[str, Any]] = []
+    for item in source:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key") or "").strip().lower()
+        if key.startswith("yb_standard"):
+            continue
+        sanitized.append(item)
+    return sanitized or [dict(item) for item in DEFAULT_CRITICAL_DESIGN_PATTERNS]
 
-重点研判角度：
-1. 通道：邮件外发、IM附件、外部站点上传、外设拷贝分开判断；外部发件箱只作为邮件明细事实字段研判。
-2. 对象：结构标准方案、电气标准方案是最高预警对象；三维模型是公司核心技术资产，必须单独重点分析，不能只合并表述为“图纸”或“设计资料”；DWG二维图纸、敏感名称、压缩包是其他矩阵审计对象。设计图纸和压缩包外发不得被判为普通业务后隐藏。
-3. 组织：从公司、部门、终端三个层级归纳集中度；不要做责任认定，只输出审计复核线索和治理建议。
-4. 历史趋势：结合近7/30/90天趋势，指出本周期是否处于近期高位、是否由少数组织/通道拉高、是否出现风险迁移。
-5. 行为异常：短时间集中外发、接收方扩散、多目标发送、跨通道尝试、疑似分片/拆包、超大文件、异常目标、未知接收方、外部发件箱。
-6. 降噪边界：采购询价等正常业务可以提示为低风险背景，但高风险外联目标、外设拷贝、设计图纸、压缩包、超大文件、非采购敏感词仍需保留。
 
-约束：
-- 不编造日志中没有的事实；历史趋势不足时明确说“不足以比较”。
-- 不输出任何密钥、令牌、接口地址中的敏感参数。
-- 不要求查看邮件正文、聊天正文或附件正文。
-- 所有结论必须能回到矩阵事实、趋势事实、行为线索、代表事件、日志字段、通道、时间、人员、终端、接收方、文件名或统计模式。
-- 不做责任认定；不要把进程启动尝试类日志推断为文件外发或实际使用行为。
-- 输出面向事实矩阵，不使用处置优先级口径命名结论；可以说“需复核/需闭环”，不要按后台优先级标签组织内容。
-- 禁止使用没有数字支撑的套话，例如“总体偏高”“仍处高位区间”“重点推动治理”“压实责任”；必须改写为具体数量、占比、变化幅度、组织/通道/对象名称。
-- 如果本周期三维模型事件数大于0，executive_summary 和 insights 中必须各至少有一条单独说明三维模型：数量、主要通道、主要公司/部门/终端，以及建议复核动作。
-- insights 最多输出4条，只保留最关键异常；reasoning 不超过80字，next_action 不超过60字。
-- 严格输出JSON对象，不要输出Markdown。
-
-输出JSON字段：
-- executive_summary: 字符串数组，恰好3条。
-- matrix_facts: 字符串数组，3-6条，提炼当前周期矩阵事实。
-- trend_facts: 字符串数组，2-5条，提炼近7/30/90天趋势事实。
-- historical_comparison: 字符串数组，2-4条，说明本周期与近期历史相比的变化。
-- insights: 数组，每项包含 title, risk_level(HIGH/MEDIUM/LOW), reasoning, evidence, next_action。
-- watchlist: 字符串数组，3-6项。
-
-审计摘要JSON：
-{audit_context_json}
-"""
 MAX_POST_BYTES = 256 * 1024
 MAX_UPLOAD_POST_BYTES = 128 * 1024 * 1024
 MAX_RANGE_DAYS = 370
@@ -220,9 +165,6 @@ class AppConfig:
     auth_cookie_domain: str
     auth_proxy_base_url: str
     auth_proxy_token: str
-    ai_host: str
-    ai_container: str
-    ai_model: str
 
 
 @dataclass
@@ -232,7 +174,6 @@ class Job:
     start_text: str
     end_text: str
     max_events: int
-    enable_ai: bool
     output_name: str
     log_name: str
     refresh_clickhouse: bool = True
@@ -463,12 +404,11 @@ def policy_bool(value: Any, default: bool = True) -> bool:
 
 
 def ai_policy_enabled_from_doc(doc: dict[str, Any]) -> bool:
-    ai_analysis = doc.get("ai_analysis") if isinstance(doc.get("ai_analysis"), dict) else {}
-    return policy_bool(ai_analysis.get("enabled", True), True)
+    return False
 
 
 def ai_policy_enabled(config: AppConfig) -> bool:
-    return ai_policy_enabled_from_doc(load_policy_doc(config))
+    return False
 
 
 def cookie_domain_suffix(config: AppConfig) -> str:
@@ -502,7 +442,6 @@ def normalize_login_next(next_path: str) -> str:
         "/settings/decrypt-records/": "/settings/decrypt-records",
         "/settings/organization-aliases/": "/settings/organization-aliases",
         "/settings/organization-tree/": "/settings/organization-tree",
-        "/settings/ai/": "/settings/ai",
         "/settings/auth/": "/settings/auth",
         "/settings/exclusions/": "/settings/exclusions",
     }
@@ -1193,12 +1132,10 @@ def _fallback_tianqing_management_metrics(text: str) -> dict[str, Any]:
     tianqing_plain = _html_plain_text(tianqing_section)
     structure = _first_regex_int(r"结构(?:标准方案)?\s*(\d+)", tianqing_plain)
     electrical = _first_regex_int(r"电气(?:标准方案)?\s*(\d+)", tianqing_plain)
-    yb = _first_regex_int(r"油变(?:标准方案)?\s*(\d+)", tianqing_plain)
     return {
-        "critical_design": structure + electrical + yb,
+        "critical_design": structure + electrical,
         "critical_structure": structure,
         "critical_electrical": electrical,
-        "critical_yb": yb,
     }
 
 
@@ -1924,21 +1861,6 @@ def auth_policy(config: AppConfig) -> dict[str, Any]:
     }
 
 
-def ai_toggle_form(enabled: bool, action: str = "/settings/ai/toggle") -> str:
-    status_class = "on" if enabled else "off"
-    status_text = "AI已启用" if enabled else "AI已关闭"
-    next_value = "0" if enabled else "1"
-    button_text = "开" if enabled else "关"
-    return f"""
-    <div class="switch-row">
-      <span class="switch-status {status_class}">{status_text}</span>
-      <form class="inline-form" method="post" action="{esc(action)}">
-        <button class="switch-button {status_class}" type="submit" name="ai_enabled" value="{esc(next_value)}" title="点击切换AI智能分析总开关">{esc(button_text)}</button>
-      </form>
-    </div>
-"""
-
-
 def role_for_user(config: AppConfig, userid: str, company: str, status: str) -> str:
     policy = auth_policy(config)
     if userid == FIXED_POLICY_ADMIN_USERID:
@@ -2020,7 +1942,6 @@ def run_job(config: AppConfig, job: Job) -> None:
     log_path = config.report_dir / "jobs" / job.log_name
     command = command_for_job(config, job, output_path)
     env = os.environ.copy()
-    env["TIANQING_AI_MODEL"] = config.ai_model
     env["CLICKHOUSE_URL"] = config.clickhouse_url
     env["CLICKHOUSE_DB"] = config.clickhouse_database
     if config.clickhouse_user:
@@ -2570,7 +2491,6 @@ def job_history_entries(config: AppConfig, session: AuthSession, limit: int = 50
                 "mtime": job.finished_at or job.created_at,
                 "created_at": datetime.fromtimestamp(job.created_at).isoformat(timespec="seconds"),
                 "range": f"{job.start_text} -> {job.end_text}",
-                "ai": "on" if job.enable_ai else "off",
                 "status": job.status,
                 "error": job.error,
                 "output": output if output.exists() else None,
@@ -3696,7 +3616,7 @@ def load_policy_doc(config: AppConfig) -> dict[str, Any]:
             "version": 1,
             "description": "奇安信天擎安全审计策略。设计图纸后缀和敏感词一样由策略中心维护。",
             "design_suffixes": {"three_d": ["prt", "asm", "sldasm", "sldprt", "step"], "two_d": ["dwg"], "pcb_ecad": []},
-            "critical_design_patterns": DEFAULT_CRITICAL_DESIGN_PATTERNS,
+            "critical_design_patterns": sanitize_critical_design_patterns(DEFAULT_CRITICAL_DESIGN_PATTERNS),
             "archive_suffixes": DEFAULT_ARCHIVE_SUFFIXES,
             "organization_aliases": [],
             "internal_targets": {"domains": ["daqo.com"], "networks": ["172.88.0.0/16", "172.188.0.0/16"]},
@@ -3705,7 +3625,6 @@ def load_policy_doc(config: AppConfig) -> dict[str, Any]:
                 "terminal_match_fields": DEFAULT_PLM_TERMINAL_MATCH_FIELDS,
             },
             "terminal_behavior_review": terminal_review.DEFAULT_REVIEW_POLICY,
-            "ai_analysis": {"prompt_template": DEFAULT_AI_PROMPT_TEMPLATE},
             "auth": {
                 "policy_admin_userids": DEFAULT_POLICY_ADMIN_USERIDS,
                 "global_viewer_userids": [],
@@ -3727,10 +3646,7 @@ def load_policy_doc(config: AppConfig) -> dict[str, Any]:
     design.setdefault("two_d", ["dwg"])
     design.setdefault("pcb_ecad", [])
     loaded["design_suffixes"] = design
-    critical_design_patterns = loaded.get("critical_design_patterns")
-    if not isinstance(critical_design_patterns, list):
-        critical_design_patterns = DEFAULT_CRITICAL_DESIGN_PATTERNS
-    loaded["critical_design_patterns"] = critical_design_patterns
+    loaded["critical_design_patterns"] = sanitize_critical_design_patterns(loaded.get("critical_design_patterns"))
     archive_suffixes = loaded.get("archive_suffixes")
     if not isinstance(archive_suffixes, list):
         archive_suffixes = DEFAULT_ARCHIVE_SUFFIXES
@@ -3764,15 +3680,6 @@ def load_policy_doc(config: AppConfig) -> dict[str, Any]:
     loaded["terminal_behavior_review"] = terminal_review.normalized_review_policy(
         {"terminal_behavior_review": terminal_behavior_review}
     )
-    ai_analysis = loaded.get("ai_analysis")
-    if not isinstance(ai_analysis, dict):
-        ai_analysis = {}
-    ai_analysis["enabled"] = policy_bool(ai_analysis.get("enabled", True), True)
-    template = str(ai_analysis.get("prompt_template") or "").strip()
-    if not template or AI_CONTEXT_PLACEHOLDER not in template:
-        template = DEFAULT_AI_PROMPT_TEMPLATE
-    ai_analysis["prompt_template"] = template
-    loaded["ai_analysis"] = ai_analysis
     auth = loaded.get("auth")
     if not isinstance(auth, dict):
         auth = {}
@@ -3781,17 +3688,6 @@ def load_policy_doc(config: AppConfig) -> dict[str, Any]:
     auth.setdefault("session_hours", 8)
     loaded["auth"] = auth
     return loaded
-
-
-def validate_ai_prompt_template(template: str) -> str:
-    text = str(template or "").strip()
-    if not text:
-        raise ValueError("AI提示词不能为空。")
-    if len(text) > MAX_AI_PROMPT_TEMPLATE_CHARS:
-        raise ValueError(f"AI提示词不能超过 {MAX_AI_PROMPT_TEMPLATE_CHARS} 字。")
-    if AI_CONTEXT_PLACEHOLDER not in text:
-        raise ValueError(f"AI提示词必须包含 {AI_CONTEXT_PLACEHOLDER} 占位符。")
-    return text
 
 
 def load_exclusion_doc(config: AppConfig) -> dict[str, Any]:
@@ -4599,21 +4495,48 @@ def live_decrypt_pattern_conditions(label: str, base_expr: str) -> list[str]:
     return conditions
 
 
-def live_decrypt_summary_counts(config: AppConfig, start: datetime, end: datetime) -> dict[str, int]:
-    if not config.use_clickhouse:
-        return {"records": 0, "standard": 0, "structure": 0, "electrical": 0, "three_d": 0, "dwg": 0, "archive": 0}
-    args, _tz, _internal_domains = live_decrypt_policy_context(config)
+def live_decrypt_sql_classifiers() -> dict[str, str]:
     base_expr = "replaceRegexpOne(lowerUTF8(file_name), '^.*[\\\\\\\\/]', '')"
     ext_expr = "lowerUTF8(file_ext)"
     structure_direct = live_decrypt_sql_or(live_decrypt_pattern_conditions(report_gen.CRITICAL_STRUCTURE_LABEL, base_expr))
     electrical_direct = live_decrypt_sql_or(live_decrypt_pattern_conditions(report_gen.CRITICAL_ELECTRICAL_LABEL, base_expr))
-    yb_direct = live_decrypt_sql_or(live_decrypt_pattern_conditions(getattr(report_gen, "CRITICAL_YB_STANDARD_LABEL", "油变标准方案"), base_expr))
-    two_d_ext = live_decrypt_ext_has(report_gen.CONTROLLED_2D_CAD_EXTS, ext_expr)
-    three_d_ext = live_decrypt_ext_has(report_gen.CONTROLLED_3D_EXTS, ext_expr)
-    archive_ext = live_decrypt_ext_has(report_gen.ARCHIVE_EXTS, ext_expr)
-    standard_cond = f"(({structure_direct}) OR ({electrical_direct}) OR ({yb_direct}))"
-    structure_bucket = f"(({structure_direct}) OR ((NOT ({structure_direct})) AND (NOT ({electrical_direct})) AND ({yb_direct}) AND (NOT ({two_d_ext}))))"
-    electrical_bucket = f"((NOT ({structure_direct})) AND (({electrical_direct}) OR ((NOT ({electrical_direct})) AND ({yb_direct}) AND ({two_d_ext}))))"
+    standard_cond = f"(({structure_direct}) OR ({electrical_direct}))"
+    return {
+        "structure": structure_direct,
+        "electrical": electrical_direct,
+        "standard": standard_cond,
+        "three_d": live_decrypt_ext_has(report_gen.CONTROLLED_3D_EXTS, ext_expr),
+        "dwg": live_decrypt_ext_has(report_gen.CONTROLLED_2D_CAD_EXTS, ext_expr),
+        "archive": live_decrypt_ext_has(report_gen.ARCHIVE_EXTS, ext_expr),
+    }
+
+
+def live_decrypt_bucket_expr(classifiers: dict[str, str]) -> str:
+    structure_direct = classifiers["structure"]
+    electrical_direct = classifiers["electrical"]
+    standard_cond = classifiers["standard"]
+    return (
+        "multiIf("
+        f"{structure_direct}, '结构', "
+        f"(NOT ({structure_direct})) AND ({electrical_direct}), '电气', "
+        f"(NOT ({standard_cond})) AND ({classifiers['three_d']}), '三维模型', "
+        f"(NOT ({standard_cond})) AND ({classifiers['dwg']}), 'DWG图纸', "
+        f"{classifiers['archive']}, '压缩包', "
+        "'其他')"
+    )
+
+
+def live_decrypt_summary_counts(config: AppConfig, start: datetime, end: datetime) -> dict[str, int]:
+    if not config.use_clickhouse:
+        return {"records": 0, "standard": 0, "structure": 0, "electrical": 0, "three_d": 0, "dwg": 0, "archive": 0}
+    args, _tz, _internal_domains = live_decrypt_policy_context(config)
+    classifiers = live_decrypt_sql_classifiers()
+    structure_direct = classifiers["structure"]
+    electrical_direct = classifiers["electrical"]
+    standard_cond = classifiers["standard"]
+    three_d_ext = classifiers["three_d"]
+    two_d_ext = classifiers["dwg"]
+    archive_ext = classifiers["archive"]
     time_filter = (
         f"isNotNull(apply_time) "
         f"AND apply_time >= parseDateTime64BestEffort({decrypt_records.clickhouse_quote(start.isoformat())}, 3) "
@@ -4623,8 +4546,8 @@ def live_decrypt_summary_counts(config: AppConfig, start: datetime, end: datetim
 SELECT
   count() AS records,
   countIf({standard_cond}) AS standard,
-  countIf({structure_bucket}) AS structure,
-  countIf({electrical_bucket}) AS electrical,
+  countIf({structure_direct}) AS structure,
+  countIf((NOT ({structure_direct})) AND ({electrical_direct})) AS electrical,
   countIf((NOT ({standard_cond})) AND ({three_d_ext})) AS three_d,
   countIf((NOT ({standard_cond})) AND ({two_d_ext})) AS dwg,
   countIf({archive_ext}) AS archive
@@ -4656,26 +4579,7 @@ def live_decrypt_trend_summary_html(config: AppConfig, start: datetime, end: dat
     days = [trend_end - timedelta(days=offset) for offset in range(29, -1, -1)]
     day_index = {item: idx for idx, item in enumerate(days)}
     args, _tz, _internal_domains = live_decrypt_policy_context(config)
-    base_expr = "replaceRegexpOne(lowerUTF8(file_name), '^.*[\\\\\\\\/]', '')"
-    ext_expr = "lowerUTF8(file_ext)"
-    structure_direct = live_decrypt_sql_or(live_decrypt_pattern_conditions(report_gen.CRITICAL_STRUCTURE_LABEL, base_expr))
-    electrical_direct = live_decrypt_sql_or(live_decrypt_pattern_conditions(report_gen.CRITICAL_ELECTRICAL_LABEL, base_expr))
-    yb_direct = live_decrypt_sql_or(live_decrypt_pattern_conditions(getattr(report_gen, "CRITICAL_YB_STANDARD_LABEL", "油变标准方案"), base_expr))
-    two_d_ext = live_decrypt_ext_has(report_gen.CONTROLLED_2D_CAD_EXTS, ext_expr)
-    three_d_ext = live_decrypt_ext_has(report_gen.CONTROLLED_3D_EXTS, ext_expr)
-    archive_ext = live_decrypt_ext_has(report_gen.ARCHIVE_EXTS, ext_expr)
-    standard_cond = f"(({structure_direct}) OR ({electrical_direct}) OR ({yb_direct}))"
-    structure_bucket = f"(({structure_direct}) OR ((NOT ({structure_direct})) AND (NOT ({electrical_direct})) AND ({yb_direct}) AND (NOT ({two_d_ext}))))"
-    electrical_bucket = f"((NOT ({structure_direct})) AND (({electrical_direct}) OR ((NOT ({electrical_direct})) AND ({yb_direct}) AND ({two_d_ext}))))"
-    bucket_expr = (
-        "multiIf("
-        f"{structure_bucket}, '结构', "
-        f"{electrical_bucket}, '电气', "
-        f"(NOT ({standard_cond})) AND ({three_d_ext}), '三维模型', "
-        f"(NOT ({standard_cond})) AND ({two_d_ext}), 'DWG图纸', "
-        f"{archive_ext}, '压缩包', "
-        "'其他')"
-    )
+    bucket_expr = live_decrypt_bucket_expr(live_decrypt_sql_classifiers())
     trend_start = datetime.combine(days[0], datetime.min.time(), tz)
     query = f"""
 SELECT
@@ -4762,6 +4666,116 @@ FORMAT JSONEachRow
 """
 
 
+def live_decrypt_company_matrix_summary_html(
+    config: AppConfig,
+    start: datetime,
+    end: datetime,
+    limit: int = 10,
+) -> str:
+    if not config.use_clickhouse:
+        return ""
+    args, _tz, _internal_domains = live_decrypt_policy_context(config)
+    bucket_expr = live_decrypt_bucket_expr(live_decrypt_sql_classifiers())
+    query = f"""
+SELECT
+  {bucket_expr} AS bucket,
+  raw_org_path,
+  raw_company,
+  raw_department,
+  count() AS count
+FROM decrypt_records FINAL
+WHERE isNotNull(apply_time)
+  AND apply_time >= parseDateTime64BestEffort({decrypt_records.clickhouse_quote(start.isoformat())}, 3)
+  AND apply_time < parseDateTime64BestEffort({decrypt_records.clickhouse_quote(end.isoformat())}, 3)
+GROUP BY bucket, raw_org_path, raw_company, raw_department
+FORMAT JSONEachRow
+"""
+    try:
+        rows = [json.loads(line) for line in decrypt_records.clickhouse_request(args, query).decode("utf-8", errors="replace").splitlines() if line.strip()]
+    except Exception:
+        return ""
+
+    aliases = decrypt_records.normalize_aliases(load_policy_doc(config))
+    company_counts: dict[str, Counter] = defaultdict(Counter)
+    for row in rows:
+        company, _department, matched = decrypt_records.resolve_org_alias(
+            str(row.get("raw_org_path") or ""),
+            str(row.get("raw_company") or ""),
+            str(row.get("raw_department") or ""),
+            aliases,
+        )
+        company = str(company or "").strip()
+        if not matched or not company or company.startswith("未"):
+            continue
+        bucket = str(row.get("bucket") or "其他")
+        company_counts[company][bucket] += int(row.get("count") or 0)
+
+    ordered = sorted(
+        company_counts.items(),
+        key=lambda item: (
+            -sum(int(value or 0) for value in item[1].values()),
+            -int(item[1].get("结构", 0) or 0) - int(item[1].get("电气", 0) or 0),
+            item[0],
+        ),
+    )
+    visible = ordered[:limit]
+    if not visible:
+        matrix_html = '<p class="empty">暂无已映射公司的解密记录。</p>'
+    else:
+        all_cell_counts: list[int] = []
+        all_total_counts: list[int] = []
+        for _company, counts in ordered:
+            all_cell_counts.extend(int(counts.get(column, 0) or 0) for column in report_gen.DECRYPT_MATRIX_COLUMNS)
+            all_total_counts.append(sum(int(value or 0) for value in counts.values()))
+        cell_thresholds = report_gen.heat_thresholds_from_counts(all_cell_counts)
+        total_thresholds = report_gen.heat_thresholds_from_counts(all_total_counts)
+        headers = "".join(
+            f'<th title="{esc(column)}">{esc({"三维模型": "三维", "DWG图纸": "DWG", "压缩包": "压缩"}.get(column, column))}</th>'
+            for column in report_gen.DECRYPT_MATRIX_COLUMNS
+        )
+        rows_html: list[str] = []
+        for company, counts in visible:
+            total_count = sum(int(value or 0) for value in counts.values())
+            total_href = live_decrypt_url("/api/decrypt-risk-detail", start, end, scope="company", company=company, bucket="__all__")
+            label_inner = f"""
+              <div class="org-matrix-label">
+                <strong title="{esc(company)}">{esc(company)}</strong>
+                <small>{esc(total_count)} 条记录</small>
+              </div>
+"""
+            row_label = f'<a class="org-matrix-label-link" href="{esc(total_href)}" title="查看{esc(company)}解密记录">{label_inner}</a>'
+            cells = [f'<th class="channel-name org-matrix-name" scope="row">{row_label}</th>']
+            for column in report_gen.DECRYPT_MATRIX_COLUMNS:
+                count = int(counts.get(column, 0) or 0)
+                href = live_decrypt_url("/api/decrypt-risk-detail", start, end, scope="company", company=company, bucket=column)
+                cells.append(
+                    f"<td>{report_gen.matrix_number_html(count, href if count else '', f'查看{company} / {column} 解密记录', cell_thresholds)}</td>"
+                )
+            cells.append(
+                f"<td>{report_gen.matrix_number_html(total_count, total_href, f'查看{company}全部解密记录', total_thresholds, total=True)}</td>"
+            )
+            rows_html.append("<tr>" + "".join(cells) + "</tr>")
+        matrix_html = f"""
+          <div class="channel-matrix-wrap organization-matrix-wrap decrypt-company-matrix-wrap">
+            <table class="channel-matrix organization-matrix decrypt-company-matrix">
+              <thead><tr><th>公司</th>{headers}<th>合计</th></tr></thead>
+              <tbody>{"".join(rows_html)}</tbody>
+            </table>
+          </div>
+"""
+    all_href = live_decrypt_url("/api/decrypt-risk-detail", start, end, scope="all")
+    return f"""
+      <section class="decrypt-company-panel">
+        <div class="org-panel-head">
+          <span>Company Decrypt Risk</span>
+          <a href="{esc(all_href)}">查看全部解密记录</a>
+        </div>
+        <h3>公司解密风险矩阵 Top10</h3>
+        {matrix_html}
+      </section>
+"""
+
+
 def live_decrypt_bucket_for_row(row: dict[str, Any]) -> str:
     file_name = str(row.get("file_name") or "")
     file_ext = str(row.get("file_ext") or report_gen.extension(file_name)).lower()
@@ -4770,8 +4784,6 @@ def live_decrypt_bucket_for_row(row: dict[str, Any]) -> str:
         return "结构"
     if report_gen.CRITICAL_ELECTRICAL_LABEL in labels:
         return "电气"
-    if report_gen.CRITICAL_YB_STANDARD_LABEL in labels:
-        return "电气" if file_ext in report_gen.CONTROLLED_2D_CAD_EXTS else "结构"
     if file_ext in report_gen.CONTROLLED_3D_EXTS:
         return "三维模型"
     if file_ext in report_gen.CONTROLLED_2D_CAD_EXTS:
@@ -4829,6 +4841,8 @@ def live_decrypt_fragment(config: AppConfig, start: datetime, end: datetime) -> 
 def live_decrypt_summary_fragment(config: AppConfig, start: datetime, end: datetime) -> bytes:
     counts = live_decrypt_summary_counts(config, start, end)
     links = live_decrypt_links(start, end)
+    trend_html = live_decrypt_trend_summary_html(config, start, end)
+    company_matrix_html = live_decrypt_company_matrix_summary_html(config, start, end)
     structure = int(counts.get("structure", 0) or 0)
     electrical = int(counts.get("electrical", 0) or 0)
     standard = int(counts.get("standard", 0) or 0)
@@ -4838,7 +4852,7 @@ def live_decrypt_summary_fragment(config: AppConfig, start: datetime, end: datet
     conclusions = [
         f"本期一级风险为标准图纸解密 {standard} 条，其中结构 {structure} 条、电气 {electrical} 条；该口径与下方结构/电气卡片及标准图纸明细一致。",
         f"普通对象作为辅助复核：三维模型 {three_d} 条、DWG图纸 {dwg} 条、压缩包 {archive} 条；不计入本模块一级风险汇总。",
-        "后续流转链路、公司矩阵和趋势正在后台继续计算，完成后自动刷新本模块详情。",
+        "首页只实时刷新数字、趋势和公司矩阵；后续流转链路和完整明细在点击下钻时再计算。",
     ]
     overview = f"""
     <section id="decrypt-risk-overview" class="section-block risk-overview-shell decrypt-overview-shell">
@@ -4846,7 +4860,7 @@ def live_decrypt_summary_fragment(config: AppConfig, start: datetime, end: datet
         <div>
           <span class="section-eyebrow">Rule Overview</span>
           <h2>加密软件解密规则风险概览</h2>
-          <p>先按解密记录本周期文件名和后缀快速聚合一级风险；后续流转链路异步补充。</p>
+          <p>首页只按本周期文件名、后缀和组织做轻量聚合；流转链路和完整明细点击后再计算。</p>
         </div>
       </div>
       <div class="risk-overview-hero">
@@ -4876,10 +4890,9 @@ def live_decrypt_summary_fragment(config: AppConfig, start: datetime, end: datet
         card("电气", electrical, "电气标准方案解密记录", links.get("electrical"), "amber"),
         card("三维模型", three_d, "PRT/ASM/SLDASM/SLDPRT/STEP 解密记录", links.get("three_d"), "blue"),
         card("DWG图纸", dwg, "DWG 图纸解密记录", links.get("dwg"), "slate"),
-        card("发现后续流转", "计算中", "后续流转链路正在后台计算", links.get("linked"), "red"),
+        card("发现后续流转", "下钻计算", "点击后按解密记录与天擎审计事件计算后续流转链路", links.get("linked"), "red"),
     ]
-    trend_html = live_decrypt_trend_summary_html(config, start, end)
-    return (overview + f'<div class="decrypt-card-grid">{"".join(cards)}</div>' + trend_html).encode("utf-8")
+    return (overview + f'<div class="decrypt-card-grid">{"".join(cards)}</div>' + trend_html + company_matrix_html).encode("utf-8")
 
 
 def filter_live_decrypt_records(
@@ -4981,7 +4994,6 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
     except ValueError:
         return data
     summary_url = live_decrypt_url("/api/decrypt-risk-summary-fragment", start, end)
-    detail_url = live_decrypt_url("/api/decrypt-risk-fragment", start, end)
     prehide_style = """
 <style id="tq-live-decrypt-prehide">
   #decrypt-risk-overview[data-live-decrypt-state="loading"] {
@@ -5071,7 +5083,6 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
 <script id="tq-live-decrypt-loader">
 (function() {{
   var summaryUrl = {json.dumps(summary_url, ensure_ascii=False)};
-  var detailUrl = {json.dumps(detail_url, ensure_ascii=False)};
   function removePrehide() {{
     var style = document.getElementById("tq-live-decrypt-prehide");
     if (style && style.parentNode) {{
@@ -5091,7 +5102,7 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
     if (!status) {{
       status = document.createElement("p");
       status.className = "live-decrypt-inline-status";
-      status.textContent = "解密审计实时刷新中，先刷新一级风险数字，趋势和矩阵随后补齐";
+      status.textContent = "解密审计数字实时刷新中";
       section.insertBefore(status, section.firstChild);
     }}
     var summaryApplied = false;
@@ -5107,34 +5118,33 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
       }}
       var freshCards = wrapper.querySelector(".decrypt-card-grid");
       var oldCards = section.querySelector(".decrypt-card-grid");
-	      if (freshCards && oldCards) {{
-	        oldCards.replaceWith(freshCards);
-	      }}
-	      var freshTrend = wrapper.querySelector(".decrypt-trend-panel");
-	      var oldTrend = section.querySelector(".decrypt-trend-panel");
-	      if (freshTrend && oldTrend) {{
-	        oldTrend.replaceWith(freshTrend);
-	      }}
-	      if (freshOverview || freshCards) {{
-	        section.setAttribute("data-live-decrypt-state", "summary");
+      if (freshCards && oldCards) {{
+        oldCards.replaceWith(freshCards);
+      }}
+      var anchor = section.querySelector(".decrypt-card-grid");
+      var freshTrend = wrapper.querySelector(".decrypt-trend-panel");
+      var freshCompany = wrapper.querySelector(".decrypt-company-panel");
+      Array.prototype.forEach.call(section.querySelectorAll(".decrypt-trend-panel, .decrypt-company-panel, .rename-empty"), function(node) {{
+        if (node && node.parentNode) node.parentNode.removeChild(node);
+      }});
+      function insertAfter(reference, node) {{
+        if (!node) return reference;
+        if (reference && reference.parentNode) {{
+          reference.parentNode.insertBefore(node, reference.nextSibling);
+          return node;
+        }}
+        section.appendChild(node);
+        return node;
+      }}
+      anchor = insertAfter(anchor, freshTrend);
+      anchor = insertAfter(anchor, freshCompany);
+      if (freshOverview || freshCards || freshTrend || freshCompany) {{
+        section.setAttribute("data-live-decrypt-state", "ready");
+        removePrehide();
         if (status && status.parentNode) {{
-          status.textContent = "一级风险数字已刷新，趋势和公司矩阵正在继续计算";
+          status.textContent = "解密审计数字、趋势和公司矩阵已刷新；流转链路点击后计算";
         }}
         summaryApplied = true;
-      }}
-    }}
-    function applyDetail(html) {{
-      var wrapper = document.createElement("div");
-      wrapper.innerHTML = html;
-      var fresh = wrapper.querySelector("#decrypt-risk-tracking");
-      if (fresh) {{
-        section.replaceWith(fresh);
-        removePrehide();
-        Array.prototype.forEach.call(wrapper.querySelectorAll("script"), function(oldScript) {{
-          var script = document.createElement("script");
-          script.text = oldScript.text || oldScript.textContent || "";
-          document.body.appendChild(script);
-        }});
       }}
     }}
     function showError(err) {{
@@ -5147,7 +5157,7 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
       if (summaryApplied) {{
         var error = document.createElement("p");
         error.className = "note";
-        error.textContent = "完整趋势和链路暂未刷新：" + err.message;
+        error.textContent = "解密数字刷新失败：" + err.message;
         section.appendChild(error);
       }} else {{
         if (status && status.parentNode) {{
@@ -5168,11 +5178,7 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
       }});
     }}
     fetchHtml(summaryUrl)
-      .then(function(html) {{
-        applySummary(html);
-        return fetchHtml(detailUrl);
-      }})
-      .then(applyDetail)
+      .then(applySummary)
       .catch(showError);
   }}
   if (document.readyState === "loading") {{
@@ -5707,7 +5713,6 @@ def settings_page(config: AppConfig) -> bytes:
     keywords = [rule for rule in keyword_doc.get("rules", []) if isinstance(rule, dict)]
     design = policy_doc.get("design_suffixes") if isinstance(policy_doc.get("design_suffixes"), dict) else {}
     internal_targets = policy_doc.get("internal_targets") if isinstance(policy_doc.get("internal_targets"), dict) else {}
-    ai_analysis = policy_doc.get("ai_analysis") if isinstance(policy_doc.get("ai_analysis"), dict) else {}
     plm_login_audit = policy_doc.get("plm_login_audit") if isinstance(policy_doc.get("plm_login_audit"), dict) else {}
     organization_aliases = normalize_organization_aliases(policy_doc.get("organization_aliases"))
     three_d = design.get("three_d") or []
@@ -5717,9 +5722,6 @@ def settings_page(config: AppConfig) -> bytes:
     internal_domains = internal_targets.get("domains") or []
     internal_networks = internal_targets.get("networks") or []
     plm_departments = normalize_unique_text_list(plm_login_audit.get("constrained_departments") or DEFAULT_PLM_CONSTRAINED_DEPARTMENTS)
-    prompt_template = str(ai_analysis.get("prompt_template") or "")
-    prompt_mode = "自定义" if prompt_template.strip() and prompt_template.strip() != DEFAULT_AI_PROMPT_TEMPLATE.strip() else "默认"
-    ai_enabled = ai_policy_enabled_from_doc(policy_doc)
     exclusions = [rule for rule in exclusion_doc.get("rules", []) if isinstance(rule, dict)]
     auth = auth_policy(config)
     wecom_companies, _wecom_departments = wecom_org_options(config)
@@ -5868,18 +5870,10 @@ def settings_page(config: AppConfig) -> bytes:
           <div>
             <p class="settings-group-kicker">SYSTEM</p>
             <h2>系统能力与访问控制</h2>
-            <p class="muted">控制AI研判是否启用，并维护全集团审计报告访问权限。</p>
+            <p class="muted">维护全集团审计报告访问权限和系统级策略。</p>
           </div>
         </div>
         <div class="settings-grid">
-      <div class="settings-card">
-        <h3>AI分析策略</h3>
-        <p class="metric">{esc('启用' if ai_enabled else '关闭')}</p>
-        <p class="muted">当前：{esc(prompt_mode)}提示词。</p>
-        {ai_toggle_form(ai_enabled)}
-        <p class="muted">完整维护AI异常研判提示词，必须保留审计摘要 JSON 占位符。</p>
-        <div class="actions"><a class="button primary" href="/settings/ai">维护AI提示词</a></div>
-      </div>
       <div class="settings-card">
         <h3>认证与报表查看</h3>
         <p class="metric">查看用户 {len(auth["global_viewer_userids"])}</p>
@@ -7683,50 +7677,6 @@ def organization_aliases_page(config: AppConfig, message: str = "", error: str =
     return page_shell("组织别名关联", body)
 
 
-def ai_policy_page(config: AppConfig, message: str = "", error: str = "") -> bytes:
-    doc = load_policy_doc(config)
-    ai_analysis = doc.get("ai_analysis") if isinstance(doc.get("ai_analysis"), dict) else {}
-    ai_enabled = ai_policy_enabled_from_doc(doc)
-    prompt_template = str(ai_analysis.get("prompt_template") or DEFAULT_AI_PROMPT_TEMPLATE)
-    msg = f'<p class="muted">{esc(message)}</p>' if message else ""
-    error_html = f'<p class="error">{esc(error)}</p>' if error else ""
-    body = f"""
-    <header>
-      <div>
-        <h1>AI分析策略</h1>
-        <div class="muted">完整提示词来自 {esc(policy_path(config))}；报告生成时会把 {esc(AI_CONTEXT_PLACEHOLDER)} 替换为审计摘要 JSON。</div>
-      </div>
-      <div class="actions">
-        <a class="button" href="/settings">策略中心</a>
-        <a class="button" href="/manual">自定义生成</a>
-        <a class="button" href="/">当前报告首页</a>
-      </div>
-    </header>
-    {msg}
-    {error_html}
-    <section class="panel">
-      <h2>AI启用开关</h2>
-      {ai_toggle_form(ai_enabled)}
-      <p class="muted">关闭后，周报、月报、日报和手动报告都不调用模型，仅展示规则研判摘要。</p>
-    </section>
-    <section class="panel">
-      <h2>编辑完整提示词</h2>
-      <form method="post" action="/settings/ai/save">
-        <input type="hidden" name="ai_enabled" value="{esc('1' if ai_enabled else '0')}">
-        <label class="full">AI异常研判提示词
-          <textarea name="prompt_template" spellcheck="false" style="min-height: 520px;" placeholder="必须包含 {esc(AI_CONTEXT_PLACEHOLDER)}">{esc(prompt_template)}</textarea>
-        </label>
-        <p class="muted full">保存校验：不能为空、必须包含 {esc(AI_CONTEXT_PLACEHOLDER)}、不超过 {MAX_AI_PROMPT_TEMPLATE_CHARS} 字。若提示词不要求 JSON 输出，AI详情页会降级显示非结构化结果。</p>
-        <div class="full actions">
-          <button class="primary" type="submit">保存覆盖</button>
-          <button type="submit" formaction="/settings/ai/default">恢复默认模板</button>
-        </div>
-      </form>
-    </section>
-"""
-    return page_shell("AI分析策略", body)
-
-
 def auth_settings_page(config: AppConfig, message: str = "", error: str = "") -> bytes:
     auth = auth_policy(config)
     msg = f'<p class="muted">{esc(message)}</p>' if message else ""
@@ -8197,11 +8147,6 @@ class ReportHandler(BaseHTTPRequestHandler):
                 return
             self.send_html(organization_tree_page(self.config))
             return
-        if parsed.path == "/settings/ai":
-            if not self.require_admin(session):
-                return
-            self.send_html(ai_policy_page(self.config))
-            return
         if parsed.path == "/settings/auth":
             if not self.require_admin(session):
                 return
@@ -8334,11 +8279,6 @@ class ReportHandler(BaseHTTPRequestHandler):
                 return
             self.handle_organization_alias_post(parsed.path, form)
             return
-        if parsed.path.startswith("/settings/ai/"):
-            if not self.require_admin(session):
-                return
-            self.handle_ai_policy_post(parsed.path, form)
-            return
         if parsed.path.startswith("/settings/auth/"):
             if not self.require_admin(session):
                 return
@@ -8456,7 +8396,6 @@ class ReportHandler(BaseHTTPRequestHandler):
             "/settings/encryption-terminals",
             "/settings/organization-aliases",
             "/settings/organization-tree",
-            "/settings/ai",
             "/settings/auth",
             "/settings/exclusions",
             "/terminal-check",
@@ -8847,28 +8786,6 @@ class ReportHandler(BaseHTTPRequestHandler):
             write_rule_doc(policy_path(self.config), doc, self.config)
         self.redirect("/settings/organization-aliases")
 
-    def handle_ai_policy_post(self, path: str, form: dict[str, str]) -> None:
-        with RULES_LOCK:
-            doc = load_policy_doc(self.config)
-            ai_analysis = doc.get("ai_analysis") if isinstance(doc.get("ai_analysis"), dict) else {}
-            enabled = form.get("ai_enabled") == "1" if "ai_enabled" in form else policy_bool(ai_analysis.get("enabled", True), True)
-            if path.endswith("/toggle"):
-                template = str(ai_analysis.get("prompt_template") or DEFAULT_AI_PROMPT_TEMPLATE)
-            elif path.endswith("/default"):
-                template = DEFAULT_AI_PROMPT_TEMPLATE
-            elif path.endswith("/save"):
-                try:
-                    template = validate_ai_prompt_template(form.get("prompt_template") or "")
-                except ValueError as exc:
-                    self.send_html(ai_policy_page(self.config, error=str(exc)), HTTPStatus.BAD_REQUEST)
-                    return
-            else:
-                self.send_error(HTTPStatus.NOT_FOUND)
-                return
-            doc["ai_analysis"] = {"enabled": enabled, "prompt_template": template}
-            write_rule_doc(policy_path(self.config), doc, self.config)
-        self.redirect("/settings/ai")
-
     def handle_auth_policy_post(self, path: str, form: dict[str, str]) -> None:
         with RULES_LOCK:
             if not path.endswith("/save"):
@@ -8938,7 +8855,6 @@ class ReportHandler(BaseHTTPRequestHandler):
             start_text=start_dt.strftime("%Y-%m-%d %H:%M:%S"),
             end_text=end_dt.strftime("%Y-%m-%d %H:%M:%S"),
             max_events=0,
-            enable_ai=False,
             output_name=base_name,
             log_name=log_name,
             refresh_clickhouse=True,
@@ -9052,9 +8968,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auth-cookie-domain", default=os.getenv("TIANQING_AUTH_COOKIE_DOMAIN", DEFAULT_AUTH_COOKIE_DOMAIN))
     parser.add_argument("--auth-proxy-base-url", default=os.getenv("TIANQING_AUTH_PROXY_BASE_URL", DEFAULT_AUTH_PROXY_BASE_URL))
     parser.add_argument("--auth-proxy-token", default=os.getenv("TIANQING_AUTH_PROXY_TOKEN", ""))
-    parser.add_argument("--ai-host", default=DEFAULT_AI_HOST)
-    parser.add_argument("--ai-container", default=DEFAULT_AI_CONTAINER)
-    parser.add_argument("--ai-model", default=DEFAULT_AI_MODEL)
     return parser.parse_args()
 
 
@@ -9083,9 +8996,6 @@ def main() -> int:
         auth_cookie_domain=args.auth_cookie_domain.strip(),
         auth_proxy_base_url=args.auth_proxy_base_url.rstrip("/"),
         auth_proxy_token=args.auth_proxy_token,
-        ai_host=args.ai_host,
-        ai_container=args.ai_container,
-        ai_model=args.ai_model,
     )
     config.report_dir.mkdir(parents=True, exist_ok=True)
     (config.report_dir / "jobs").mkdir(parents=True, exist_ok=True)
