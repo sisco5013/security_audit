@@ -1116,10 +1116,18 @@ def _first_regex_value(pattern: str, text: str, default: str = "-") -> str:
     return match.group(1) if match else default
 
 
+def _first_regex_int(pattern: str, text: str, default: int = 0, group: int = 1) -> int:
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    if not match:
+        return default
+    try:
+        return int(match.group(group))
+    except (IndexError, TypeError, ValueError):
+        return default
+
+
 def inject_global_management_summary(data: bytes) -> bytes:
     text = data.decode("utf-8", errors="replace")
-    if 'id="global-management-summary"' in text:
-        return data
     if 'id="decrypt-audit"' not in text and 'id="tianqing-audit"' not in text:
         return data
 
@@ -1127,27 +1135,18 @@ def inject_global_management_summary(data: bytes) -> bytes:
     tianqing_section = _section_html(text, "tianqing-audit")
     decrypt_plain = _html_plain_text(decrypt_section)
     tianqing_plain = _html_plain_text(tianqing_section)
-    decrypt_value = _first_regex_value(r"解密审计记录\s*(\d+)\s*条", decrypt_plain)
-    decrypt_standard = _first_regex_value(r"标准图纸\s*(\d+)\s*条", decrypt_plain)
-    tianqing_value = _first_regex_value(r"重点事件\s*(\d+)\s*条", tianqing_plain)
-    tianqing_terminals = _first_regex_value(r"风险终端\s*(\d+)\s*台", tianqing_plain)
-    if decrypt_value == "-" and "暂无解密记录" in decrypt_plain:
-        decrypt_value = "0"
-    if decrypt_standard == "-":
-        decrypt_standard = _first_regex_value(r"标准图纸解密总数\s*(\d+)", decrypt_plain)
-    if tianqing_terminals == "-":
-        tianqing_terminals = _first_regex_value(r"(\d+)\s*台风险终端", tianqing_plain)
-    decrypt_sentence = _first_conclusion_text(
-        decrypt_section,
-        "加密软件解密审计重点关注标准图纸、三维模型、DWG 图纸及其后续流转线索。",
-    )
-    tianqing_sentence = _first_conclusion_text(
-        tianqing_section,
-        "天擎外发审计重点关注邮件、IM、外部站点上传和外设拷贝中的设计资料与敏感附件。",
-    )
+    decrypt_standard = _first_regex_int(r"标准图纸\s*(\d+)\s*条", decrypt_plain)
+    if not decrypt_standard:
+        decrypt_standard = _first_regex_int(r"标准图纸解密总数\s*(\d+)", decrypt_plain)
+    decrypt_structure = _first_regex_int(r"结构\s*(\d+)", decrypt_plain)
+    decrypt_electrical = _first_regex_int(r"电气\s*(\d+)", decrypt_plain)
+    tianqing_structure = _first_regex_int(r"结构(?:标准方案)?\s*(\d+)", tianqing_plain)
+    tianqing_electrical = _first_regex_int(r"电气(?:标准方案)?\s*(\d+)", tianqing_plain)
+    tianqing_yb = _first_regex_int(r"油变(?:标准方案)?\s*(\d+)", tianqing_plain)
+    tianqing_critical = tianqing_structure + tianqing_electrical + tianqing_yb
     lead = (
-        f"本周期风险概况：加密软件解密 {decrypt_value} 条，标准图纸 {decrypt_standard} 条；"
-        f"天擎外发重点事件 {tianqing_value} 条，涉及风险终端 {tianqing_terminals} 台；"
+        f"本周期一级风险概况：标准图纸解密 {decrypt_standard} 条；"
+        f"天擎标准图纸外发/拷贝 {tianqing_critical} 条；"
         "PLM 登录审计待接入。"
     )
     style = """
@@ -1270,15 +1269,15 @@ def inject_global_management_summary(data: bytes) -> bytes:
       <div class="management-module-grid">
         <a class="management-module-card management-module-card-decrypt" href="#decrypt-audit">
           <span>加密软件解密审计</span>
-          <strong>{esc(decrypt_value)}</strong>
-          <em>标准图纸 {esc(decrypt_standard)}</em>
-          <p>{esc(decrypt_sentence)}</p>
+          <strong>{esc(decrypt_standard)}</strong>
+          <em>标准图纸解密：结构 {esc(decrypt_structure)} / 电气 {esc(decrypt_electrical)}</em>
+          <p>只汇总结构、电气等标准图纸解密；三维模型、DWG、压缩包及后续流转由解密模块详述。</p>
         </a>
         <a class="management-module-card management-module-card-tianqing" href="#tianqing-audit">
           <span>天擎外发审计</span>
-          <strong>{esc(tianqing_value)}</strong>
-          <em>风险终端 {esc(tianqing_terminals)}</em>
-          <p>{esc(tianqing_sentence)}</p>
+          <strong>{esc(tianqing_critical)}</strong>
+          <em>标准图纸外发/拷贝：结构 {esc(tianqing_structure)} / 电气 {esc(tianqing_electrical)} / 油变 {esc(tianqing_yb)}</em>
+          <p>只汇总结构、电气、油变等标准图纸经邮件、IM、上传或外设拷贝的一级风险；其他对象由天擎模块详述。</p>
         </a>
         <div class="management-module-card management-module-card-plm">
           <span>PLM登录审计</span>
@@ -1287,19 +1286,27 @@ def inject_global_management_summary(data: bytes) -> bytes:
           <p>接口接入后重点校验技术、研发、工艺账号是否从 MAC+计算机名授信终端登录。</p>
         </div>
       </div>
-      <p class="global-management-action">管理动作建议：先看标准图纸解密和天擎外发矩阵，再下钻公司、部门和终端；PLM 模块上线后作为账号登录合规补充，不替代天擎外发和解密流转证据。</p>
+      <p class="global-management-action">顶部只呈现各模块一级风险；普通三维、DWG、敏感名称、压缩包、趋势、组织和终端细节由各模块详述并下钻复核。</p>
     </section>
 """
+    existing_match = re.search(
+        r'<section\b[^>]*\bid="global-management-summary"[\s\S]*?(?=<section\b[^>]*\bid="(?:decrypt-audit|tianqing-audit|plm-login-audit)"|<footer\b|</main>)',
+        text,
+        flags=re.IGNORECASE,
+    )
     marker_match = re.search(r'<section\b[^>]*\bid="(?:decrypt-audit|tianqing-audit)"', text, flags=re.IGNORECASE)
-    if not marker_match:
+    if not existing_match and not marker_match:
         return data
     if "global-management-summary-style" not in text:
         if re.search(r"</head>", text, flags=re.IGNORECASE):
             text = re.sub(r"</head>", style + r"\g<0>", text, count=1, flags=re.IGNORECASE)
         else:
             text = style + text
-    idx = marker_match.start()
-    text = text[:idx] + block + "\n" + text[idx:]
+    if existing_match:
+        text = text[: existing_match.start()] + block + "\n" + text[existing_match.end() :]
+    else:
+        idx = marker_match.start()
+        text = text[:idx] + block + "\n" + text[idx:]
     return text.encode("utf-8")
 
 

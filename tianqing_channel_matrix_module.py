@@ -77,6 +77,7 @@ def build_tianqing_channel_matrix_result(
 
     matrix_counts = {key: len(value) for key, value in channel_matrix_event_map.items()}
     row_totals = Counter({channel: len(channel_events) for channel, channel_events in channel_event_map.items()})
+    object_totals = Counter({bucket: len(bucket_events) for bucket, bucket_events in matrix_object_event_map.items()})
     dynamic_matrix_rows = [
         row_label
         for row_label, count in row_totals.most_common()
@@ -142,6 +143,7 @@ def build_tianqing_channel_matrix_result(
         cell_links=cell_links,
         object_links=object_links,
         row_totals=row_totals,
+        object_totals=object_totals,
         rows=channel_matrix_rows,
         sidecar_pages=sidecar_pages,
     )

@@ -752,6 +752,8 @@ def build_decrypt_audit_module_result(
         metrics={
             "records": len(records),
             "standard": len(standard_records),
+            "structure": len(structure_records),
+            "electrical": len(electrical_records),
             "linked": len(linked_records),
             "unmatched_org": len(unmatched_records),
             "company_count": len(decrypt_company_groups(records)),

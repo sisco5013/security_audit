@@ -49,6 +49,7 @@ class TianqingChannelMatrixResult:
     cell_links: dict[tuple[str, str], str]
     object_links: dict[str, str]
     row_totals: Counter
+    object_totals: Counter
     rows: list[str]
     sidecar_pages: dict[str, str] = field(default_factory=dict)
 
@@ -150,60 +151,69 @@ def _summary_card_html(title: str, value: str, label: str, detail: str, href: st
 """
 
 
+def _standard_design_total_from_metrics(metrics: dict[str, Any] | None) -> int:
+    total = _metric_int(metrics, "critical_design")
+    if total:
+        return total
+    return (
+        _metric_int(metrics, "critical_structure")
+        + _metric_int(metrics, "critical_electrical")
+        + _metric_int(metrics, "critical_yb")
+    )
+
+
 def build_global_management_summary_html(
     decrypt_metrics: dict[str, Any] | None,
     tianqing_metrics: dict[str, Any] | None,
     plm_metrics: dict[str, Any] | None = None,
 ) -> str:
-    decrypt_total = _metric_int(decrypt_metrics, "records")
     decrypt_standard = _metric_int(decrypt_metrics, "standard")
-    decrypt_linked = _metric_int(decrypt_metrics, "linked")
-    decrypt_companies = _metric_int(decrypt_metrics, "company_count")
+    decrypt_structure = _metric_int(decrypt_metrics, "structure")
+    decrypt_electrical = _metric_int(decrypt_metrics, "electrical")
 
-    tianqing_events = _metric_int(tianqing_metrics, "matrix_events") or _metric_int(tianqing_metrics, "events")
-    tianqing_terminals = _metric_int(tianqing_metrics, "terminal_count")
-    top_channel = _metric_text(tianqing_metrics, "top_channel")
-    top_channel_count = _metric_int(tianqing_metrics, "top_channel_count")
+    tianqing_critical = _standard_design_total_from_metrics(tianqing_metrics)
+    tianqing_structure = _metric_int(tianqing_metrics, "critical_structure")
+    tianqing_electrical = _metric_int(tianqing_metrics, "critical_electrical")
+    tianqing_yb = _metric_int(tianqing_metrics, "critical_yb")
 
     plm_enabled = bool(plm_metrics and plm_metrics.get("enabled"))
     plm_risks = _metric_int(plm_metrics, "risk_count")
-    plm_label = "登录合规风险" if plm_enabled else "待接入"
+    plm_label = "池外登录" if plm_enabled else "待接入"
     plm_value = str(plm_risks) if plm_enabled else "未纳入"
     plm_detail = (
-        f"已纳入 PLM 登录合规审计，本期识别 {plm_risks} 条需复核登录记录。"
+        f"已纳入 PLM 登录合规审计，本期识别 {plm_risks} 条技术、研发、工艺账号池外登录记录。"
         if plm_enabled
         else "接口接入后重点校验技术、研发、工艺账号是否从 MAC+计算机名授信终端登录。"
     )
 
-    if decrypt_total or tianqing_events:
+    if decrypt_standard or tianqing_critical or plm_risks:
         lead = (
-            f"本周期风险概况：加密软件解密 {decrypt_total} 条，标准图纸 {decrypt_standard} 条；"
-            f"天擎外发重点事件 {tianqing_events} 条，涉及风险终端 {tianqing_terminals} 台；"
-            f"PLM 登录审计{plm_label}。"
+            f"本周期一级风险概况：标准图纸解密 {decrypt_standard} 条；"
+            f"天擎标准图纸外发/拷贝 {tianqing_critical} 条；"
+            f"PLM 登录审计{plm_label}{' ' + str(plm_risks) + ' 条' if plm_enabled else ''}。"
         )
     else:
-        lead = "本周期三大审计模块暂无显著风险数据，仍按解密记录、天擎外发和 PLM 登录三个入口保留持续监测。"
+        lead = "本周期三大审计模块暂无一级风险数据，仍按标准图纸解密、天擎标准图纸外发/拷贝和 PLM 池外登录保留持续监测。"
 
     action = (
-        "管理动作建议：先看标准图纸解密和天擎外发矩阵，再下钻公司、部门和终端；"
-        "PLM 模块上线后作为账号登录合规补充，不替代天擎外发和解密流转证据。"
+        "顶部只呈现各模块一级风险；普通三维、DWG、敏感名称、压缩包、趋势、组织和终端细节由各模块详述并下钻复核。"
     )
 
     cards = "".join(
         [
             _summary_card_html(
                 "加密软件解密审计",
-                f"{decrypt_total}",
-                f"标准图纸 {decrypt_standard} / 后续流转 {decrypt_linked}",
-                f"重点看结构、电气、三维和 DWG 解密；涉及公司 {decrypt_companies} 个，按审批依据和后续流转闭环。",
+                f"{decrypt_standard}",
+                f"标准图纸解密：结构 {decrypt_structure} / 电气 {decrypt_electrical}",
+                "只汇总结构、电气等标准图纸解密；三维模型、DWG、压缩包及后续流转由解密模块详述。",
                 "#decrypt-audit",
                 "decrypt",
             ),
             _summary_card_html(
                 "天擎外发审计",
-                f"{tianqing_events}",
-                f"风险终端 {tianqing_terminals} / Top通道 {top_channel} {top_channel_count}",
-                "重点看邮件、IM、外部站点上传、外设拷贝中的结构、电气、三维、DWG、敏感名称和压缩包。",
+                f"{tianqing_critical}",
+                f"标准图纸外发/拷贝：结构 {tianqing_structure} / 电气 {tianqing_electrical} / 油变 {tianqing_yb}",
+                "只汇总结构、电气、油变等标准图纸经邮件、IM、上传或外设拷贝的一级风险；其他对象由天擎模块详述。",
                 "#tianqing-audit",
                 "tianqing",
             ),
@@ -417,6 +427,13 @@ def build_tianqing_outbound_module_result(
         metrics={
             "events": len(events),
             "matrix_events": sum(channel_matrix_result.row_totals.values()),
+            "critical_design": sum(
+                int(channel_matrix_result.object_totals.get(label, 0) or 0)
+                for label in ("结构标准方案", "电气标准方案", "油变标准方案")
+            ),
+            "critical_structure": int(channel_matrix_result.object_totals.get("结构标准方案", 0) or 0),
+            "critical_electrical": int(channel_matrix_result.object_totals.get("电气标准方案", 0) or 0),
+            "critical_yb": int(channel_matrix_result.object_totals.get("油变标准方案", 0) or 0),
             "top_channel": channel_matrix_result.row_totals.most_common(1)[0][0] if channel_matrix_result.row_totals else "",
             "top_channel_count": channel_matrix_result.row_totals.most_common(1)[0][1] if channel_matrix_result.row_totals else 0,
             "channel_pages": len(channel_matrix_result.sidecar_pages),
