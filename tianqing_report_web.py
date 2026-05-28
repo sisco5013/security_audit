@@ -36,6 +36,7 @@ import urllib.request
 import tianqing_decrypt_records as decrypt_records
 import tianqing_encryption_terminals as encryption_terminals
 import tianqing_external_audit_report as report_gen
+import tianqing_terminal_behavior_review as terminal_review
 
 try:
     from zoneinfo import ZoneInfo
@@ -487,6 +488,7 @@ def normalize_login_next(next_path: str) -> str:
         "/settings/internal-targets/": "/settings/internal-targets",
         "/settings/archive-suffixes/": "/settings/archive-suffixes",
         "/settings/plm-login/": "/settings/plm-login",
+        "/settings/terminal-behavior-review/": "/settings/terminal-behavior-review",
         "/settings/decrypt-records/": "/settings/decrypt-records",
         "/settings/organization-aliases/": "/settings/organization-aliases",
         "/settings/organization-tree/": "/settings/organization-tree",
@@ -1077,6 +1079,14 @@ def inject_report_navigation_patch(data: bytes) -> bytes:
         count=1,
         flags=re.IGNORECASE,
     )
+    if "异常终端行为核查" not in updated:
+        updated = re.sub(
+            r'(<a\s+class="top-action"\s+href="[^"]*/settings">策略管理</a>)',
+            r'\1<a class="top-action" href="/terminal-check">异常终端行为核查</a>',
+            updated,
+            count=1,
+            flags=re.IGNORECASE,
+        )
     return updated.encode("utf-8") if updated != text else data
 
 
@@ -1290,6 +1300,50 @@ def inject_global_management_summary(data: bytes) -> bytes:
             text = style + text
     idx = marker_match.start()
     text = text[:idx] + block + "\n" + text[idx:]
+    return text.encode("utf-8")
+
+
+def report_period_for_static_path(config: AppConfig, target: Path) -> tuple[datetime, datetime] | None:
+    target = target.resolve()
+    for item in read_report_archives(config):
+        rel_path = str(item.get("path") or "")
+        path = (config.report_dir / rel_path).resolve()
+        if path != target:
+            continue
+        start_text = str(item.get("period_start") or "").strip()
+        end_text = str(item.get("period_end") or "").strip()
+        if not start_text or not end_text:
+            return None
+        try:
+            return parse_local_datetime(start_text, config.timezone), parse_local_datetime(end_text, config.timezone)
+        except ValueError:
+            return None
+    return None
+
+
+def inject_terminal_behavior_review_summary(data: bytes, config: AppConfig, target: Path) -> bytes:
+    text = data.decode("utf-8", errors="replace")
+    if 'id="terminal-behavior-review-summary"' in text:
+        return data
+    if 'id="decrypt-audit"' not in text and 'id="tianqing-audit"' not in text:
+        return data
+    period = report_period_for_static_path(config, target)
+    if not period:
+        return data
+    start, end = period
+    block = terminal_review.report_summary_html(config, start, end)
+    if "terminal-review-summary-style" not in text:
+        style = terminal_review.report_summary_style()
+        if re.search(r"</head>", text, flags=re.IGNORECASE):
+            text = re.sub(r"</head>", style + r"\g<0>", text, count=1, flags=re.IGNORECASE)
+        else:
+            text = style + text
+    marker = re.search(r'<section\b[^>]*\bid="(?:decrypt-audit|tianqing-audit)"', text, flags=re.IGNORECASE)
+    summary_marker = re.search(r'<section\b[^>]*\bid="global-management-summary"[\s\S]*?</section>', text, flags=re.IGNORECASE)
+    insert_at = summary_marker.end() if summary_marker else (marker.start() if marker else -1)
+    if insert_at < 0:
+        return data
+    text = text[:insert_at] + "\n" + block + "\n" + text[insert_at:]
     return text.encode("utf-8")
 
 
@@ -3586,6 +3640,7 @@ def load_policy_doc(config: AppConfig) -> dict[str, Any]:
                 "constrained_departments": DEFAULT_PLM_CONSTRAINED_DEPARTMENTS,
                 "terminal_match_fields": DEFAULT_PLM_TERMINAL_MATCH_FIELDS,
             },
+            "terminal_behavior_review": terminal_review.DEFAULT_REVIEW_POLICY,
             "ai_analysis": {"prompt_template": DEFAULT_AI_PROMPT_TEMPLATE},
             "auth": {
                 "policy_admin_userids": DEFAULT_POLICY_ADMIN_USERIDS,
@@ -3639,6 +3694,12 @@ def load_policy_doc(config: AppConfig) -> dict[str, Any]:
     normalized_match_fields = [item for item in normalize_unique_text_list(match_fields) if item in DEFAULT_PLM_TERMINAL_MATCH_FIELDS]
     plm_login_audit["terminal_match_fields"] = normalized_match_fields or DEFAULT_PLM_TERMINAL_MATCH_FIELDS
     loaded["plm_login_audit"] = plm_login_audit
+    terminal_behavior_review = loaded.get("terminal_behavior_review")
+    if not isinstance(terminal_behavior_review, dict):
+        terminal_behavior_review = {}
+    loaded["terminal_behavior_review"] = terminal_review.normalized_review_policy(
+        {"terminal_behavior_review": terminal_behavior_review}
+    )
     ai_analysis = loaded.get("ai_analysis")
     if not isinstance(ai_analysis, dict):
         ai_analysis = {}
@@ -5063,6 +5124,12 @@ def settings_page(config: AppConfig) -> bytes:
         <p class="muted">仅跟踪强约束部门账号；登录终端不在 7 天内在线的加密终端池时判一级风险。</p>
         <div class="actions"><a class="button primary" href="/settings/plm-login">维护PLM策略</a></div>
       </div>
+      <div class="settings-card">
+        <h3>异常终端核查策略</h3>
+        <p class="metric">{'启用' if terminal_review.normalized_review_policy(policy_doc).get('enabled', True) else '关闭'}</p>
+        <p class="muted">配置外设批量拷贝、短时间集中发送、多通道、多目标等候选阈值；候选需人工确认后才进报告。</p>
+        <div class="actions"><a class="button primary" href="/settings/terminal-behavior-review">维护核查阈值</a></div>
+      </div>
         </div>
       </div>
 
@@ -5119,6 +5186,345 @@ def settings_page(config: AppConfig) -> bytes:
     </section>
 """
     return page_shell("审计策略管理", body)
+
+
+def datetime_input_value(value: datetime) -> str:
+    return value.strftime("%Y-%m-%dT%H:%M")
+
+
+def terminal_check_period_from_params(config: AppConfig, params: dict[str, list[str]]) -> tuple[datetime, datetime, str]:
+    tz = local_tz(config.timezone)
+    now = datetime.now(tz) if tz else datetime.now()
+    preset = (params.get("preset") or ["today"])[-1]
+    if preset == "yesterday":
+        day = (now - timedelta(days=1)).date()
+        return datetime.combine(day, datetime.min.time(), tz), datetime.combine(day + timedelta(days=1), datetime.min.time(), tz), preset
+    if preset == "week":
+        start_day = now.date() - timedelta(days=now.weekday())
+        return datetime.combine(start_day, datetime.min.time(), tz), now, preset
+    if preset == "custom":
+        try:
+            start = parse_local_datetime((params.get("start") or [""])[-1], config.timezone)
+            end = parse_local_datetime((params.get("end") or [""])[-1], config.timezone)
+            if end > start:
+                return start, end, preset
+        except ValueError:
+            pass
+    day = now.date()
+    return datetime.combine(day, datetime.min.time(), tz), now, "today"
+
+
+def terminal_review_status_options(selected: str = "待核查") -> str:
+    return "".join(
+        f'<option value="{esc(status)}"{" selected" if status == selected else ""}>{esc(status)}</option>'
+        for status in terminal_review.REVIEW_STATUSES
+    )
+
+
+def terminal_check_css() -> str:
+    return """
+<style>
+  .terminal-check-hero {
+    border: 1px solid #dbe6f3;
+    border-radius: 14px;
+    padding: 18px 20px;
+    background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+    box-shadow: 0 14px 32px rgba(15, 23, 42, 0.055);
+  }
+  .terminal-check-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: flex-end;
+    justify-content: space-between;
+    margin: 16px 0 12px;
+  }
+  .terminal-check-toolbar form {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: 10px;
+  }
+  .terminal-check-toolbar label { min-width: 190px; }
+  .terminal-check-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+    margin: 14px 0;
+  }
+  .terminal-check-chip {
+    border: 1px solid #dbe6f3;
+    border-radius: 12px;
+    padding: 13px 14px;
+    background: #fff;
+  }
+  .terminal-check-chip span {
+    display: block;
+    color: #667085;
+    font-size: 12px;
+    font-weight: 800;
+  }
+  .terminal-check-chip strong {
+    display: block;
+    margin-top: 4px;
+    color: #122033;
+    font-size: 25px;
+    line-height: 1;
+    font-weight: 900;
+  }
+  table.terminal-check-table th,
+  table.terminal-check-table td { vertical-align: middle; }
+  table.terminal-check-table td.compact { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .terminal-check-status { min-width: 132px; }
+  .terminal-check-notes { min-width: 180px; min-height: 38px; }
+  @media (max-width: 980px) {
+    .terminal-check-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .terminal-check-toolbar form { display: grid; grid-template-columns: 1fr; width: 100%; }
+  }
+</style>
+"""
+
+
+def terminal_check_metrics_html(candidates: list[terminal_review.TerminalBehaviorCandidate], reviews: list[terminal_review.TerminalBehaviorReview]) -> str:
+    type_counts = Counter(candidate.anomaly_type for candidate in candidates)
+    report_reviews = [review for review in reviews if review.include_in_report]
+    chips = [
+        ("候选异常终端", len(candidates)),
+        ("已人工确认", len(reviews)),
+        ("进入报告", len(report_reviews)),
+        ("最高频类型", type_counts.most_common(1)[0][0] if type_counts else "-"),
+    ]
+    return '<div class="terminal-check-grid">' + "".join(
+        f'<div class="terminal-check-chip"><span>{esc(label)}</span><strong>{esc(value)}</strong></div>' for label, value in chips
+    ) + "</div>"
+
+
+def terminal_candidates_table(candidates: list[terminal_review.TerminalBehaviorCandidate], start: datetime, end: datetime) -> str:
+    if not candidates:
+        return '<p class="muted">当前周期暂无候选异常终端。</p>'
+    rows = []
+    start_value = datetime_input_value(start)
+    end_value = datetime_input_value(end)
+    for candidate in candidates:
+        checked = ' checked' if candidate.existing_status else ""
+        status = candidate.existing_status or "待核查"
+        detail_href = f"/terminal-check/events?preset=custom&candidate_id={quote(candidate.candidate_id)}&start={quote(start_value)}&end={quote(end_value)}"
+        rows.append(
+            f"""
+<tr>
+  <td><input type="checkbox" name="candidate__{esc(candidate.candidate_id)}" value="1"{checked}></td>
+  <td><strong>{esc(candidate.anomaly_type)}</strong><br><span class="muted">{esc(candidate.basis)}</span></td>
+  <td>{esc(candidate.company)}<br><span class="muted">{esc(candidate.department)}</span></td>
+  <td>{esc(candidate.person)}</td>
+  <td>{esc(candidate.client_ip)}<br><span class="muted">{esc(candidate.client_mac)}</span></td>
+  <td>{esc(candidate.client_name or "-")}</td>
+  <td><strong>{candidate.event_count}</strong></td>
+  <td>{candidate.structure_count}/{candidate.electrical_count}/{candidate.three_d_count}/{candidate.dwg_count}/{candidate.archive_count}</td>
+  <td class="compact" title="{esc(' / '.join(candidate.channels))}">{esc(' / '.join(candidate.channels) or "-")}</td>
+  <td class="compact" title="{esc('；'.join(candidate.targets))}">{esc('；'.join(candidate.targets) or "-")}</td>
+  <td class="compact" title="{esc('；'.join(candidate.sample_files))}">{esc('；'.join(candidate.sample_files) or "-")}</td>
+  <td><select class="terminal-check-status" name="status__{esc(candidate.candidate_id)}">{terminal_review_status_options(status)}</select></td>
+  <td><input class="terminal-check-notes" name="conclusion__{esc(candidate.candidate_id)}" value="{esc(candidate.existing_conclusion)}" placeholder="核查结论"></td>
+  <td><input class="terminal-check-notes" name="owner__{esc(candidate.candidate_id)}" value="{esc(candidate.existing_owner_department)}" placeholder="责任部门"></td>
+  <td><input type="date" name="due__{esc(candidate.candidate_id)}" value="{esc(candidate.existing_due_date[:10])}"></td>
+  <td><input class="terminal-check-notes" name="notes__{esc(candidate.candidate_id)}" value="{esc(candidate.existing_notes)}" placeholder="核查备注"></td>
+  <td><a href="{esc(detail_href)}">明细</a></td>
+</tr>"""
+        )
+    return f"""
+<div class="table-wrap">
+  <table class="terminal-check-table">
+    <thead><tr><th>选择</th><th>异常类型</th><th>公司/部门</th><th>使用人</th><th>IP/MAC</th><th>终端名</th><th>事件</th><th>结构/电气/三维/DWG/压缩</th><th>通道</th><th>目标</th><th>代表文件</th><th>状态</th><th>结论</th><th>责任部门</th><th>期限</th><th>备注</th><th>证据</th></tr></thead>
+    <tbody>{''.join(rows)}</tbody>
+  </table>
+</div>
+"""
+
+
+def terminal_reviews_table(reviews: list[terminal_review.TerminalBehaviorReview]) -> str:
+    if not reviews:
+        return '<p class="muted">当前周期暂无已保存核查记录。</p>'
+    rows = []
+    for review in reviews:
+        rows.append(
+            f"""
+<tr>
+  <td>{esc(review.event_start[:19])}</td>
+  <td><strong>{esc(review.status)}</strong><br><span class="muted">{esc(review.anomaly_type)}</span></td>
+  <td>{esc(review.company)}<br><span class="muted">{esc(review.department)}</span></td>
+  <td>{esc(review.person)}</td>
+  <td>{esc(review.client_ip)}<br><span class="muted">{esc(review.client_mac)}</span></td>
+  <td>{esc(review.event_count)}</td>
+  <td class="compact" title="{esc('；'.join(review.sample_files))}">{esc('；'.join(review.sample_files) or "-")}</td>
+  <td class="compact" title="{esc(review.conclusion or review.notes)}">{esc(review.conclusion or review.notes or "-")}</td>
+  <td>{esc(review.owner_department or "-")}<br><span class="muted">{esc(review.due_date[:10] or "-")}</span></td>
+  <td>{esc(review.reviewer_name or review.reviewer_userid)}<br><span class="muted">{esc(review.review_time[:19])}</span></td>
+  <td>{esc('是' if review.include_in_report else '否')}</td>
+</tr>"""
+        )
+    return f"""
+<div class="table-wrap">
+  <table class="terminal-check-table">
+    <thead><tr><th>事件时间</th><th>核查状态</th><th>公司/部门</th><th>使用人</th><th>IP/MAC</th><th>事件数</th><th>代表文件</th><th>结论/备注</th><th>责任/期限</th><th>审核人</th><th>进入报告</th></tr></thead>
+    <tbody>{''.join(rows)}</tbody>
+  </table>
+</div>
+"""
+
+
+def terminal_check_page(config: AppConfig, session: AuthSession, params: dict[str, list[str]] | None = None, message: str = "", error: str = "") -> bytes:
+    params = params or {}
+    start, end, preset = terminal_check_period_from_params(config, params)
+    policy_doc = load_policy_doc(config)
+    try:
+        candidates = terminal_review.generate_candidates(config, policy_doc, start, end)
+        reviews = terminal_review.fetch_reviews(config, start, end, include_all_status=True)
+        existing = {review.candidate_id: review for review in reviews}
+        for candidate in candidates:
+            review = existing.get(candidate.candidate_id)
+            if review:
+                candidate.existing_status = review.status
+                candidate.existing_review_time = review.review_time
+                candidate.existing_conclusion = review.conclusion
+                candidate.existing_notes = review.notes
+                candidate.existing_owner_department = review.owner_department
+                candidate.existing_due_date = review.due_date
+    except Exception as exc:
+        candidates = []
+        reviews = []
+        error = error or f"候选生成失败：{exc}"
+    preset_buttons = [
+        ("today", "今日"),
+        ("yesterday", "昨日"),
+        ("week", "本周"),
+    ]
+    body = f"""
+    <header>
+      <div>
+        <h1>异常终端行为核查</h1>
+        <div class="muted">候选线索不会自动进入正式日报/周报；只有人工勾选并保存的核查记录才会在报告中展示。</div>
+      </div>
+      <div class="actions">
+        <a class="button" href="/">当前报告首页</a>
+        <a class="button" href="/settings">策略管理</a>
+      </div>
+    </header>
+    {terminal_check_css()}
+    <section class="terminal-check-hero">
+      <div class="terminal-check-toolbar">
+        <div class="actions">
+          {''.join(f'<a class="button{" primary" if preset == key else ""}" href="/terminal-check?preset={key}">{label}</a>' for key, label in preset_buttons)}
+        </div>
+        <form method="get" action="/terminal-check">
+          <input type="hidden" name="preset" value="custom">
+          <label>开始时间<input type="datetime-local" name="start" value="{esc(datetime_input_value(start))}"></label>
+          <label>结束时间<input type="datetime-local" name="end" value="{esc(datetime_input_value(end))}"></label>
+          <button class="primary" type="submit">查询</button>
+        </form>
+      </div>
+      <p class="muted">当前周期：{esc(start.strftime('%Y-%m-%d %H:%M'))} 至 {esc(end.strftime('%Y-%m-%d %H:%M'))}</p>
+      {f'<p class="badge on">{esc(message)}</p>' if message else ''}
+      {f'<p class="badge off danger">{esc(error)}</p>' if error else ''}
+      {terminal_check_metrics_html(candidates, reviews)}
+    </section>
+    <form method="post" action="/terminal-check/review">
+      <input type="hidden" name="start" value="{esc(datetime_input_value(start))}">
+      <input type="hidden" name="end" value="{esc(datetime_input_value(end))}">
+      <div class="settings-toolbar">
+        <div>
+          <h2>候选异常终端</h2>
+          <p class="muted">按终端、使用人、日期和异常类型聚合；勾选后保存为人工核查记录。</p>
+        </div>
+        <div class="actions"><button class="primary" type="submit">保存选中核查记录</button></div>
+      </div>
+      {terminal_candidates_table(candidates, start, end)}
+    </form>
+    <section>
+      <h2>已保存核查记录</h2>
+      <p class="muted">周报按事件发生时间自动汇总本周期已进入报告的核查记录。</p>
+      {terminal_reviews_table(reviews)}
+    </section>
+"""
+    return page_shell("异常终端行为核查", body)
+
+
+def terminal_check_events_page(config: AppConfig, params: dict[str, list[str]]) -> bytes:
+    start, end, _preset = terminal_check_period_from_params(config, params)
+    candidate_id = (params.get("candidate_id") or [""])[-1]
+    event_ids: list[str] = []
+    title = "异常终端候选证据"
+    if candidate_id:
+        candidates = terminal_review.generate_candidates(config, load_policy_doc(config), start, end)
+        for candidate in candidates:
+            if candidate.candidate_id == candidate_id:
+                event_ids = candidate.event_ids
+                title = f"{candidate.anomaly_type} / {candidate.client_ip}"
+                break
+    rows = terminal_review.event_detail_rows(config, event_ids)
+    table_rows = []
+    for row in rows:
+        files = "；".join(str(item) for item in row.get("file_names") or [])
+        targets = "；".join(str(item) for key in ("recipients", "targets", "target_domains") for item in (row.get(key) or []))
+        table_rows.append(
+            f"<tr><td>{esc(str(row.get('ts') or '')[:19])}</td><td>{esc(row.get('channel') or row.get('topic') or '')}</td><td>{esc(row.get('company') or '')}</td><td>{esc(row.get('department') or '')}</td><td>{esc(row.get('resolved_person') or '')}</td><td>{esc(row.get('client_ip') or '')}</td><td title=\"{esc(files)}\">{esc(files[:120])}</td><td title=\"{esc(targets)}\">{esc(targets[:120])}</td></tr>"
+        )
+    table_html = (
+        '<p class="muted">未找到候选证据，可能候选周期已变化。</p>'
+        if not table_rows
+        else f'<div class="table-wrap"><table><thead><tr><th>时间</th><th>通道</th><th>公司</th><th>部门</th><th>人员</th><th>IP</th><th>文件</th><th>目标</th></tr></thead><tbody>{"".join(table_rows)}</tbody></table></div>'
+    )
+    body = f"""
+    <header>
+      <div><h1>{esc(title)}</h1><div class="muted">仅展示候选关联的代表证据事件；完整证据仍以 ClickHouse 审计底稿为准。</div></div>
+      <div class="actions"><a class="button" href="/terminal-check?start={esc(datetime_input_value(start))}&end={esc(datetime_input_value(end))}&preset=custom">返回核查工作台</a></div>
+    </header>
+    {table_html}
+"""
+    return page_shell(title, body)
+
+
+def terminal_behavior_policy_page(config: AppConfig, message: str = "", error: str = "") -> bytes:
+    doc = load_policy_doc(config)
+    policy = terminal_review.normalized_review_policy(doc)
+    field_labels = [
+        ("peripheral_design_daily", "外设设计资料日阈值"),
+        ("peripheral_total_daily", "外设总事件日阈值"),
+        ("core_design_daily", "核心图纸日阈值"),
+        ("burst_window_minutes", "集中发送窗口分钟"),
+        ("burst_min_events", "集中发送事件阈值"),
+        ("multi_channel_min_channels", "多通道最少通道数"),
+        ("multi_channel_min_events", "多通道事件阈值"),
+        ("multi_target_min_targets", "多目标最少目标数"),
+        ("multi_target_min_events", "多目标事件阈值"),
+        ("unknown_target_min_events", "未知接收方事件阈值"),
+        ("baseline_days", "历史基线天数"),
+        ("baseline_multiplier", "历史突增倍数"),
+        ("baseline_min_events", "历史突增最低事件数"),
+        ("candidate_limit", "候选列表上限"),
+    ]
+    inputs = "".join(
+        f'<label>{esc(label)}<input type="number" min="0" name="{esc(key)}" value="{esc(policy.get(key, terminal_review.DEFAULT_REVIEW_POLICY[key]))}"></label>'
+        for key, label in field_labels
+    )
+    body = f"""
+    <header>
+      <div><h1>异常终端核查策略</h1><div class="muted">只影响候选生成，不会自动把候选写入日报/周报。</div></div>
+      <div class="actions"><a class="button" href="/settings">策略中心</a><a class="button" href="/terminal-check">核查工作台</a></div>
+    </header>
+    {f'<p class="badge on">{esc(message)}</p>' if message else ''}
+    {f'<p class="badge off danger">{esc(error)}</p>' if error else ''}
+    <form method="post" action="/settings/terminal-behavior-review/save">
+      <label>启用状态
+        <select name="enabled">
+          <option value="1"{" selected" if policy.get("enabled", True) else ""}>启用</option>
+          <option value="0"{" selected" if not policy.get("enabled", True) else ""}>关闭</option>
+        </select>
+      </label>
+      {inputs}
+      <div class="actions"><button class="primary" type="submit">保存核查策略</button></div>
+    </form>
+"""
+    return page_shell("异常终端核查策略", body)
 
 
 def keywords_page(config: AppConfig, message: str = "") -> bytes:
@@ -6171,6 +6577,18 @@ class ReportHandler(BaseHTTPRequestHandler):
         if parsed.path == "/reports":
             self.send_html(reports_page(self.config, session))
             return
+        if parsed.path == "/terminal-check":
+            if session.role not in {"admin", "global"}:
+                self.send_forbidden("仅授权查看全集团报告的用户可以进行异常终端行为核查。")
+                return
+            self.send_html(terminal_check_page(self.config, session, parse_qs(parsed.query)))
+            return
+        if parsed.path == "/terminal-check/events":
+            if session.role not in {"admin", "global"}:
+                self.send_forbidden("仅授权查看全集团报告的用户可以查看异常终端核查证据。")
+                return
+            self.send_html(terminal_check_events_page(self.config, parse_qs(parsed.query)))
+            return
         if parsed.path == "/jobs":
             self.redirect("/reports")
             return
@@ -6203,6 +6621,11 @@ class ReportHandler(BaseHTTPRequestHandler):
             if not self.require_admin(session):
                 return
             self.send_html(plm_login_policy_page(self.config))
+            return
+        if parsed.path == "/settings/terminal-behavior-review":
+            if not self.require_admin(session):
+                return
+            self.send_html(terminal_behavior_policy_page(self.config))
             return
         if parsed.path == "/settings/decrypt-records":
             if not self.require_admin(session):
@@ -6338,6 +6761,11 @@ class ReportHandler(BaseHTTPRequestHandler):
                 return
             self.handle_plm_login_policy_post(parsed.path, form)
             return
+        if parsed.path.startswith("/settings/terminal-behavior-review/"):
+            if not self.require_admin(session):
+                return
+            self.handle_terminal_behavior_policy_post(parsed.path, form)
+            return
         if parsed.path.startswith("/settings/decrypt-records/"):
             if not self.require_admin(session):
                 return
@@ -6367,6 +6795,12 @@ class ReportHandler(BaseHTTPRequestHandler):
             if not self.require_admin(session):
                 return
             self.handle_exclusion_post(parsed.path, form)
+            return
+        if parsed.path == "/terminal-check/review":
+            if session.role not in {"admin", "global"}:
+                self.send_forbidden("仅授权查看全集团报告的用户可以保存异常终端核查记录。")
+                return
+            self.handle_terminal_check_review_post(form, session)
             return
         if parsed.path != "/api/generate":
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -6464,6 +6898,7 @@ class ReportHandler(BaseHTTPRequestHandler):
             "/settings/internal-targets",
             "/settings/archive-suffixes",
             "/settings/plm-login",
+            "/settings/terminal-behavior-review",
             "/settings/decrypt-records",
             "/settings/encryption-terminals",
             "/settings/organization-aliases",
@@ -6471,6 +6906,8 @@ class ReportHandler(BaseHTTPRequestHandler):
             "/settings/ai",
             "/settings/auth",
             "/settings/exclusions",
+            "/terminal-check",
+            "/terminal-check/events",
         }
         if path in dynamic_paths or path.startswith("/jobs/"):
             return True
@@ -6546,6 +6983,115 @@ class ReportHandler(BaseHTTPRequestHandler):
             doc["plm_login_audit"] = plm_login_audit
             write_rule_doc(policy_path(self.config), doc, self.config)
         self.redirect("/settings/plm-login")
+
+    def handle_terminal_behavior_policy_post(self, path: str, form: dict[str, str]) -> None:
+        with RULES_LOCK:
+            if not path.endswith("/save"):
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            doc = load_policy_doc(self.config)
+            policy = terminal_review.normalized_review_policy(doc)
+            policy["enabled"] = form.get("enabled") == "1"
+            for key, default in terminal_review.DEFAULT_REVIEW_POLICY.items():
+                if key == "enabled":
+                    continue
+                policy[key] = clamp_int(str(form.get(key, default)), int(default), 0, 100000)
+            doc["terminal_behavior_review"] = policy
+            write_rule_doc(policy_path(self.config), doc, self.config)
+        self.redirect("/settings/terminal-behavior-review")
+
+    def handle_terminal_check_review_post(self, form: dict[str, str], session: AuthSession) -> None:
+        try:
+            start = parse_local_datetime(form.get("start", ""), self.config.timezone)
+            end = parse_local_datetime(form.get("end", ""), self.config.timezone)
+        except ValueError as exc:
+            self.send_html(terminal_check_page(self.config, session, error=str(exc)), HTTPStatus.BAD_REQUEST)
+            return
+        selected = {key.removeprefix("candidate__") for key, value in form.items() if key.startswith("candidate__") and value == "1"}
+        if not selected:
+            self.send_html(
+                terminal_check_page(self.config, session, {"preset": ["custom"], "start": [datetime_input_value(start)], "end": [datetime_input_value(end)]}, error="请至少勾选一条候选记录。"),
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        try:
+            candidates = terminal_review.generate_candidates(self.config, load_policy_doc(self.config), start, end)
+        except Exception as exc:
+            self.send_html(terminal_check_page(self.config, session, error=f"候选重新计算失败：{exc}"), HTTPStatus.BAD_REQUEST)
+            return
+        now = datetime.now(local_tz(self.config.timezone)) if local_tz(self.config.timezone) else datetime.now()
+        rows: list[dict[str, Any]] = []
+        for candidate in candidates:
+            if candidate.candidate_id not in selected:
+                continue
+            status = form.get(f"status__{candidate.candidate_id}") or "待核查"
+            if status not in terminal_review.REVIEW_STATUSES:
+                status = "待核查"
+            include = 0 if status in terminal_review.REPORT_EXCLUDED_STATUSES else 1
+            notes = (form.get(f"notes__{candidate.candidate_id}") or "").strip()
+            conclusion = (form.get(f"conclusion__{candidate.candidate_id}") or "").strip()
+            owner_department = (form.get(f"owner__{candidate.candidate_id}") or "").strip()
+            due_raw = (form.get(f"due__{candidate.candidate_id}") or "").strip()
+            due_date = due_raw if re.fullmatch(r"\d{4}-\d{2}-\d{2}", due_raw) else None
+            rows.append(
+                {
+                    "event_date": candidate.event_date.isoformat(),
+                    "event_start": candidate.event_start.strftime("%Y-%m-%d %H:%M:%S.%f")[:23],
+                    "event_end": candidate.event_end.strftime("%Y-%m-%d %H:%M:%S.%f")[:23],
+                    "review_id": candidate.candidate_id,
+                    "candidate_id": candidate.candidate_id,
+                    "anomaly_type": candidate.anomaly_type,
+                    "status": status,
+                    "include_in_report": include,
+                    "reviewer_userid": session.userid,
+                    "reviewer_name": session.name,
+                    "review_time": now.strftime("%Y-%m-%d %H:%M:%S.%f")[:23],
+                    "updated_at": now.strftime("%Y-%m-%d %H:%M:%S.%f")[:23],
+                    "company": candidate.company,
+                    "department": candidate.department,
+                    "person": candidate.person,
+                    "client_name": candidate.client_name,
+                    "client_ip": candidate.client_ip,
+                    "client_mac": candidate.client_mac,
+                    "event_count": candidate.event_count,
+                    "structure_count": candidate.structure_count,
+                    "electrical_count": candidate.electrical_count,
+                    "three_d_count": candidate.three_d_count,
+                    "dwg_count": candidate.dwg_count,
+                    "archive_count": candidate.archive_count,
+                    "channels": candidate.channels,
+                    "targets": candidate.targets,
+                    "sample_files": candidate.sample_files,
+                    "event_ids": candidate.event_ids,
+                    "conclusion": conclusion,
+                    "notes": notes,
+                    "owner_department": owner_department,
+                    "due_date": due_date,
+                    "evidence_json": json.dumps(
+                        {
+                            "basis": candidate.basis,
+                            "event_ids": candidate.event_ids[:500],
+                            "sample_files": candidate.sample_files,
+                            "channels": candidate.channels,
+                            "targets": candidate.targets,
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            )
+        if not rows:
+            self.send_html(
+                terminal_check_page(self.config, session, {"preset": ["custom"], "start": [datetime_input_value(start)], "end": [datetime_input_value(end)]}, error="所选候选已不在当前周期结果中，请刷新后重试。"),
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        try:
+            terminal_review.insert_reviews(self.config, rows)
+        except Exception as exc:
+            self.send_html(terminal_check_page(self.config, session, error=f"核查记录保存失败：{exc}"), HTTPStatus.BAD_REQUEST)
+            return
+        params = urlencode({"preset": "custom", "start": datetime_input_value(start), "end": datetime_input_value(end)})
+        self.redirect(f"/terminal-check?{params}")
 
     def handle_decrypt_records_post(
         self,
@@ -6893,6 +7439,7 @@ class ReportHandler(BaseHTTPRequestHandler):
             data = inject_identity_bar(data, session)
             data = inject_report_navigation_patch(data)
             data = inject_global_management_summary(data)
+            data = inject_terminal_behavior_review_summary(data, self.config, target)
             data = inject_home_history_dropdown(data, self.config, session)
             data = inject_temporary_report_cleanup(data, self.config, target)
             path = unquote(request_path.split("?", 1)[0].split("#", 1)[0])

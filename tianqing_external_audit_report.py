@@ -8940,6 +8940,7 @@ def build_html_report(
     public_base_url = str(getattr(args, "public_base_url", "") or DEFAULT_PUBLIC_BASE_URL).rstrip("/")
     reports_url = f"{public_base_url}/reports"
     settings_url = f"{public_base_url}/settings"
+    terminal_check_url = f"{public_base_url}/terminal-check"
     home_url = f"{public_base_url}/"
     sidecar_reports = SidecarReportStore(getattr(args, "sidecar_output_dir", None))
     decrypt_module_result = build_decrypt_audit_module_result(
@@ -11448,6 +11449,7 @@ def build_html_report(
         </div>
         <div class="top-actions">
           <a class="top-action" href="{esc(settings_url)}">策略管理</a>
+          <a class="top-action" href="{esc(terminal_check_url)}">异常终端行为核查</a>
           <a class="top-action" href="{esc(home_url)}">当前报告首页</a>
         </div>
       </div>
