@@ -437,6 +437,22 @@ def build_rule_risk_overview_html(
         )
     else:
         overall_sentence = "本期暂无进入通道×对象矩阵的重点事件，首页保留组织和趋势入口用于复核。"
+    structure_critical = sum(
+        1 for event in events if CRITICAL_STRUCTURE_LABEL in critical_design_labels_for_event(event)
+    )
+    electrical_critical = sum(
+        1
+        for event in events
+        if CRITICAL_ELECTRICAL_LABEL in critical_design_labels_for_event(event)
+        and CRITICAL_STRUCTURE_LABEL not in critical_design_labels_for_event(event)
+    )
+    standard_critical = structure_critical + electrical_critical
+    large_archive_critical = sum(1 for event in events if is_large_archive_event(event))
+    level_one_sentence = (
+        f"一级风险对象：标准图纸外发/拷贝 {standard_critical} 条"
+        f"（结构 {structure_critical} 条、电气 {electrical_critical} 条），"
+        f"大于100MB压缩包 {large_archive_critical} 条；顶部汇总只展示分项，不再合并成一个总数。"
+    )
     three_d_sentence = (
         f"三维模型作为最高关注对象，本期 {three_d_item.get('current', 0)} 条，"
         f"{risk_overview_compare_text(three_d_primary)}；主要集中在 {three_d_item.get('top_company') or '-'} / {three_d_item.get('top_department') or '-'}，"
@@ -475,6 +491,7 @@ def build_rule_risk_overview_html(
         <div class="risk-overview-conclusions">
           <span>管理结论</span>
           <ul>
+            <li>{esc(level_one_sentence)}</li>
             <li>{esc(overall_sentence)}</li>
             <li>{esc(three_d_sentence)}</li>
             <li>{esc(object_sentence)}</li>
