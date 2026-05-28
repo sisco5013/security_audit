@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import hmac
 import html
 import ipaddress
@@ -264,6 +265,10 @@ RUN_LOCK = threading.Lock()
 RULES_LOCK = threading.Lock()
 SESSIONS: dict[str, AuthSession] = {}
 SESSIONS_LOCK = threading.Lock()
+TERMINAL_CHECK_CACHE_TTL_SECONDS = 30 * 60
+TERMINAL_CHECK_CACHE_MAX_ENTRIES = 6
+TERMINAL_CHECK_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
+TERMINAL_CHECK_CACHE_LOCK = threading.Lock()
 RECENT_JOB_SECONDS = 12 * 3600
 CUSTOM_REPORT_TTL_DAYS = int(os.getenv("TIANQING_CUSTOM_REPORT_TTL_DAYS", "7") or "7")
 JOB_LOG_TTL_DAYS = int(os.getenv("TIANQING_JOB_LOG_TTL_DAYS", "30") or "30")
@@ -5239,6 +5244,88 @@ def datetime_input_value(value: datetime) -> str:
     return value.strftime("%Y-%m-%dT%H:%M")
 
 
+def terminal_check_policy_fingerprint(policy_doc: dict[str, Any]) -> str:
+    payload = {key: value for key, value in policy_doc.items() if key != "updated_at"}
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def terminal_check_cache_key(policy_doc: dict[str, Any], start: datetime, end: datetime) -> tuple[str, str, str]:
+    return (datetime_input_value(start), datetime_input_value(end), terminal_check_policy_fingerprint(policy_doc))
+
+
+def attach_terminal_review_state(
+    candidates: list[terminal_review.TerminalBehaviorCandidate],
+    reviews: list[terminal_review.TerminalBehaviorReview],
+) -> None:
+    existing = {review.candidate_id: review for review in reviews}
+    for candidate in candidates:
+        candidate.existing_status = ""
+        candidate.existing_review_time = ""
+        candidate.existing_conclusion = ""
+        candidate.existing_notes = ""
+        candidate.existing_owner_department = ""
+        candidate.existing_due_date = ""
+        review = existing.get(candidate.candidate_id)
+        if review:
+            candidate.existing_status = review.status
+            candidate.existing_review_time = review.review_time
+            candidate.existing_conclusion = review.conclusion
+            candidate.existing_notes = review.notes
+            candidate.existing_owner_department = review.owner_department
+            candidate.existing_due_date = review.due_date
+
+
+def terminal_check_prune_cache(now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    for key, value in list(TERMINAL_CHECK_CACHE.items()):
+        if now - float(value.get("created_at") or 0) > TERMINAL_CHECK_CACHE_TTL_SECONDS:
+            TERMINAL_CHECK_CACHE.pop(key, None)
+    if len(TERMINAL_CHECK_CACHE) <= TERMINAL_CHECK_CACHE_MAX_ENTRIES:
+        return
+    ordered = sorted(TERMINAL_CHECK_CACHE.items(), key=lambda item: float(item[1].get("created_at") or 0))
+    for key, _value in ordered[: max(0, len(TERMINAL_CHECK_CACHE) - TERMINAL_CHECK_CACHE_MAX_ENTRIES)]:
+        TERMINAL_CHECK_CACHE.pop(key, None)
+
+
+def terminal_check_put_cache(
+    policy_doc: dict[str, Any],
+    start: datetime,
+    end: datetime,
+    candidates: list[terminal_review.TerminalBehaviorCandidate],
+    reviews: list[terminal_review.TerminalBehaviorReview],
+) -> dict[str, Any]:
+    attach_terminal_review_state(candidates, reviews)
+    value = {
+        "created_at": time.time(),
+        "candidates": candidates,
+        "reviews": reviews,
+        "by_id": {candidate.candidate_id: candidate for candidate in candidates},
+    }
+    with TERMINAL_CHECK_CACHE_LOCK:
+        terminal_check_prune_cache(value["created_at"])
+        TERMINAL_CHECK_CACHE[terminal_check_cache_key(policy_doc, start, end)] = value
+    return value
+
+
+def terminal_check_cached_data(config: AppConfig, policy_doc: dict[str, Any], start: datetime, end: datetime) -> dict[str, Any]:
+    key = terminal_check_cache_key(policy_doc, start, end)
+    now = time.time()
+    with TERMINAL_CHECK_CACHE_LOCK:
+        terminal_check_prune_cache(now)
+        cached = TERMINAL_CHECK_CACHE.get(key)
+        if cached and now - float(cached.get("created_at") or 0) <= TERMINAL_CHECK_CACHE_TTL_SECONDS:
+            return cached
+    candidates = terminal_review.generate_candidates(config, policy_doc, start, end)
+    reviews = terminal_review.fetch_reviews(config, start, end, include_all_status=True)
+    return terminal_check_put_cache(policy_doc, start, end, candidates, reviews)
+
+
+def terminal_check_clear_cache() -> None:
+    with TERMINAL_CHECK_CACHE_LOCK:
+        TERMINAL_CHECK_CACHE.clear()
+
+
 def terminal_check_period_from_params(config: AppConfig, params: dict[str, list[str]]) -> tuple[datetime, datetime, str]:
     tz = local_tz(config.timezone)
     now = datetime.now(tz) if tz else datetime.now()
@@ -5694,18 +5781,9 @@ def terminal_check_page(config: AppConfig, session: AuthSession, params: dict[st
     start, end, preset = terminal_check_period_from_params(config, params)
     policy_doc = load_policy_doc(config)
     try:
-        candidates = terminal_review.generate_candidates(config, policy_doc, start, end)
-        reviews = terminal_review.fetch_reviews(config, start, end, include_all_status=True)
-        existing = {review.candidate_id: review for review in reviews}
-        for candidate in candidates:
-            review = existing.get(candidate.candidate_id)
-            if review:
-                candidate.existing_status = review.status
-                candidate.existing_review_time = review.review_time
-                candidate.existing_conclusion = review.conclusion
-                candidate.existing_notes = review.notes
-                candidate.existing_owner_department = review.owner_department
-                candidate.existing_due_date = review.due_date
+        cached_data = terminal_check_cached_data(config, policy_doc, start, end)
+        candidates = cached_data["candidates"]
+        reviews = cached_data["reviews"]
     except Exception as exc:
         candidates = []
         reviews = []
@@ -5764,13 +5842,12 @@ def terminal_check_events_page(config: AppConfig, params: dict[str, list[str]]) 
     detail_events: list[report_gen.AuditEvent] = []
     title = "异常终端候选证据"
     if candidate_id:
-        candidates = terminal_review.generate_candidates(config, load_policy_doc(config), start, end)
-        for candidate in candidates:
-            if candidate.candidate_id == candidate_id:
-                title = f"{candidate.anomaly_type} / {candidate.client_ip}"
-                tz = local_tz(config.timezone)
-                detail_events = [terminal_check_audit_event_from_row(row, tz) for row in candidate.evidence_events]
-                break
+        cached_data = terminal_check_cached_data(config, load_policy_doc(config), start, end)
+        candidate = cached_data["by_id"].get(candidate_id)
+        if candidate:
+            title = f"{candidate.anomaly_type} / {candidate.client_ip}"
+            tz = local_tz(config.timezone)
+            detail_events = [terminal_check_audit_event_from_row(row, tz) for row in candidate.evidence_events]
     table_html = (
         '<p class="muted">未找到候选证据，可能候选周期已变化。</p>'
         if not detail_events
@@ -7298,6 +7375,7 @@ class ReportHandler(BaseHTTPRequestHandler):
                 policy[key] = clamp_int(str(form.get(key, default)), int(default), 0, 100000)
             doc["terminal_behavior_review"] = policy
             write_rule_doc(policy_path(self.config), doc, self.config)
+            terminal_check_clear_cache()
         self.redirect("/settings/terminal-behavior-review")
 
     def handle_terminal_check_review_post(self, form: dict[str, str], session: AuthSession) -> None:
@@ -7315,8 +7393,10 @@ class ReportHandler(BaseHTTPRequestHandler):
             )
             return
         try:
-            candidates = terminal_review.generate_candidates(self.config, load_policy_doc(self.config), start, end)
-            existing_reviews = {review.candidate_id: review for review in terminal_review.fetch_reviews(self.config, start, end, include_all_status=True)}
+            policy_doc = load_policy_doc(self.config)
+            cached_data = terminal_check_cached_data(self.config, policy_doc, start, end)
+            candidates = cached_data["candidates"]
+            existing_reviews = {review.candidate_id: review for review in cached_data["reviews"]}
         except Exception as exc:
             self.send_html(terminal_check_page(self.config, session, error=f"候选重新计算失败：{exc}"), HTTPStatus.BAD_REQUEST)
             return
@@ -7389,6 +7469,8 @@ class ReportHandler(BaseHTTPRequestHandler):
             return
         try:
             terminal_review.insert_reviews(self.config, rows)
+            refreshed_reviews = terminal_review.fetch_reviews(self.config, start, end, include_all_status=True)
+            terminal_check_put_cache(policy_doc, start, end, candidates, refreshed_reviews)
         except Exception as exc:
             self.send_html(terminal_check_page(self.config, session, error=f"核查记录保存失败：{exc}"), HTTPStatus.BAD_REQUEST)
             return
