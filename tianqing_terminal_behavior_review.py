@@ -287,12 +287,14 @@ def display_channel(event: dict[str, Any]) -> str:
 
 
 def event_targets(event: dict[str, Any]) -> list[str]:
-    values: list[str] = []
-    for key in ("recipients", "targets", "target_domains"):
+    for key in ("recipients", "target_domains", "targets"):
+        values: list[str] = []
         raw = event.get(key) or []
         if isinstance(raw, list):
             values.extend(str(item) for item in raw if str(item or "").strip())
-    return list(dict.fromkeys(values))[:30]
+        if values:
+            return list(dict.fromkeys(values))[:30]
+    return []
 
 
 def is_external_mailbox(mailbox: str) -> bool:
@@ -874,6 +876,39 @@ def fast_review_policy_context(policy_doc: dict[str, Any]) -> set[str]:
     return internal_domains
 
 
+def fast_terminal_identity_map(
+    config: Any,
+    policy_doc: dict[str, Any],
+    start: datetime,
+    end: datetime,
+    terminals: Iterable[tuple[str, str]],
+) -> dict[tuple[str, str], Any]:
+    terminal_events = [
+        SimpleNamespace(client_name=name, client_ip=ip)
+        for name, ip in dict.fromkeys(
+            (str(name or "").strip(), str(ip or "").strip())
+            for name, ip in terminals
+            if str(name or "").strip() or str(ip or "").strip()
+        )
+    ]
+    if not terminal_events:
+        return {}
+    try:
+        args, _internal_domains = configure_report_policy_context(config, policy_doc)
+        tz = report_gen.get_tz(getattr(config, "timezone", "Asia/Shanghai"))
+        history = limited_terminal_identity_history(config, args, terminal_events, tz, start, end)
+    except Exception:
+        return {}
+    result: dict[tuple[str, str], Any] = {}
+    for item in terminal_events:
+        name = str(getattr(item, "client_name", "") or "")
+        ip = str(getattr(item, "client_ip", "") or "")
+        observation = report_gen.terminal_identity_observation_for(name, ip, None, history)
+        if observation:
+            result[(name, ip)] = observation
+    return result
+
+
 def generate_candidate_summaries(config: Any, policy_doc: dict[str, Any], start: datetime, end: datetime) -> list[TerminalBehaviorCandidate]:
     """Build review candidates from ClickHouse aggregates only.
 
@@ -1009,6 +1044,13 @@ FORMAT JSONEachRow
         if end_ts and (item["event_end"] is None or end_ts > item["event_end"]):
             item["event_end"] = end_ts
 
+    identity_map = fast_terminal_identity_map(
+        config,
+        policy_doc,
+        start,
+        end,
+        ((str(item.get("client_name") or ""), str(item.get("client_ip") or "")) for item in groups.values()),
+    )
     candidates: dict[str, TerminalBehaviorCandidate] = {}
     for item in groups.values():
         reason_labels: list[str] = []
@@ -1030,8 +1072,14 @@ FORMAT JSONEachRow
             continue
         event_start = item["event_start"] or start
         event_end = item["event_end"] or event_start
-        company = item["companies"].most_common(1)[0][0] if item["companies"] else "未匹配公司"
-        department = item["departments"].most_common(1)[0][0] if item["departments"] else "未匹配部门"
+        identity = identity_map.get((str(item["client_name"] or ""), str(item["client_ip"] or "")))
+        if identity:
+            item["person"] = identity.person_name or item["person"]
+            company = identity.company or "未匹配公司"
+            department = identity.department or "未匹配部门"
+        else:
+            company = item["companies"].most_common(1)[0][0] if item["companies"] else "未匹配公司"
+            department = item["departments"].most_common(1)[0][0] if item["departments"] else "未匹配部门"
         anomaly_type = "；".join(reason_labels)
         candidate_id = candidate_hash([event_start.date().isoformat(), item["client_name"], item["client_ip"], item["person"], anomaly_type])
         candidates[candidate_id] = TerminalBehaviorCandidate(

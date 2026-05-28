@@ -3897,7 +3897,11 @@ def wecom_internal_entry_for_recipient_label(
     target: str,
     wecom_people_map: dict[tuple[str, str], PeopleEntry],
 ) -> PeopleEntry | None:
-    nickname, _account = split_im_target(target)
+    nickname, account = split_im_target(target)
+    if account:
+        entry = active_wecom_people_entry(wecom_people_map.get(("im_account", normalize_key(account))))
+        if entry:
+            return entry
     if not nickname:
         return None
     return active_wecom_people_entry(wecom_people_map.get(("im_nickname", normalize_key(nickname))))
