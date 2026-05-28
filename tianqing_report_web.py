@@ -113,6 +113,11 @@ DEFAULT_POLICY_ADMIN_USERIDS = [FIXED_POLICY_ADMIN_USERID]
 DEFAULT_PLM_CONSTRAINED_DEPARTMENTS = ["技术部", "研发部", "工艺部"]
 DEFAULT_PLM_TERMINAL_MATCH_FIELDS = ["ip_address", "computer_name"]
 ENCRYPTION_TERMINAL_TRUST_DAYS = 7
+TOP_RISK_DEFINITION_TEXT = (
+    "一级风险定义：标准图纸解密；天擎标准图纸外发/拷贝；"
+    "天擎大于50MB压缩包外发/上传/外设拷贝；PLM技术、研发、工艺账号池外登录。"
+)
+TOP_RISK_EVIDENCE_TEXT = "一级风险进入顶部汇总管理结论，矩阵、趋势和明细用于定位组织、终端与证据链。"
 
 
 def encryption_terminal_trust_condition(prefix: str = "") -> str:
@@ -1078,6 +1083,25 @@ def inject_report_navigation_patch(data: bytes, config: AppConfig | None = None,
     return updated.encode("utf-8") if updated != text else data
 
 
+def inject_top_risk_definition(data: bytes) -> bytes:
+    text = data.decode("utf-8", errors="replace")
+    if TOP_RISK_DEFINITION_TEXT in text and TOP_RISK_EVIDENCE_TEXT in text:
+        return data
+    updated = re.sub(
+        r"<span>首页[^<]{0,240}</span>",
+        f"<span>{esc(TOP_RISK_DEFINITION_TEXT)}</span>",
+        text,
+        count=1,
+    )
+    updated = re.sub(
+        r"<span>所有数字均可下钻追溯，原始日志和审计底稿保留用于复核闭环。</span>",
+        f"<span>{esc(TOP_RISK_EVIDENCE_TEXT)}</span>",
+        updated,
+        count=1,
+    )
+    return updated.encode("utf-8") if updated != text else data
+
+
 def _html_plain_text(fragment: str) -> str:
     text = re.sub(r"(?is)<script\b.*?</script>|<style\b.*?</style>", " ", fragment)
     text = re.sub(r"(?s)<[^>]+>", " ", text)
@@ -1132,10 +1156,73 @@ def _fallback_tianqing_management_metrics(text: str) -> dict[str, Any]:
     tianqing_plain = _html_plain_text(tianqing_section)
     structure = _first_regex_int(r"结构(?:标准方案)?\s*(\d+)", tianqing_plain)
     electrical = _first_regex_int(r"电气(?:标准方案)?\s*(\d+)", tianqing_plain)
+    large_archive = _first_regex_int(r"(?:大于50MB|超过50MB|>50MB)\s*压缩包\s*(\d+)", tianqing_plain)
+    standard = structure + electrical
     return {
-        "critical_design": structure + electrical,
+        "critical_design": standard,
         "critical_structure": structure,
         "critical_electrical": electrical,
+        "critical_large_archive": large_archive,
+        "level_one": standard + large_archive,
+    }
+
+
+def _tianqing_array_pattern_condition(label: str) -> str:
+    conditions: list[str] = []
+    base_expr = "replaceRegexpOne(lowerUTF8(name), '^.*[\\\\\\\\/]', '')"
+    for pattern in report_gen.CRITICAL_DESIGN_PATTERNS:
+        if str(pattern.get("label") or "").strip() != label:
+            continue
+        regex = str(pattern.get("regex") or "").strip()
+        if regex:
+            conditions.append(f"arrayExists(name -> match({base_expr}, {report_gen.clickhouse_literal(regex.lower())}), file_names)")
+    if not conditions:
+        return "0"
+    return "(" + " OR ".join(f"({condition})" for condition in conditions) + ")"
+
+
+def _tianqing_archive_condition() -> str:
+    archive_exts = sorted({str(item or "").strip().lower().lstrip(".") for item in report_gen.ARCHIVE_EXTS if str(item or "").strip()})
+    if not archive_exts:
+        return "0"
+    literal = report_gen.clickhouse_array_literal(archive_exts)
+    return (
+        f"hasAny(arrayMap(ext -> lowerUTF8(ext), file_exts), {literal}) "
+        f"OR arrayExists(name -> has({literal}, replaceRegexpOne(lowerUTF8(name), '^.*\\\\.', '')), file_names)"
+    )
+
+
+def _live_tianqing_management_metrics(config: AppConfig, start: datetime, end: datetime) -> dict[str, Any] | None:
+    if not config.use_clickhouse:
+        return None
+    try:
+        args, _tz, _internal_domains = live_decrypt_policy_context(config)
+        event_where = report_gen.clickhouse_event_filter(start, end)
+        structure_cond = _tianqing_array_pattern_condition(report_gen.CRITICAL_STRUCTURE_LABEL)
+        electrical_cond = _tianqing_array_pattern_condition(report_gen.CRITICAL_ELECTRICAL_LABEL)
+        standard_cond = f"(({structure_cond}) OR ((NOT ({structure_cond})) AND ({electrical_cond})))"
+        large_archive_cond = f"(({_tianqing_archive_condition()}) AND ifNull(file_size, 0) > {report_gen.LARGE_ARCHIVE_RISK_BYTES})"
+        query = f"""
+SELECT
+  countIf({standard_cond}) AS critical_design,
+  countIf({structure_cond}) AS critical_structure,
+  countIf((NOT ({structure_cond})) AND ({electrical_cond})) AS critical_electrical,
+  countIf({large_archive_cond}) AS critical_large_archive,
+  countIf(({standard_cond}) OR ({large_archive_cond})) AS level_one
+FROM audit_events
+WHERE {event_where}
+FORMAT JSONEachRow
+"""
+        text = report_gen.clickhouse_query(args, query)
+        row = json.loads(text.splitlines()[0]) if text.strip() else {}
+    except Exception:
+        return None
+    return {
+        "critical_design": int(row.get("critical_design") or 0),
+        "critical_structure": int(row.get("critical_structure") or 0),
+        "critical_electrical": int(row.get("critical_electrical") or 0),
+        "critical_large_archive": int(row.get("critical_large_archive") or 0),
+        "level_one": int(row.get("level_one") or 0),
     }
 
 
@@ -1263,6 +1350,10 @@ def inject_global_management_summary(data: bytes, config: AppConfig | None = Non
         if live_metrics:
             decrypt_metrics = live_metrics
     tianqing_metrics = _fallback_tianqing_management_metrics(text)
+    if config is not None and period:
+        live_tianqing_metrics = _live_tianqing_management_metrics(config, period[0], period[1])
+        if live_tianqing_metrics:
+            tianqing_metrics = live_tianqing_metrics
     review_metrics = (
         _terminal_review_management_metrics(config, period[0], period[1])
         if config is not None and period
@@ -9022,6 +9113,7 @@ class ReportHandler(BaseHTTPRequestHandler):
                 data = suppress_static_ai_section(data)
             data = inject_identity_bar(data, session)
             data = inject_report_navigation_patch(data, self.config, target)
+            data = inject_top_risk_definition(data)
             data = inject_global_management_summary(data, self.config, target)
             data = inject_terminal_behavior_review_summary(data, self.config, target)
             data = inject_home_history_dropdown(data, self.config, session)

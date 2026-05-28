@@ -380,6 +380,7 @@ REASON_DISPLAY_PRIORITY = [
 ]
 HIDDEN_LEADERSHIP_REASONS = {"二维/三维设计图纸", "设计图纸后缀"}
 DESIGN_CATEGORY_DISPLAY_ORDER = CRITICAL_DESIGN_LABELS + ["三维模型", "DWG二维图纸", "设计资料"]
+LARGE_ARCHIVE_RISK_BYTES = 50 * 1024 * 1024
 
 
 @dataclass
@@ -1896,6 +1897,8 @@ def event_behavior_score(event: AuditEvent) -> int:
         score += 5
     if set(event.file_exts) & ARCHIVE_EXTS:
         score += 5
+    if is_large_archive_event(event):
+        score += 15
     if event.file_size and event.file_size >= 50 * 1024 * 1024:
         score += 8
     elif event.file_size and event.file_size >= 10 * 1024 * 1024:
@@ -1940,6 +1943,9 @@ def assign_event_priority(event: AuditEvent, internal_domains: set[str] | None =
 
     if is_critical_design_event(event):
         score = max(score, 95)
+        priority = PRIORITY_ACTION
+    elif is_large_archive_event(event):
+        score = max(score, 88)
         priority = PRIORITY_ACTION
     elif is_three_d_model_event(event):
         priority = PRIORITY_ACTION
@@ -2945,6 +2951,14 @@ def is_archive_event(event: AuditEvent) -> bool:
     if set(event.file_exts) & ARCHIVE_EXTS:
         return True
     return any(extension(name) in ARCHIVE_EXTS for name in event.file_names)
+
+
+def is_large_archive_event(event: AuditEvent) -> bool:
+    return is_archive_event(event) and int(event.file_size or 0) > LARGE_ARCHIVE_RISK_BYTES
+
+
+def is_tianqing_level_one_event(event: AuditEvent) -> bool:
+    return is_critical_design_event(event) or is_large_archive_event(event)
 
 
 def text_matches_hints(value: str, hints: Iterable[str]) -> bool:
@@ -8983,6 +8997,8 @@ def build_html_report(
         build_trend_summary=build_trend_summary,
         trend_comparison_html=trend_comparison_html,
         build_rule_risk_overview_html=build_rule_risk_overview_html,
+        is_large_archive_event=is_large_archive_event,
+        is_tianqing_level_one_event=is_tianqing_level_one_event,
         debug_timing=debug_timing,
     )
     tianqing_module_result = build_tianqing_outbound_module_result(
@@ -9017,7 +9033,11 @@ def build_html_report(
         tianqing_module_result.metrics,
         {"enabled": False},
     )
-    home_focus_text = "首页按三大模块组织：加密软件解密审计、天擎外发审计和 PLM 登录审计；趋势、矩阵和下钻明细均按各自数据源独立呈现。"
+    home_focus_text = (
+        "一级风险定义：标准图纸解密；天擎标准图纸外发/拷贝；"
+        "天擎大于50MB压缩包外发/上传/外设拷贝；PLM技术、研发、工艺账号池外登录。"
+    )
+    home_evidence_text = "一级风险进入顶部汇总管理结论，矩阵、趋势和明细用于定位组织、终端与证据链。"
     home_modules = [
         decrypt_module_result.home_module,
         tianqing_module_result.home_module,
@@ -11523,7 +11543,7 @@ def build_html_report(
         <div class="meta">
           <span>统计周期：{esc(report_period)}</span>
           <span>{esc(home_focus_text)}</span>
-          <span>所有数字均可下钻追溯，原始日志和审计底稿保留用于复核闭环。</span>
+          <span>{esc(home_evidence_text)}</span>
         </div>
         <div class="top-actions">
           <a class="top-action" href="{esc(settings_url)}">策略管理</a>

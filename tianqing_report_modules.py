@@ -92,6 +92,8 @@ class TianqingOutboundModuleBuilders:
     build_trend_summary: Callable[..., Any]
     trend_comparison_html: Callable[..., str]
     build_rule_risk_overview_html: Callable[..., str]
+    is_large_archive_event: Callable[[Any], bool] = lambda _event: False
+    is_tianqing_level_one_event: Callable[[Any], bool] = lambda _event: False
     debug_timing: Callable[[str], None] = lambda _message: None
 
 
@@ -161,6 +163,13 @@ def _standard_design_total_from_metrics(metrics: dict[str, Any] | None) -> int:
     )
 
 
+def _tianqing_level_one_total_from_metrics(metrics: dict[str, Any] | None) -> int:
+    total = _metric_int(metrics, "level_one")
+    if total:
+        return total
+    return _standard_design_total_from_metrics(metrics) + _metric_int(metrics, "critical_large_archive")
+
+
 def build_global_management_summary_html(
     decrypt_metrics: dict[str, Any] | None,
     tianqing_metrics: dict[str, Any] | None,
@@ -171,9 +180,11 @@ def build_global_management_summary_html(
     decrypt_structure = _metric_int(decrypt_metrics, "structure")
     decrypt_electrical = _metric_int(decrypt_metrics, "electrical")
 
-    tianqing_critical = _standard_design_total_from_metrics(tianqing_metrics)
+    tianqing_standard = _standard_design_total_from_metrics(tianqing_metrics)
+    tianqing_level_one = _tianqing_level_one_total_from_metrics(tianqing_metrics)
     tianqing_structure = _metric_int(tianqing_metrics, "critical_structure")
     tianqing_electrical = _metric_int(tianqing_metrics, "critical_electrical")
+    tianqing_large_archive = _metric_int(tianqing_metrics, "critical_large_archive")
 
     plm_enabled = bool(plm_metrics and plm_metrics.get("enabled"))
     plm_risks = _metric_int(plm_metrics, "risk_count")
@@ -188,14 +199,14 @@ def build_global_management_summary_html(
     review_pending = _metric_int(review_metrics, "pending")
     review_done = _metric_int(review_metrics, "reviewed")
 
-    if decrypt_standard or tianqing_critical or plm_risks:
+    if decrypt_standard or tianqing_level_one or plm_risks:
         lead = (
             f"本周期一级风险概况：标准图纸解密 {decrypt_standard} 条；"
-            f"天擎标准图纸外发/拷贝 {tianqing_critical} 条；"
+            f"天擎一级风险 {tianqing_level_one} 条（标准图纸 {tianqing_standard} 条，大于50MB压缩包 {tianqing_large_archive} 条）；"
             f"PLM 登录审计{plm_label}{' ' + str(plm_risks) + ' 条' if plm_enabled else ''}。"
         )
     else:
-        lead = "本周期三大审计模块暂无一级风险数据，仍按标准图纸解密、天擎标准图纸外发/拷贝和 PLM 池外登录保留持续监测。"
+        lead = "本周期三大审计模块暂无一级风险数据，仍按标准图纸解密、天擎标准图纸外发/拷贝、大于50MB压缩包和 PLM 池外登录保留持续监测。"
 
     def row_html(label: str, body: str, href: str = "", tone: str = "blue") -> str:
         tag = "a" if href else "div"
@@ -215,7 +226,7 @@ def build_global_management_summary_html(
         ),
         row_html(
             "天擎外发审计",
-            f"一级风险：标准图纸外发/拷贝 {tianqing_critical} 条，其中结构 {tianqing_structure} 条、电气 {tianqing_electrical} 条。",
+            f"一级风险：标准图纸外发/拷贝 {tianqing_standard} 条（结构 {tianqing_structure} 条、电气 {tianqing_electrical} 条），大于50MB压缩包 {tianqing_large_archive} 条。",
             "#tianqing-audit",
             "tianqing",
         ),
@@ -425,18 +436,23 @@ def build_tianqing_outbound_module_result(
         channel_matrix_result.block_html,
         organization_result.terminal_risk_block,
     )
+    critical_design_count = sum(
+        int(channel_matrix_result.object_totals.get(label, 0) or 0)
+        for label in ("结构标准方案", "电气标准方案")
+    )
+    critical_large_archive_count = sum(1 for event in events if builders.is_large_archive_event(event))
+    tianqing_level_one_count = sum(1 for event in events if builders.is_tianqing_level_one_event(event))
     return ReportModuleResult(
         home_module=home_module,
         sidecar_pages=sidecar_pages,
         metrics={
             "events": len(events),
             "matrix_events": sum(channel_matrix_result.row_totals.values()),
-            "critical_design": sum(
-                int(channel_matrix_result.object_totals.get(label, 0) or 0)
-                for label in ("结构标准方案", "电气标准方案")
-            ),
+            "critical_design": critical_design_count,
             "critical_structure": int(channel_matrix_result.object_totals.get("结构标准方案", 0) or 0),
             "critical_electrical": int(channel_matrix_result.object_totals.get("电气标准方案", 0) or 0),
+            "critical_large_archive": critical_large_archive_count,
+            "level_one": tianqing_level_one_count,
             "top_channel": channel_matrix_result.row_totals.most_common(1)[0][0] if channel_matrix_result.row_totals else "",
             "top_channel_count": channel_matrix_result.row_totals.most_common(1)[0][1] if channel_matrix_result.row_totals else 0,
             "channel_pages": len(channel_matrix_result.sidecar_pages),
