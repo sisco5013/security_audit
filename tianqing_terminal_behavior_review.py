@@ -910,11 +910,10 @@ def fast_terminal_identity_map(
 
 
 def generate_candidate_summaries(config: Any, policy_doc: dict[str, Any], start: datetime, end: datetime) -> list[TerminalBehaviorCandidate]:
-    """Build review candidates from ClickHouse aggregates only.
+    """Deprecated fast aggregate path kept for offline diagnostics only.
 
-    This intentionally avoids loading full evidence rows, terminal identity
-    history, and report detail rendering. The full cache still runs in the
-    background and replaces this summary once evidence is ready.
+    The web page intentionally no longer serves these rows because they bypass
+    the full report enrichment path and can diverge from the final candidates.
     """
     policy = normalized_review_policy(policy_doc)
     if not policy.get("enabled", True):

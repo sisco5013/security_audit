@@ -1045,6 +1045,18 @@ def report_period_for_html_or_path(config: AppConfig | None, target: Path | None
         return None
 
 
+def warm_terminal_check_cache_for_report(data: bytes, config: AppConfig | None, target: Path | None) -> None:
+    if config is None:
+        return
+    period = report_period_for_html_or_path(config, target, data)
+    if not period:
+        return
+    try:
+        terminal_check_schedule_warm_cache(config, load_policy_doc(config), period[0], period[1])
+    except Exception:
+        return
+
+
 def inject_report_navigation_patch(data: bytes, config: AppConfig | None = None, target: Path | None = None) -> bytes:
     text = data.decode("utf-8", errors="replace")
     period = report_period_for_html_or_path(config, target, data) if config is not None else None
@@ -7089,14 +7101,8 @@ def terminal_check_fragment_html(config: AppConfig, start: datetime, end: dateti
         return terminal_check_work_area_html(payload.get("candidates") or [], payload.get("reviews") or [], start, end).encode("utf-8")
     if entry and entry.get("status") == "error":
         return terminal_check_error_html(str(entry.get("error") or "候选生成失败")).encode("utf-8")
-    try:
-        candidates = terminal_review.generate_candidate_summaries(config, policy_doc, start, end)
-        reviews = terminal_review.fetch_reviews(config, start, end, include_all_status=True)
-        html_text = terminal_check_work_area_html(candidates, reviews, start, end, summary_only=True)
-    except Exception:
-        html_text = terminal_check_loading_html(start, end)
     terminal_check_schedule_warm_cache(config, policy_doc, start, end)
-    return html_text.encode("utf-8")
+    return terminal_check_loading_html(start, end).encode("utf-8")
 
 
 def terminal_check_loader_script(start: datetime, end: datetime) -> str:
@@ -9130,6 +9136,7 @@ class ReportHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.FORBIDDEN)
             return
         if mime.startswith("text/html") or target.suffix.lower() in {".html", ".htm"}:
+            warm_terminal_check_cache_for_report(data, self.config, target)
             if not ai_policy_enabled(self.config):
                 data = suppress_static_ai_section(data)
             data = inject_identity_bar(data, session)

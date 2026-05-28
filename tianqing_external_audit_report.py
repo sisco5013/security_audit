@@ -3822,6 +3822,8 @@ def looks_like_im_recipient_token(value: str) -> bool:
         return False
     if "<" in text and ">" in text:
         return True
+    if re.fullmatch(r"\s*.*?\s*[（(][A-Za-z0-9_-]{5,64}[）)]\s*", text):
+        return True
     if any(marker in text for marker in ("://", "/", "\\", "@")):
         return False
     if "." in text:
@@ -3915,6 +3917,13 @@ def wecom_internal_recipient_label(entry: PeopleEntry) -> str:
     return entry.person_name
 
 
+def im_recipient_labels_need_wecom_repair(values: Iterable[str]) -> bool:
+    labels = [str(value or "").strip() for value in values if str(value or "").strip()]
+    if not labels:
+        return False
+    return all(looks_like_im_recipient_token(label) for label in labels)
+
+
 def repair_wecom_internal_recipient_relations(
     events: list[AuditEvent],
     wecom_people_map: dict[tuple[str, str], PeopleEntry],
@@ -3922,8 +3931,6 @@ def repair_wecom_internal_recipient_relations(
     if not wecom_people_map:
         return
     for event in events:
-        if event.recipient_relation != "unknown":
-            continue
         if event.topic == "im_audit":
             if not is_wecom_process_name(event.process_name):
                 continue
@@ -3934,6 +3941,12 @@ def repair_wecom_internal_recipient_relations(
             continue
         raw_targets = [item for item in (event.recipients or event.targets) if str(item or "").strip()]
         if not raw_targets:
+            continue
+        needs_repair = event.recipient_relation == "unknown" or (
+            event.recipient_relation == "internal"
+            and im_recipient_labels_need_wecom_repair(raw_targets)
+        )
+        if not needs_repair:
             continue
         entries: list[PeopleEntry] = []
         unmatched = False
