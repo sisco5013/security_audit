@@ -2381,6 +2381,49 @@ def page_shell(title: str, body: str, refresh_seconds: int | None = None) -> byt
       margin-top: auto;
       padding-top: 12px;
     }}
+    .settings-toolbar {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px 14px;
+      margin: 0 0 12px;
+    }}
+    .settings-toolbar .actions {{
+      margin: 0;
+    }}
+    .mini-badge {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 22px;
+      border: 1px solid #d9e0ea;
+      border-radius: 999px;
+      padding: 2px 8px;
+      color: #475467;
+      background: #f7f9fc;
+      font-size: 12px;
+      font-weight: 800;
+      white-space: nowrap;
+    }}
+    .mini-badge.warn {{
+      border-color: #fedf89;
+      color: #b54708;
+      background: #fffaeb;
+    }}
+    .pager {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .pager .actions {{
+      margin: 0;
+    }}
     .badge {{
       display: inline-flex;
       align-items: center;
@@ -4170,6 +4213,137 @@ FORMAT JSONEachRow
         return {}
     return rows[0]
 
+
+def latest_encryption_terminal_batch(config: AppConfig) -> str:
+    pool = latest_encryption_terminal_pool(config)
+    return str(pool.get("import_batch") or "") if pool else ""
+
+
+def encryption_terminal_duplicates(config: AppConfig, batch_id: str, limit: int = 80) -> list[dict[str, Any]]:
+    if not batch_id:
+        return []
+    quoted_batch = decrypt_records.clickhouse_quote(batch_id)
+    return encryption_terminal_query(
+        config,
+        f"""
+SELECT
+    ip_address,
+    count() AS rows,
+    uniqExactIf(tuple(ip_address, computer_name), notEmpty(computer_name)) AS terminal_keys,
+    groupUniqArray(computer_name) AS computers,
+    groupUniqArray(user_name) AS users,
+    groupUniqArray(company) AS companies
+FROM encryption_terminal_inventory FINAL
+WHERE import_batch = {quoted_batch} AND notEmpty(ip_address)
+GROUP BY ip_address
+HAVING rows > 1
+ORDER BY rows DESC, terminal_keys DESC, ip_address
+LIMIT {int(limit)}
+FORMAT JSONEachRow
+""",
+    )
+
+
+def encryption_terminal_count(config: AppConfig, batch_id: str, duplicate_ip_only: bool = False) -> int:
+    if not batch_id:
+        return 0
+    quoted_batch = decrypt_records.clickhouse_quote(batch_id)
+    duplicate_filter = ""
+    if duplicate_ip_only:
+        duplicate_filter = f"""
+AND ip_address IN (
+    SELECT ip_address
+    FROM encryption_terminal_inventory FINAL
+    WHERE import_batch = {quoted_batch} AND notEmpty(ip_address)
+    GROUP BY ip_address
+    HAVING count() > 1
+)
+"""
+    rows = encryption_terminal_query(
+        config,
+        f"""
+SELECT count() AS rows
+FROM encryption_terminal_inventory FINAL
+WHERE import_batch = {quoted_batch}
+{duplicate_filter}
+FORMAT JSONEachRow
+""",
+    )
+    return int(rows[0].get("rows") or 0) if rows else 0
+
+
+def encryption_terminal_records(
+    config: AppConfig,
+    batch_id: str,
+    page: int = 1,
+    page_size: int = 100,
+    duplicate_ip_only: bool = False,
+) -> list[dict[str, Any]]:
+    if not batch_id:
+        return []
+    page = max(1, int(page or 1))
+    page_size = min(200, max(50, int(page_size or 100)))
+    offset = (page - 1) * page_size
+    quoted_batch = decrypt_records.clickhouse_quote(batch_id)
+    duplicate_filter = ""
+    if duplicate_ip_only:
+        duplicate_filter = f"""
+AND ip_address IN (
+    SELECT ip_address
+    FROM encryption_terminal_inventory FINAL
+    WHERE import_batch = {quoted_batch} AND notEmpty(ip_address)
+    GROUP BY ip_address
+    HAVING count() > 1
+)
+"""
+    return encryption_terminal_query(
+        config,
+        f"""
+SELECT
+    t.ip_address,
+    t.computer_name,
+    t.mac_address,
+    t.user_name,
+    t.user_account,
+    t.company,
+    t.department,
+    t.os_version,
+    t.client_version,
+    t.encryption_status,
+    t.last_seen,
+    ifNull(d.ip_rows, 0) AS ip_rows
+FROM
+(
+    SELECT
+        ip_address,
+        computer_name,
+        mac_address,
+        user_name,
+        user_account,
+        company,
+        department,
+        os_version,
+        client_version,
+        encryption_status,
+        last_seen
+    FROM encryption_terminal_inventory FINAL
+    WHERE import_batch = {quoted_batch}
+    {duplicate_filter}
+) AS t
+LEFT JOIN
+(
+    SELECT ip_address, count() AS ip_rows
+    FROM encryption_terminal_inventory FINAL
+    WHERE import_batch = {quoted_batch} AND notEmpty(ip_address)
+    GROUP BY ip_address
+) AS d USING ip_address
+ORDER BY if(ip_rows > 1, 0, 1), ip_address, computer_name, mac_address
+LIMIT {page_size} OFFSET {offset}
+FORMAT JSONEachRow
+""",
+    )
+
+
 def decrypt_org_candidates(config: AppConfig, policy_doc: dict[str, Any], limit: int = 80) -> list[dict[str, Any]]:
     aliases = decrypt_records.normalize_aliases(policy_doc)
     candidates = decrypt_query(
@@ -4803,9 +4977,49 @@ def decrypt_records_page(config: AppConfig, message: str = "", error: str = "") 
     return page_shell("解密记录导入", body)
 
 
-def encryption_terminals_page(config: AppConfig, message: str = "", error: str = "") -> bytes:
+def compact_list_text(value: Any, limit: int = 8) -> str:
+    if isinstance(value, list):
+        items = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        items = [str(value).strip()] if str(value or "").strip() else []
+    if not items:
+        return "-"
+    shown = items[:limit]
+    suffix = f" 等{len(items)}项" if len(items) > limit else ""
+    return "、".join(shown) + suffix
+
+
+def parse_settings_page_params(params: dict[str, list[str]] | None) -> tuple[int, int, bool]:
+    params = params or {}
+    try:
+        page = int((params.get("page") or ["1"])[-1] or "1")
+    except ValueError:
+        page = 1
+    try:
+        page_size = int((params.get("page_size") or ["100"])[-1] or "100")
+    except ValueError:
+        page_size = 100
+    if page_size not in {50, 100, 200}:
+        page_size = 100
+    duplicate_ip_only = str((params.get("duplicate_ip") or [""])[-1]).lower() in {"1", "true", "yes", "on"}
+    return max(1, page), page_size, duplicate_ip_only
+
+
+def encryption_terminals_page(
+    config: AppConfig,
+    message: str = "",
+    error: str = "",
+    params: dict[str, list[str]] | None = None,
+) -> bytes:
     batches = encryption_terminal_batches(config, 30)
     latest_pool = latest_encryption_terminal_pool(config)
+    latest_batch = str(latest_pool.get("import_batch") or "") if latest_pool else ""
+    page, page_size, duplicate_ip_only = parse_settings_page_params(params)
+    total_records = encryption_terminal_count(config, latest_batch, duplicate_ip_only)
+    page_count = max(1, (total_records + page_size - 1) // page_size)
+    page = min(page, page_count)
+    terminal_records = encryption_terminal_records(config, latest_batch, page, page_size, duplicate_ip_only)
+    duplicate_rows = encryption_terminal_duplicates(config, latest_batch, 80)
     rows = []
     for item in batches:
         rows.append(
@@ -4820,6 +5034,63 @@ def encryption_terminals_page(config: AppConfig, message: str = "", error: str =
             "</tr>"
         )
     batch_table = "".join(rows) or '<tr><td colspan="7" class="muted">暂无导入批次。</td></tr>'
+    duplicate_html = []
+    for item in duplicate_rows:
+        duplicate_html.append(
+            "<tr>"
+            f"<td>{esc(item.get('ip_address') or '-')}</td>"
+            f"<td>{esc(item.get('rows') or 0)}</td>"
+            f"<td>{esc(item.get('terminal_keys') or 0)}</td>"
+            f"<td title=\"{esc(compact_list_text(item.get('computers'), 80))}\">{esc(compact_list_text(item.get('computers'), 8))}</td>"
+            f"<td title=\"{esc(compact_list_text(item.get('users'), 80))}\">{esc(compact_list_text(item.get('users'), 8))}</td>"
+            f"<td title=\"{esc(compact_list_text(item.get('companies'), 80))}\">{esc(compact_list_text(item.get('companies'), 8))}</td>"
+            "</tr>"
+        )
+    duplicate_table = "".join(duplicate_html) or '<tr><td colspan="6" class="muted">最新批次未发现重复 IP。</td></tr>'
+    terminal_html = []
+    for item in terminal_records:
+        ip_rows = int(item.get("ip_rows") or 0)
+        duplicate_badge = f'<span class="mini-badge warn">重复 {ip_rows}</span>' if ip_rows > 1 else '<span class="mini-badge">唯一</span>'
+        terminal_html.append(
+            "<tr>"
+            f"<td>{esc(item.get('ip_address') or '-')}</td>"
+            f"<td>{esc(item.get('computer_name') or '-')}</td>"
+            f"<td>{duplicate_badge}</td>"
+            f"<td>{esc(item.get('mac_address') or '-')}</td>"
+            f"<td>{esc(item.get('user_name') or '-')}</td>"
+            f"<td>{esc(item.get('user_account') or '-')}</td>"
+            f"<td>{esc(item.get('company') or '-')}</td>"
+            f"<td>{esc(item.get('department') or '-')}</td>"
+            f"<td>{esc(item.get('os_version') or '-')}</td>"
+            f"<td>{esc(item.get('client_version') or '-')}</td>"
+            f"<td>{esc(item.get('encryption_status') or '-')}</td>"
+            f"<td>{esc(item.get('last_seen') or '-')}</td>"
+            "</tr>"
+        )
+    terminal_table = "".join(terminal_html) or '<tr><td colspan="12" class="muted">暂无终端记录。</td></tr>'
+    def list_url(target_page: int = 1, size: int | None = None, duplicate: bool | None = None) -> str:
+        query = {
+            "page": str(max(1, target_page)),
+            "page_size": str(size if size is not None else page_size),
+        }
+        if duplicate if duplicate is not None else duplicate_ip_only:
+            query["duplicate_ip"] = "1"
+        return "/settings/encryption-terminals?" + urlencode(query)
+
+    mode_actions = (
+        f'<a class="button {"primary" if not duplicate_ip_only else ""}" href="{esc(list_url(1, page_size, False))}">全部终端</a>'
+        f'<a class="button {"primary" if duplicate_ip_only else ""}" href="{esc(list_url(1, page_size, True))}">仅重复IP</a>'
+    )
+    size_actions = "".join(
+        f'<a class="button {"primary" if page_size == size else ""}" href="{esc(list_url(1, size, duplicate_ip_only))}">{size}/页</a>'
+        for size in (50, 100, 200)
+    )
+    prev_link = list_url(page - 1, page_size, duplicate_ip_only)
+    next_link = list_url(page + 1, page_size, duplicate_ip_only)
+    pager_actions = (
+        (f'<a class="button" href="{esc(prev_link)}">上一页</a>' if page > 1 else '<span class="mini-badge">上一页</span>')
+        + (f'<a class="button" href="{esc(next_link)}">下一页</a>' if page < page_count else '<span class="mini-badge">下一页</span>')
+    )
     pool_text = "尚未导入终端列表"
     if latest_pool:
         pool_text = (
@@ -4848,6 +5119,30 @@ def encryption_terminals_page(config: AppConfig, message: str = "", error: str =
       <h2>当前合规终端池来源</h2>
       <p class="metric">{esc(pool_text)}</p>
       <p class="muted">该页面只维护数据源。PLM 登录审计等模块后续会读取最新批次中的 `IP地址 + 计算机名` 作为合规终端键，不使用历史批次叠加；若 PLM 登录记录缺少计算机名，应单独标记为待复核，不按纯 IP 自动放行。</p>
+    </section>
+    <section class="panel">
+      <div class="settings-toolbar">
+        <div>
+          <h2>重复 IP 概览</h2>
+          <p class="muted">同一 IP 对应多台计算机时，PLM 审计不能只按 IP 放行，必须结合计算机名。</p>
+        </div>
+        <span class="mini-badge warn">{len(duplicate_rows)} 个重复IP</span>
+      </div>
+      <div class="table-wrap"><table><thead><tr><th>IP地址</th><th>记录数</th><th>终端键</th><th>计算机名</th><th>使用人</th><th>公司</th></tr></thead><tbody>{duplicate_table}</tbody></table></div>
+    </section>
+    <section class="panel">
+      <div class="settings-toolbar">
+        <div>
+          <h2>最新批次终端清单</h2>
+          <p class="muted">当前显示 {esc('仅重复IP' if duplicate_ip_only else '全部终端')}，共 {total_records} 条；合规终端键为 `IP地址 + 计算机名`。</p>
+        </div>
+        <div class="actions">{mode_actions}{size_actions}</div>
+      </div>
+      <div class="table-wrap"><table><thead><tr><th>IP地址</th><th>计算机名</th><th>IP状态</th><th>MAC地址</th><th>使用人</th><th>账号</th><th>公司</th><th>部门</th><th>操作系统</th><th>客户端版本</th><th>状态</th><th>最后在线</th></tr></thead><tbody>{terminal_table}</tbody></table></div>
+      <div class="pager">
+        <span>第 {page} / {page_count} 页，每页 {page_size} 条</span>
+        <div class="actions">{pager_actions}</div>
+      </div>
     </section>
     <section class="panel">
       <h2>上传 Excel</h2>
@@ -5471,7 +5766,7 @@ class ReportHandler(BaseHTTPRequestHandler):
         if parsed.path == "/settings/encryption-terminals":
             if not self.require_admin(session):
                 return
-            self.send_html(encryption_terminals_page(self.config))
+            self.send_html(encryption_terminals_page(self.config, params=parse_qs(parsed.query)))
             return
         if parsed.path == "/settings/organization-aliases":
             if not self.require_admin(session):
