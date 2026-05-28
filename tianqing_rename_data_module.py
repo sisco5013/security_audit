@@ -465,6 +465,8 @@ def load_three_d_rename_findings(
         debug_timing(f"three_d_rename destination query failed {type(exc).__name__}: {exc}")
 
     update_three_d_rename_destination(findings, destination_rows, internal_domains, tz)
+    for finding in findings:
+        finding.destination_in_report_period = in_period(finding.destination_ts, start, end, tz)
     active = [
         finding
         for finding in findings

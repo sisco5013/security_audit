@@ -30,6 +30,10 @@ def three_d_rename_is_outbound_or_copy(finding: ThreeDRenameFinding) -> bool:
     return three_d_rename_is_confirmed(finding) and channel in THREE_D_RENAME_OUTBOUND_CHANNELS
 
 
+def three_d_rename_in_current_report(finding: ThreeDRenameFinding) -> bool:
+    return bool(finding.in_report_period or getattr(finding, "destination_in_report_period", False))
+
+
 def three_d_rename_change_label(finding: ThreeDRenameFinding) -> str:
     exts: list[str] = []
     for path in finding.rename_chain_paths or [finding.old_path, finding.new_path]:
@@ -81,25 +85,26 @@ def standard_design_rename_outbound(finding: ThreeDRenameFinding) -> bool:
 
 
 def three_d_rename_home_html(findings: list[ThreeDRenameFinding], links: dict[str, str]) -> str:
-    total = len(findings)
-    confirmed = sum(1 for finding in findings if three_d_rename_is_confirmed(finding))
-    unresolved = sum(1 for finding in findings if finding.tracking_status == "未发现后续去向")
-    outbound = sum(1 for finding in findings if three_d_rename_is_outbound_or_copy(finding))
-    current_period = sum(1 for finding in findings if finding.in_report_period)
-    rolling = max(0, total - current_period)
-    change_counts = Counter(three_d_rename_change_label(finding) for finding in findings)
-    top_change, top_change_count = ("-", 0)
-    if change_counts:
-        top_change, top_change_count = change_counts.most_common(1)[0]
+    current_findings = [finding for finding in findings if three_d_rename_in_current_report(finding)]
+    total = len(current_findings)
+    confirmed = sum(1 for finding in current_findings if three_d_rename_is_confirmed(finding))
+    unresolved = sum(1 for finding in current_findings if finding.tracking_status == "未发现后续去向")
+    outbound = sum(1 for finding in current_findings if three_d_rename_is_outbound_or_copy(finding))
+    rolling_unresolved = [
+        finding
+        for finding in findings
+        if not three_d_rename_in_current_report(finding)
+        and finding.tracking_status == "未发现后续去向"
+    ]
     empty_text = ""
-    if total <= 0:
-        empty_text = '<p class="rename-empty">本周期及滚动追踪范围内未发现三维图纸后缀伪装记录。</p>'
+    if total <= 0 and not rolling_unresolved:
+        empty_text = '<p class="rename-empty">本周期未发现三维图纸后缀伪装记录，也没有跨周期未闭环伪装追踪项。</p>'
     cards = [
-        three_d_rename_card_html("伪装总数", total, f"本周期新增 {current_period} 条，跨周期未闭环 {rolling} 条", links.get("all"), "red"),
-        three_d_rename_card_html("已发现后续去向", confirmed, "强匹配或可信匹配，点击查看追踪链路", links.get("confirmed"), "blue"),
-        three_d_rename_card_html("未发现后续去向", unresolved, "仍需滚动追踪，后续周期继续回查", links.get("unresolved"), "amber"),
-        three_d_rename_card_html("已外发/外设", outbound, "最终去向为邮件、IM、外部站点上传或外设拷贝", links.get("outbound"), "violet"),
-        three_d_rename_card_html("主要后缀变化", f"{top_change} · {top_change_count}", "按后缀伪装变化聚合的最高频组合", links.get("top_change"), "slate"),
+        three_d_rename_card_html("本周期伪装", total, "改名动作或后续去向发生在本报告周期内", links.get("all"), "red"),
+        three_d_rename_card_html("已发现后续去向", confirmed, "本周期范围内强匹配或可信匹配到后续动作", links.get("confirmed"), "blue"),
+        three_d_rename_card_html("未发现后续去向", unresolved, "本周期新增但尚未发现后续去向", links.get("unresolved"), "amber"),
+        three_d_rename_card_html("已外发/外设", outbound, "本周期范围内最终去向为外发、上传或外设拷贝", links.get("outbound"), "violet"),
+        three_d_rename_card_html("跨周期未闭环", len(rolling_unresolved), "历史伪装记录仍未发现后续去向，单独滚动追踪", links.get("rolling"), "slate"),
     ]
     return f"""
     <section id="three-d-rename-tracking" class="section-block rename-tracking-shell">
@@ -238,22 +243,31 @@ def build_tianqing_rename_tracking_result(
     three_d_suffix_findings = [
         finding for finding in findings if three_d_rename_is_suffix_mask(finding)
     ]
+    three_d_rename_current = [
+        finding for finding in three_d_suffix_findings if three_d_rename_in_current_report(finding)
+    ]
     standard_rename_findings = [
         finding for finding in findings if standard_design_rename_outbound(finding)
     ]
     three_d_rename_confirmed = [
-        finding for finding in three_d_suffix_findings if three_d_rename_is_confirmed(finding)
+        finding for finding in three_d_rename_current if three_d_rename_is_confirmed(finding)
     ]
     three_d_rename_unresolved = [
-        finding for finding in three_d_suffix_findings if finding.tracking_status == "未发现后续去向"
+        finding for finding in three_d_rename_current if finding.tracking_status == "未发现后续去向"
     ]
     three_d_rename_outbound = [
-        finding for finding in three_d_suffix_findings if three_d_rename_is_outbound_or_copy(finding)
+        finding for finding in three_d_rename_current if three_d_rename_is_outbound_or_copy(finding)
     ]
-    change_counts = Counter(three_d_rename_change_label(finding) for finding in three_d_suffix_findings)
+    three_d_rename_rolling_unresolved = [
+        finding
+        for finding in three_d_suffix_findings
+        if not three_d_rename_in_current_report(finding)
+        and finding.tracking_status == "未发现后续去向"
+    ]
+    change_counts = Counter(three_d_rename_change_label(finding) for finding in three_d_rename_current)
     top_change_label = change_counts.most_common(1)[0][0] if change_counts else ""
     three_d_rename_top_change = [
-        finding for finding in three_d_suffix_findings if top_change_label and three_d_rename_change_label(finding) == top_change_label
+        finding for finding in three_d_rename_current if top_change_label and three_d_rename_change_label(finding) == top_change_label
     ]
     standard_rename_structure = [
         finding for finding in standard_rename_findings if finding.critical_design_label == CRITICAL_STRUCTURE_LABEL
@@ -273,6 +287,7 @@ def build_tianqing_rename_tracking_result(
         "unresolved": sidecar_page_filename(args, "rename-3d", "unresolved"),
         "outbound": sidecar_page_filename(args, "rename-3d", "outbound"),
         "top_change": sidecar_page_filename(args, "rename-3d", "top-change"),
+        "rolling": sidecar_page_filename(args, "rename-3d", "rolling-unresolved"),
     }
     standard_links = {
         "all": sidecar_page_filename(args, "rename-standard", "all"),
@@ -283,11 +298,11 @@ def build_tianqing_rename_tracking_result(
     sidecar_pages = {
         three_d_links["all"]: build_three_d_rename_detail_page(
             "三维图纸后缀伪装追踪",
-            three_d_suffix_findings,
+            three_d_rename_current,
             tz,
             report_period,
             source_label,
-            "三维模型后缀被改成非三维后缀的高风险伪装行为，含跨周期未闭环追踪。",
+            "本页只展示改名动作或后续去向发生在当前报告周期内的三维后缀伪装记录。",
             context_label="三维伪装追踪",
             section_title="三维图纸后缀伪装追踪清单",
             primary_metric_note="本页仅展示三维图纸后缀伪装记录",
@@ -335,6 +350,17 @@ def build_tianqing_rename_tracking_result(
             context_label="三维伪装追踪",
             section_title="三维图纸后缀伪装追踪清单",
             primary_metric_note="本页按最高频三维后缀伪装变化过滤",
+        ),
+        three_d_links["rolling"]: build_three_d_rename_detail_page(
+            "三维伪装跨周期未闭环",
+            three_d_rename_rolling_unresolved,
+            tz,
+            report_period,
+            source_label,
+            "历史周期发生、当前仍未发现后续去向的三维后缀伪装记录；单独滚动追踪，不计入本周期伪装统计。",
+            context_label="三维伪装滚动追踪",
+            section_title="三维图纸后缀伪装跨周期未闭环清单",
+            primary_metric_note="本页仅展示跨周期未闭环的三维后缀伪装记录",
         ),
         standard_links["all"]: build_three_d_rename_detail_page(
             "标准图纸更名外发预警",

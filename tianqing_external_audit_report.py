@@ -708,6 +708,7 @@ class ThreeDRenameFinding:
     rename_chain_paths: list[str] = field(default_factory=list)
     chain_raw_hashes: list[str] = field(default_factory=list)
     in_report_period: bool = False
+    destination_in_report_period: bool = False
     tracking_status: str = "未发现后续去向"
     destination_channel: str = "未发现后续去向"
     destination_target: str = ""
