@@ -5272,27 +5272,21 @@ def terminal_check_css() -> str:
     return """
 <style>
   .terminal-check-hero {
-    border: 1px solid #dbe6f3;
-    border-radius: 14px;
-    padding: 18px 20px;
-    background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
-    box-shadow: 0 14px 32px rgba(15, 23, 42, 0.055);
+    border: 1px solid #d8e4f2;
+    border-radius: 16px;
+    padding: 18px 20px 16px;
+    background: linear-gradient(180deg, #ffffff 0%, #fbfdff 100%);
+    box-shadow: 0 12px 28px rgba(23, 32, 51, 0.05);
   }
-  .terminal-check-toolbar {
+  .terminal-check-scope {
     display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
-    align-items: flex-end;
+    align-items: center;
     justify-content: space-between;
-    margin: 16px 0 12px;
+    gap: 14px;
+    margin-top: 10px;
+    padding-top: 12px;
+    border-top: 1px solid #e7eef7;
   }
-  .terminal-check-toolbar form {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: flex-end;
-    gap: 10px;
-  }
-  .terminal-check-toolbar label { min-width: 190px; }
   .terminal-check-grid {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -5301,7 +5295,7 @@ def terminal_check_css() -> str:
   }
   .terminal-check-chip {
     border: 1px solid #dbe6f3;
-    border-radius: 12px;
+    border-radius: 10px;
     padding: 13px 14px;
     background: #fff;
   }
@@ -5319,11 +5313,6 @@ def terminal_check_css() -> str:
     line-height: 1;
     font-weight: 900;
   }
-  table.terminal-check-table th,
-  table.terminal-check-table td { vertical-align: middle; }
-  table.terminal-check-table td.compact { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .terminal-check-status { min-width: 132px; }
-  .terminal-check-notes { min-width: 180px; min-height: 38px; }
   .terminal-check-review-form {
     display: block;
     width: 100%;
@@ -5354,15 +5343,170 @@ def terminal_check_css() -> str:
     margin: 0;
     flex: 0 0 auto;
   }
-  .terminal-check-review-form .table-wrap {
+  .terminal-check-matrix-wrap {
     width: 100%;
+    overflow-x: hidden;
+    border: 1px solid #d8e4f2;
+    border-radius: 13px;
+    background: #fff;
+  }
+  .terminal-check-matrix {
+    width: 100%;
+    table-layout: fixed;
+    border-collapse: collapse;
+    font-size: 12px;
+    background: #fff;
+  }
+  .terminal-check-matrix col.rank-col { width: 34px; }
+  .terminal-check-matrix col.company-col { width: 96px; }
+  .terminal-check-matrix col.department-col { width: 82px; }
+  .terminal-check-matrix col.person-col { width: 74px; }
+  .terminal-check-matrix col.ip-col { width: 94px; }
+  .terminal-check-matrix col.number-col { width: 30px; }
+  .terminal-check-matrix col.total-col { width: 44px; }
+  .terminal-check-matrix col.action-col { width: 76px; }
+  .terminal-check-matrix th,
+  .terminal-check-matrix td {
+    padding: 10px 3px;
+    line-height: 1.24;
+    text-align: center;
+    vertical-align: middle;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .terminal-check-matrix thead th {
+    color: #43546c;
+    background: #f6f9fd;
+    font-size: 10.5px;
+    line-height: 1.15;
+    font-weight: 820;
+    white-space: normal;
+  }
+  .terminal-check-matrix .channel-head {
+    background: #eaf3ff;
+    border-left: 1px solid #d8e4f2;
+    border-right: 1px solid #d8e4f2;
+    font-weight: 860;
+  }
+  .terminal-check-matrix .identity-cell {
+    text-align: left;
+    color: #172033;
+    font-weight: 720;
+  }
+  .terminal-check-matrix .ip-cell {
+    text-align: left;
+    color: #344054;
+    font-weight: 500;
+  }
+  .terminal-check-matrix .rank-cell {
+    color: #667085;
+    font-weight: 780;
+  }
+  .terminal-check-matrix .matrix-zero {
+    color: #c3cedb;
+    font-size: 11px;
+    font-weight: 740;
+  }
+  .terminal-check-matrix .matrix-count,
+  .terminal-check-matrix .matrix-total {
+    display: inline-flex;
+    min-width: 24px;
+    min-height: 22px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 999px;
+    padding: 2px 6px;
+    font-size: 12px;
+    font-weight: 860;
+    text-decoration: none;
+    border-bottom: 0;
+  }
+  .terminal-check-matrix .matrix-total {
+    border-radius: 8px;
+  }
+  .terminal-check-matrix .matrix-heat-low { background: #edf7f2; color: #24754f; }
+  .terminal-check-matrix .matrix-heat-mid { background: #fff7df; color: #a15c00; }
+  .terminal-check-matrix .matrix-heat-high { background: #fff0e8; color: #c2410c; }
+  .terminal-check-matrix .matrix-heat-critical { background: #fee4e2; color: #b42318; }
+  .terminal-check-matrix .review-action-cell {
+    overflow: visible;
+  }
+  .terminal-check-action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 28px;
+    width: 66px;
+    border-radius: 999px;
+    border: 1px solid #d8e4f2;
+    padding: 4px 8px;
+    background: #fff;
+    color: #175cd3;
+    font-size: 12px;
+    font-weight: 820;
+    white-space: nowrap;
+  }
+  .terminal-check-action.has-value {
+    border-color: #9ed4c0;
+    background: #f0fbf6;
+    color: #067647;
+  }
+  .terminal-check-action.status-reviewed {
+    border-color: #f4bf7a;
+    background: #fff7e8;
+    color: #b54708;
+  }
+  .terminal-check-hidden {
+    display: none;
   }
   @media (max-width: 980px) {
     .terminal-check-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .terminal-check-toolbar form { display: grid; grid-template-columns: 1fr; width: 100%; }
     .terminal-check-section-head { align-items: flex-start; flex-direction: column; }
   }
 </style>
+<script>
+  (function () {
+    var statuses = ["待核查", "异常待整改", "正常业务", "误报", "继续观察", "已闭环", "不纳入报告"];
+    function markSelected(row) {
+      var selected = row.querySelector(".terminal-check-selected");
+      if (selected) selected.disabled = false;
+    }
+    function updateStatusButton(button, value) {
+      button.textContent = value || "待核查";
+      button.classList.toggle("status-reviewed", value && value !== "待核查");
+      button.title = "点击切换核查状态";
+    }
+    function updateResultButton(button, value) {
+      button.textContent = value ? "已填写" : "填写";
+      button.classList.toggle("has-value", !!value);
+      button.title = value || "点击填写核查结果";
+    }
+    document.addEventListener("click", function (event) {
+      var statusButton = event.target.closest(".terminal-status-button");
+      if (statusButton) {
+        var row = statusButton.closest("tr");
+        var input = row.querySelector("input[data-review-field='status']");
+        var current = input.value || "待核查";
+        var next = statuses[(Math.max(0, statuses.indexOf(current)) + 1) % statuses.length];
+        input.value = next;
+        updateStatusButton(statusButton, next);
+        markSelected(row);
+        return;
+      }
+      var resultButton = event.target.closest(".terminal-result-button");
+      if (resultButton) {
+        var row = resultButton.closest("tr");
+        var input = row.querySelector("input[data-review-field='conclusion']");
+        var value = window.prompt("填写核查结果", input.value || "");
+        if (value === null) return;
+        input.value = value.trim();
+        updateResultButton(resultButton, input.value);
+        markSelected(row);
+      }
+    });
+  })();
+</script>
 """
 
 
@@ -5380,42 +5524,103 @@ def terminal_check_metrics_html(candidates: list[terminal_review.TerminalBehavio
     ) + "</div>"
 
 
+def terminal_check_short_label(value: str) -> str:
+    alias = report_gen.HTML_DISPLAY_LABEL_ALIASES.get(value, value)
+    return report_gen.ORG_MATRIX_OBJECT_SHORT_LABELS.get(alias, report_gen.ORG_MATRIX_OBJECT_SHORT_LABELS.get(value, alias))
+
+
+def terminal_check_matrix_count(candidate: terminal_review.TerminalBehaviorCandidate, channel: str, bucket: str) -> int:
+    return int((candidate.matrix_counts or {}).get(f"{channel}\u241f{bucket}", 0) or 0)
+
+
 def terminal_candidates_table(candidates: list[terminal_review.TerminalBehaviorCandidate], start: datetime, end: datetime) -> str:
     if not candidates:
         return '<p class="muted">当前周期暂无候选异常终端。</p>'
-    rows = []
     start_value = datetime_input_value(start)
     end_value = datetime_input_value(end)
-    for candidate in candidates:
-        checked = ' checked' if candidate.existing_status else ""
+    base_channels = list(report_gen.CHANNEL_MATRIX_BASE_ROWS)
+    dynamic_channels = sorted({channel for candidate in candidates for channel in candidate.channels if channel and channel not in base_channels})
+    channels = base_channels + dynamic_channels
+    columns = list(report_gen.CHANNEL_MATRIX_COLUMNS)
+    detail_base = f"/terminal-check/events?preset=custom&start={quote(start_value)}&end={quote(end_value)}"
+    channel_headers = "".join(
+        f'<th class="channel-head" colspan="{len(columns)}" title="{esc(channel)}">{esc(report_gen.CHANNEL_MATRIX_SHORT_LABELS.get(channel, channel))}</th>'
+        for channel in channels
+    )
+    object_headers = "".join(
+        f'<th title="{esc(channel)} / {esc(column)}">{esc(terminal_check_short_label(column))}</th>'
+        for channel in channels
+        for column in columns
+    )
+    colgroup = (
+        '<colgroup>'
+        '<col class="rank-col"><col class="company-col"><col class="department-col"><col class="person-col"><col class="ip-col">'
+        + "".join('<col class="number-col">' for _ in range(len(channels) * len(columns)))
+        + '<col class="total-col"><col class="action-col"><col class="action-col">'
+        '</colgroup>'
+    )
+    all_counts = [
+        terminal_check_matrix_count(candidate, channel, column)
+        for candidate in candidates
+        for channel in channels
+        for column in columns
+    ]
+    total_counts = [sum(terminal_check_matrix_count(candidate, channel, column) for channel in channels for column in columns) for candidate in candidates]
+    count_thresholds = report_gen.heat_thresholds_from_counts(all_counts)
+    total_thresholds = report_gen.heat_thresholds_from_counts(total_counts)
+    rows: list[str] = []
+    for idx, candidate in enumerate(candidates, 1):
+        selected_disabled = "" if candidate.existing_status else " disabled"
         status = candidate.existing_status or "待核查"
-        detail_href = f"/terminal-check/events?preset=custom&candidate_id={quote(candidate.candidate_id)}&start={quote(start_value)}&end={quote(end_value)}"
+        status_class = " status-reviewed" if status != "待核查" else ""
+        result_class = " has-value" if candidate.existing_conclusion else ""
+        detail_href = f"{detail_base}&candidate_id={quote(candidate.candidate_id)}"
+        matrix_cells: list[str] = []
+        for channel in channels:
+            for column in columns:
+                count = terminal_check_matrix_count(candidate, channel, column)
+                title = f"{candidate.company or '-'} / {candidate.person or '-'}：{channel} / {column}明细"
+                matrix_cells.append(f"<td>{report_gen.matrix_number_html(count, detail_href if count else '', title, count_thresholds)}</td>")
+        total_count = int(total_counts[idx - 1] or candidate.event_count or 0)
         rows.append(
             f"""
 <tr>
-  <td><input type="checkbox" name="candidate__{esc(candidate.candidate_id)}" value="1"{checked}></td>
-  <td><strong>{esc(candidate.anomaly_type)}</strong><br><span class="muted">{esc(candidate.basis)}</span></td>
-  <td>{esc(candidate.company)}<br><span class="muted">{esc(candidate.department)}</span></td>
-  <td>{esc(candidate.person)}</td>
-  <td>{esc(candidate.client_ip)}<br><span class="muted">{esc(candidate.client_mac)}</span></td>
-  <td>{esc(candidate.client_name or "-")}</td>
-  <td><strong>{candidate.event_count}</strong></td>
-  <td>{candidate.structure_count}/{candidate.electrical_count}/{candidate.three_d_count}/{candidate.dwg_count}/{candidate.archive_count}</td>
-  <td class="compact" title="{esc(' / '.join(candidate.channels))}">{esc(' / '.join(candidate.channels) or "-")}</td>
-  <td class="compact" title="{esc('；'.join(candidate.targets))}">{esc('；'.join(candidate.targets) or "-")}</td>
-  <td class="compact" title="{esc('；'.join(candidate.sample_files))}">{esc('；'.join(candidate.sample_files) or "-")}</td>
-  <td><select class="terminal-check-status" name="status__{esc(candidate.candidate_id)}">{terminal_review_status_options(status)}</select></td>
-  <td><input class="terminal-check-notes" name="conclusion__{esc(candidate.candidate_id)}" value="{esc(candidate.existing_conclusion)}" placeholder="核查结论"></td>
-  <td><input class="terminal-check-notes" name="owner__{esc(candidate.candidate_id)}" value="{esc(candidate.existing_owner_department)}" placeholder="责任部门"></td>
-  <td><input type="date" name="due__{esc(candidate.candidate_id)}" value="{esc(candidate.existing_due_date[:10])}"></td>
-  <td><input class="terminal-check-notes" name="notes__{esc(candidate.candidate_id)}" value="{esc(candidate.existing_notes)}" placeholder="核查备注"></td>
-  <td><a href="{esc(detail_href)}">明细</a></td>
+  <td class="rank-cell">{idx}</td>
+  <td class="identity-cell" title="{esc(candidate.company)}">{esc(candidate.company or "-")}</td>
+  <td class="identity-cell" title="{esc(candidate.department)}">{esc(candidate.department or "-")}</td>
+  <td class="identity-cell" title="{esc(candidate.person)}">{esc(candidate.person or "-")}</td>
+  <td class="ip-cell" title="{esc(candidate.client_ip)}">{esc(candidate.client_ip or "-")}</td>
+  {''.join(matrix_cells)}
+  <td>{report_gen.matrix_number_html(total_count, detail_href, "查看该候选终端明细", total_thresholds, total=True)}</td>
+  <td class="review-action-cell">
+    <input class="terminal-check-selected terminal-check-hidden" type="hidden" name="candidate__{esc(candidate.candidate_id)}" value="1"{selected_disabled}>
+    <input class="terminal-check-hidden" data-review-field="status" type="hidden" name="status__{esc(candidate.candidate_id)}" value="{esc(status)}">
+    <button class="terminal-check-action terminal-status-button{status_class}" type="button">{esc(status)}</button>
+  </td>
+  <td class="review-action-cell">
+    <input class="terminal-check-hidden" data-review-field="conclusion" type="hidden" name="conclusion__{esc(candidate.candidate_id)}" value="{esc(candidate.existing_conclusion)}">
+    <button class="terminal-check-action terminal-result-button{result_class}" type="button" title="{esc(candidate.existing_conclusion or '点击填写核查结果')}">{esc('已填写' if candidate.existing_conclusion else '填写')}</button>
+  </td>
 </tr>"""
         )
     return f"""
-<div class="table-wrap">
-  <table class="terminal-check-table">
-    <thead><tr><th>选择</th><th>入选原因</th><th>公司/部门</th><th>使用人</th><th>IP/MAC</th><th>终端名</th><th>事件</th><th>结构/电气/三维/DWG/压缩</th><th>通道</th><th>目标</th><th>代表文件</th><th>核查状态</th><th>核查结论</th><th>责任部门</th><th>期限</th><th>备注</th><th>证据</th></tr></thead>
+<div class="terminal-check-matrix-wrap">
+  <table class="terminal-check-matrix" data-matrix-data-cols="{len(channels) * len(columns)}">
+    {colgroup}
+    <thead>
+      <tr>
+        <th rowspan="2">#</th>
+        <th rowspan="2">公司</th>
+        <th rowspan="2">部门</th>
+        <th rowspan="2">使用人</th>
+        <th rowspan="2">IP地址</th>
+        {channel_headers}
+        <th rowspan="2">合计</th>
+        <th rowspan="2">核查状态</th>
+        <th rowspan="2">核查结果</th>
+      </tr>
+      <tr>{object_headers}</tr>
+    </thead>
     <tbody>{''.join(rows)}</tbody>
   </table>
 </div>
@@ -5431,14 +5636,13 @@ def terminal_reviews_table(reviews: list[terminal_review.TerminalBehaviorReview]
             f"""
 <tr>
   <td>{esc(review.event_start[:19])}</td>
-  <td><strong>{esc(review.status)}</strong><br><span class="muted">{esc(review.anomaly_type)}</span></td>
+  <td title="{esc(review.anomaly_type)}">{esc(review.anomaly_type)}</td>
   <td>{esc(review.company)}<br><span class="muted">{esc(review.department)}</span></td>
   <td>{esc(review.person)}</td>
-  <td>{esc(review.client_ip)}<br><span class="muted">{esc(review.client_mac)}</span></td>
+  <td>{esc(review.client_ip)}</td>
   <td>{esc(review.event_count)}</td>
-  <td class="compact" title="{esc('；'.join(review.sample_files))}">{esc('；'.join(review.sample_files) or "-")}</td>
-  <td class="compact" title="{esc(review.conclusion or review.notes)}">{esc(review.conclusion or review.notes or "-")}</td>
-  <td>{esc(review.owner_department or "-")}<br><span class="muted">{esc(review.due_date[:10] or "-")}</span></td>
+  <td><span class="terminal-check-action status-reviewed">{esc(review.status)}</span></td>
+  <td class="compact" title="{esc(review.conclusion)}">{esc(review.conclusion or "-")}</td>
   <td>{esc(review.reviewer_name or review.reviewer_userid)}<br><span class="muted">{esc(review.review_time[:19])}</span></td>
   <td>{esc('是' if review.include_in_report else '否')}</td>
 </tr>"""
@@ -5446,7 +5650,7 @@ def terminal_reviews_table(reviews: list[terminal_review.TerminalBehaviorReview]
     return f"""
 <div class="table-wrap">
   <table class="terminal-check-table">
-    <thead><tr><th>事件时间</th><th>核查状态</th><th>公司/部门</th><th>使用人</th><th>IP/MAC</th><th>事件数</th><th>代表文件</th><th>结论/备注</th><th>责任/期限</th><th>审核人</th><th>进入报告</th></tr></thead>
+    <thead><tr><th>事件时间</th><th>入选原因</th><th>公司/部门</th><th>使用人</th><th>IP地址</th><th>事件数</th><th>核查状态</th><th>核查结果</th><th>审核人</th><th>进入报告</th></tr></thead>
     <tbody>{''.join(rows)}</tbody>
   </table>
 </div>
@@ -5474,16 +5678,11 @@ def terminal_check_page(config: AppConfig, session: AuthSession, params: dict[st
         candidates = []
         reviews = []
         error = error or f"候选生成失败：{exc}"
-    preset_buttons = [
-        ("today", "今日"),
-        ("yesterday", "昨日"),
-        ("week", "本周"),
-    ]
     body = f"""
     <header>
       <div>
         <h1>异常终端行为核查</h1>
-        <div class="muted">候选线索不会自动进入正式日报/周报；只有人工勾选并保存的核查记录才会在报告中展示。</div>
+        <div class="muted">按当前报告周期提取一级风险与终端高频明细候选，人工确认后进入日报/周报核查记录。</div>
       </div>
       <div class="actions">
         <a class="button" href="/">当前报告首页</a>
@@ -5492,18 +5691,14 @@ def terminal_check_page(config: AppConfig, session: AuthSession, params: dict[st
     </header>
     {terminal_check_css()}
     <section class="terminal-check-hero">
-      <div class="terminal-check-toolbar">
-        <div class="actions">
-          {''.join(f'<a class="button{" primary" if preset == key else ""}" href="/terminal-check?preset={key}">{label}</a>' for key, label in preset_buttons)}
-        </div>
-        <form method="get" action="/terminal-check">
-          <input type="hidden" name="preset" value="custom">
-          <label>开始时间<input type="datetime-local" name="start" value="{esc(datetime_input_value(start))}"></label>
-          <label>结束时间<input type="datetime-local" name="end" value="{esc(datetime_input_value(end))}"></label>
-          <button class="primary" type="submit">查询</button>
-        </form>
+      <div>
+        <h2 style="margin:0;font-size:19px;">核查候选概览</h2>
+        <p class="muted">当前页面不提供独立周期选择，默认跟随报表入口传入的统计周期。</p>
       </div>
-      <p class="muted">当前周期：{esc(start.strftime('%Y-%m-%d %H:%M'))} 至 {esc(end.strftime('%Y-%m-%d %H:%M'))}</p>
+      <div class="terminal-check-scope">
+        <span class="muted">当前周期：{esc(start.strftime('%Y-%m-%d %H:%M'))} 至 {esc(end.strftime('%Y-%m-%d %H:%M'))}</span>
+        <span class="muted">点击矩阵数字查看对应候选终端证据。</span>
+      </div>
       {f'<p class="badge on">{esc(message)}</p>' if message else ''}
       {f'<p class="badge off danger">{esc(error)}</p>' if error else ''}
       {terminal_check_metrics_html(candidates, reviews)}
@@ -5515,9 +5710,9 @@ def terminal_check_page(config: AppConfig, session: AuthSession, params: dict[st
         <div class="terminal-check-section-head">
           <div>
             <h2>候选异常终端</h2>
-            <p class="muted">候选直接复用本周期报表重点明细事件的终端、人员、公司和部门字段；勾选后仅追加核查状态和核查结论。</p>
+            <p class="muted">矩阵口径与报告首页终端风险保持一致；点击“核查状态”切换状态，点击“核查结果”填写结论。</p>
           </div>
-          <div class="actions"><button class="primary" type="submit">保存选中核查记录</button></div>
+          <div class="actions"><button class="primary" type="submit">保存核查结果</button></div>
         </div>
         {terminal_candidates_table(candidates, start, end)}
       </section>
@@ -7095,6 +7290,7 @@ class ReportHandler(BaseHTTPRequestHandler):
             return
         try:
             candidates = terminal_review.generate_candidates(self.config, load_policy_doc(self.config), start, end)
+            existing_reviews = {review.candidate_id: review for review in terminal_review.fetch_reviews(self.config, start, end, include_all_status=True)}
         except Exception as exc:
             self.send_html(terminal_check_page(self.config, session, error=f"候选重新计算失败：{exc}"), HTTPStatus.BAD_REQUEST)
             return
@@ -7107,10 +7303,11 @@ class ReportHandler(BaseHTTPRequestHandler):
             if status not in terminal_review.REVIEW_STATUSES:
                 status = "待核查"
             include = 0 if status in terminal_review.REPORT_EXCLUDED_STATUSES else 1
-            notes = (form.get(f"notes__{candidate.candidate_id}") or "").strip()
-            conclusion = (form.get(f"conclusion__{candidate.candidate_id}") or "").strip()
-            owner_department = (form.get(f"owner__{candidate.candidate_id}") or "").strip()
-            due_raw = (form.get(f"due__{candidate.candidate_id}") or "").strip()
+            existing_review = existing_reviews.get(candidate.candidate_id)
+            notes = (form.get(f"notes__{candidate.candidate_id}") or (existing_review.notes if existing_review else "") or "").strip()
+            conclusion = (form.get(f"conclusion__{candidate.candidate_id}") or (existing_review.conclusion if existing_review else "") or "").strip()
+            owner_department = (form.get(f"owner__{candidate.candidate_id}") or (existing_review.owner_department if existing_review else "") or "").strip()
+            due_raw = (form.get(f"due__{candidate.candidate_id}") or (existing_review.due_date[:10] if existing_review else "") or "").strip()
             due_date = due_raw if re.fullmatch(r"\d{4}-\d{2}-\d{2}", due_raw) else None
             rows.append(
                 {

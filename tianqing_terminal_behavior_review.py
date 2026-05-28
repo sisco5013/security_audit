@@ -114,6 +114,7 @@ class TerminalBehaviorCandidate:
     targets: list[str] = field(default_factory=list)
     sample_files: list[str] = field(default_factory=list)
     event_ids: list[str] = field(default_factory=list)
+    matrix_counts: dict[str, int] = field(default_factory=dict)
     evidence_events: list[dict[str, Any]] = field(default_factory=list)
     basis: str = ""
     existing_status: str = ""
@@ -334,6 +335,28 @@ def event_object_counts(event: dict[str, Any], three_d: set[str], two_d: set[str
     if any("敏感" in str(reason) for reason in event.get("reasons") or []):
         counts["sensitive"] += 1
     return counts
+
+
+def event_matrix_bucket(event: dict[str, Any], three_d: set[str], two_d: set[str], archives: set[str], patterns: list[tuple[str, re.Pattern[str]]]) -> str:
+    names = [str(item) for item in event.get("file_names") or []]
+    exts = {normalize_key(item).lstrip(".") for item in event.get("file_exts") or [] if normalize_key(item)}
+    if not exts:
+        exts = {ext_from_name(name) for name in names if ext_from_name(name)}
+    reasons = [str(reason) for reason in event.get("reasons") or []]
+    for label, pattern in patterns:
+        if any(pattern.search(re.split(r"[\\/]", name)[-1]) for name in names):
+            return label
+        if f"{report_gen.CRITICAL_DESIGN_REASON_PREFIX}{label}" in reasons:
+            return label
+    if exts & three_d or "三维模型" in reasons:
+        return "三维模型"
+    if exts & two_d or "DWG二维图纸" in reasons:
+        return "DWG二维图纸"
+    if any(reason.startswith("敏感") for reason in reasons):
+        return "敏感名称"
+    if exts & archives or "压缩包" in reasons:
+        return "压缩包"
+    return ""
 
 
 def significant_event(event: dict[str, Any], three_d: set[str], two_d: set[str], archives: set[str], patterns: list[tuple[str, re.Pattern[str]]]) -> bool:
@@ -653,9 +676,14 @@ def build_candidate(
     targets: list[str] = []
     files: list[str] = []
     event_ids: list[str] = []
+    matrix_counts: Counter = Counter()
     for event in ordered:
         counts.update(event_object_counts(event, three_d, two_d, archives, patterns))
-        channels.append(display_channel(event))
+        channel = display_channel(event)
+        channels.append(channel)
+        bucket = event_matrix_bucket(event, three_d, two_d, archives, patterns)
+        if channel and bucket:
+            matrix_counts[f"{channel}\u241f{bucket}"] += 1
         targets.extend(event_targets(event))
         files.extend(str(name) for name in event.get("file_names") or [] if normalize_text(name))
         event_ids.append(str(event.get("event_id") or ""))
@@ -685,6 +713,7 @@ def build_candidate(
         targets=list(dict.fromkeys(targets))[:12],
         sample_files=list(dict.fromkeys(files))[:8],
         event_ids=[item for item in dict.fromkeys(event_ids) if item],
+        matrix_counts=dict(matrix_counts),
         evidence_events=ordered[:80],
         basis=basis,
     )
