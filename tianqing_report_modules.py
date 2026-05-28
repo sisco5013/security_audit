@@ -238,7 +238,7 @@ def build_global_management_summary_html(
       <div class="global-management-head">
         <div>
           <span class="section-eyebrow">Management Summary</span>
-          <h2 id="global-management-summary-title">三大模块管理结论</h2>
+          <h2 id="global-management-summary-title">三大模块汇总管理结论</h2>
         </div>
         <p>{_esc(lead)}</p>
       </div>
