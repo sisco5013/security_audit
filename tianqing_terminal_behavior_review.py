@@ -847,6 +847,207 @@ def generate_candidates(config: Any, policy_doc: dict[str, Any], start: datetime
     return result[: policy_int(policy, "candidate_limit")]
 
 
+def fast_review_policy_context(policy_doc: dict[str, Any]) -> set[str]:
+    policy_doc = policy_doc if isinstance(policy_doc, dict) else {}
+    report_gen.configure_audit_policy(policy_doc)
+    internal_domains = set(report_gen.DEFAULT_INTERNAL_DOMAINS)
+    internal_domains.update(report_gen.policy_internal_domains(policy_doc))
+    return internal_domains
+
+
+def generate_candidate_summaries(config: Any, policy_doc: dict[str, Any], start: datetime, end: datetime) -> list[TerminalBehaviorCandidate]:
+    """Build review candidates from ClickHouse aggregates only.
+
+    This intentionally avoids loading full evidence rows, terminal identity
+    history, and report detail rendering. The full cache still runs in the
+    background and replaces this summary once evidence is ready.
+    """
+    policy = normalized_review_policy(policy_doc)
+    if not policy.get("enabled", True):
+        return []
+    internal_domains = fast_review_policy_context(policy_doc)
+    object_expr, channel_expr, focus_expr = report_gen.clickhouse_matrix_classification_exprs(internal_domains)
+    other_drawing_min = max(1, policy_int(policy, "other_drawing_min_events") or 100)
+    sensitive_min = max(1, policy_int(policy, "sensitive_name_min_events") or 1000)
+    query = f"""
+SELECT
+    client_name,
+    client_ip,
+    person_label,
+    company_label,
+    department_label,
+    channel_group,
+    object,
+    count() AS count,
+    min(ts) AS event_start,
+    max(ts) AS event_end,
+    groupUniqArray(256)(event_id) AS event_ids
+FROM
+(
+    SELECT
+        event_id,
+        ts,
+        topic,
+        channel,
+        process_name,
+        recipient_relation,
+        file_names,
+        file_exts,
+        reasons,
+        target_domains,
+        targets,
+        recipients,
+        level,
+        file_size,
+        if(company = '' OR company = 'unknown', '未匹配公司', company) AS company_label,
+        if(department = '' OR department = 'unknown', '未匹配部门', department) AS department_label,
+        if(resolved_person != '' AND resolved_person != 'unknown', resolved_person, if(person != '' AND person != 'unknown', person, '未匹配使用人')) AS person_label,
+        client_name,
+        client_ip,
+        {object_expr} AS object,
+        {channel_expr} AS channel_group,
+        {focus_expr} AS focus_signal
+    FROM audit_events
+    WHERE ts >= parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
+      AND ts < parseDateTime64BestEffort({ch_quote(end.isoformat())}, 3)
+)
+WHERE object != '' AND channel_group != '' AND focus_signal
+GROUP BY client_name, client_ip, person_label, company_label, department_label, channel_group, object
+FORMAT JSONEachRow
+"""
+    groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for line in clickhouse_query(config, query).splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        client_name = str(row.get("client_name") or "")
+        client_ip = str(row.get("client_ip") or "")
+        person = str(row.get("person_label") or "未匹配使用人")
+        key = (client_name, client_ip, person)
+        item = groups.setdefault(
+            key,
+            {
+                "client_name": client_name,
+                "client_ip": client_ip,
+                "person": person,
+                "companies": Counter(),
+                "departments": Counter(),
+                "matrix_counts": Counter(),
+                "channels": [],
+                "event_ids": [],
+                "event_start": None,
+                "event_end": None,
+                "event_count": 0,
+                "structure_count": 0,
+                "electrical_count": 0,
+                "three_d_count": 0,
+                "dwg_count": 0,
+                "archive_count": 0,
+                "standard_count": 0,
+                "sensitive_count": 0,
+            },
+        )
+        count = int(row.get("count") or 0)
+        company = str(row.get("company_label") or "未匹配公司")
+        department = str(row.get("department_label") or "未匹配部门")
+        channel = str(row.get("channel_group") or "")
+        bucket = str(row.get("object") or "")
+        if company:
+            item["companies"][company] += count
+        if department:
+            item["departments"][department] += count
+        if channel and bucket:
+            item["matrix_counts"][f"{channel}\u241f{bucket}"] += count
+            if channel not in item["channels"]:
+                item["channels"].append(channel)
+        item["event_count"] += count
+        if bucket == report_gen.CRITICAL_STRUCTURE_LABEL:
+            item["structure_count"] += count
+        if bucket == report_gen.CRITICAL_ELECTRICAL_LABEL:
+            item["electrical_count"] += count
+        if bucket in report_gen.CRITICAL_DESIGN_LABELS:
+            item["standard_count"] += count
+        if bucket == "三维模型":
+            item["three_d_count"] += count
+        if bucket == "DWG二维图纸":
+            item["dwg_count"] += count
+        if bucket == "压缩包":
+            item["archive_count"] += count
+        if bucket == "敏感名称":
+            item["sensitive_count"] += count
+        for event_id in row.get("event_ids") or []:
+            event_text = str(event_id or "")
+            if event_text and event_text not in item["event_ids"]:
+                item["event_ids"].append(event_text)
+        start_ts = parse_ts(row.get("event_start"))
+        end_ts = parse_ts(row.get("event_end"))
+        if start_ts and (item["event_start"] is None or start_ts < item["event_start"]):
+            item["event_start"] = start_ts
+        if end_ts and (item["event_end"] is None or end_ts > item["event_end"]):
+            item["event_end"] = end_ts
+
+    candidates: dict[str, TerminalBehaviorCandidate] = {}
+    for item in groups.values():
+        reason_labels: list[str] = []
+        reason_basis: list[str] = []
+        if int(item["standard_count"] or 0) > 0:
+            reason_labels.append("一级风险：标准图纸流转")
+            reason_basis.append("标准图纸经邮件、IM、外部站点上传或外设拷贝等通道流转。")
+        ordinary_count = int(item["three_d_count"] or 0) + int(item["dwg_count"] or 0)
+        if ordinary_count >= other_drawing_min:
+            reason_labels.append("普通图纸高频流转")
+            reason_basis.append(f"非标准三维模型或 DWG 图纸流转达到 {other_drawing_min} 条阈值。")
+        if int(item["sensitive_count"] or 0) >= sensitive_min:
+            reason_labels.append("敏感文件高频流转")
+            reason_basis.append(f"敏感名称文件流转达到 {sensitive_min} 条阈值。")
+        if not reason_labels:
+            continue
+        event_start = item["event_start"] or start
+        event_end = item["event_end"] or event_start
+        company = item["companies"].most_common(1)[0][0] if item["companies"] else "未匹配公司"
+        department = item["departments"].most_common(1)[0][0] if item["departments"] else "未匹配部门"
+        anomaly_type = "；".join(reason_labels)
+        candidate_id = candidate_hash([event_start.date().isoformat(), item["client_name"], item["client_ip"], item["person"], anomaly_type])
+        candidates[candidate_id] = TerminalBehaviorCandidate(
+            candidate_id=candidate_id,
+            event_date=event_start.date(),
+            event_start=event_start,
+            event_end=event_end,
+            anomaly_type=anomaly_type,
+            company=company,
+            department=department,
+            person=str(item["person"] or "未匹配使用人"),
+            client_name=str(item["client_name"] or ""),
+            client_ip=str(item["client_ip"] or ""),
+            client_mac="-",
+            event_count=int(item["event_count"] or 0),
+            structure_count=int(item["structure_count"] or 0),
+            electrical_count=int(item["electrical_count"] or 0),
+            three_d_count=int(item["three_d_count"] or 0),
+            dwg_count=int(item["dwg_count"] or 0),
+            archive_count=int(item["archive_count"] or 0),
+            channels=list(item["channels"])[:8],
+            event_ids=list(item["event_ids"])[:256],
+            matrix_counts=dict(item["matrix_counts"]),
+            evidence_events=[],
+            basis="；".join(reason_basis),
+        )
+    result = sorted(
+        candidates.values(),
+        key=lambda candidate: (
+            0 if candidate.anomaly_type.startswith("一级风险") else 1,
+            1 if candidate.anomaly_type.startswith("普通图纸") else 2 if candidate.anomaly_type.startswith("敏感文件") else 3,
+            -candidate.event_count,
+            -(candidate.structure_count + candidate.electrical_count),
+            -candidate.three_d_count,
+            -candidate.dwg_count,
+            candidate.company,
+            candidate.department,
+        ),
+    )
+    return result[: policy_int(policy, "candidate_limit")]
+
+
 def reviews_from_rows(rows: Iterable[dict[str, Any]]) -> list[TerminalBehaviorReview]:
     result: list[TerminalBehaviorReview] = []
     for row in rows:

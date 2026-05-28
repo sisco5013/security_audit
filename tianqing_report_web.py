@@ -25,7 +25,7 @@ import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1204,17 +1204,14 @@ def _fallback_tianqing_management_metrics(text: str) -> dict[str, Any]:
 
 def _live_decrypt_management_metrics(config: AppConfig, start: datetime, end: datetime) -> dict[str, Any] | None:
     try:
-        rows = live_decrypt_summary_rows(config, start, end)
+        counts = live_decrypt_summary_counts(config, start, end)
     except Exception:
         return None
-    object_counts = live_decrypt_object_counts(rows)
-    structure = int(object_counts.get("结构", 0) or 0)
-    electrical = int(object_counts.get("电气", 0) or 0)
     return {
-        "records": len(rows),
-        "standard": structure + electrical,
-        "structure": structure,
-        "electrical": electrical,
+        "records": int(counts.get("records") or 0),
+        "standard": int(counts.get("standard") or 0),
+        "structure": int(counts.get("structure") or 0),
+        "electrical": int(counts.get("electrical") or 0),
     }
 
 
@@ -4574,6 +4571,197 @@ FORMAT JSONEachRow
     )
 
 
+def live_decrypt_sql_or(conditions: Iterable[str]) -> str:
+    values = [condition for condition in conditions if condition]
+    if not values:
+        return "0"
+    if len(values) == 1:
+        return values[0]
+    return "(" + " OR ".join(f"({condition})" for condition in values) + ")"
+
+
+def live_decrypt_ext_has(exts: Iterable[str], ext_expr: str = "lowerUTF8(file_ext)") -> str:
+    values = sorted({str(ext or "").strip().lower().lstrip(".") for ext in exts if str(ext or "").strip()})
+    if not values:
+        return "0"
+    return f"has({report_gen.clickhouse_array_literal(values)}, {ext_expr})"
+
+
+def live_decrypt_pattern_conditions(label: str, base_expr: str) -> list[str]:
+    conditions: list[str] = []
+    for pattern in report_gen.CRITICAL_DESIGN_PATTERNS:
+        if str(pattern.get("label") or "").strip() != label:
+            continue
+        regex = str(pattern.get("regex") or "").strip()
+        if not regex:
+            continue
+        conditions.append(f"match({base_expr}, {decrypt_records.clickhouse_quote(regex.lower())})")
+    return conditions
+
+
+def live_decrypt_summary_counts(config: AppConfig, start: datetime, end: datetime) -> dict[str, int]:
+    if not config.use_clickhouse:
+        return {"records": 0, "standard": 0, "structure": 0, "electrical": 0, "three_d": 0, "dwg": 0, "archive": 0}
+    args, _tz, _internal_domains = live_decrypt_policy_context(config)
+    base_expr = "replaceRegexpOne(lowerUTF8(file_name), '^.*[\\\\\\\\/]', '')"
+    ext_expr = "lowerUTF8(file_ext)"
+    structure_direct = live_decrypt_sql_or(live_decrypt_pattern_conditions(report_gen.CRITICAL_STRUCTURE_LABEL, base_expr))
+    electrical_direct = live_decrypt_sql_or(live_decrypt_pattern_conditions(report_gen.CRITICAL_ELECTRICAL_LABEL, base_expr))
+    yb_direct = live_decrypt_sql_or(live_decrypt_pattern_conditions(getattr(report_gen, "CRITICAL_YB_STANDARD_LABEL", "油变标准方案"), base_expr))
+    two_d_ext = live_decrypt_ext_has(report_gen.CONTROLLED_2D_CAD_EXTS, ext_expr)
+    three_d_ext = live_decrypt_ext_has(report_gen.CONTROLLED_3D_EXTS, ext_expr)
+    archive_ext = live_decrypt_ext_has(report_gen.ARCHIVE_EXTS, ext_expr)
+    standard_cond = f"(({structure_direct}) OR ({electrical_direct}) OR ({yb_direct}))"
+    structure_bucket = f"(({structure_direct}) OR ((NOT ({structure_direct})) AND (NOT ({electrical_direct})) AND ({yb_direct}) AND (NOT ({two_d_ext}))))"
+    electrical_bucket = f"((NOT ({structure_direct})) AND (({electrical_direct}) OR ((NOT ({electrical_direct})) AND ({yb_direct}) AND ({two_d_ext}))))"
+    time_filter = (
+        f"isNotNull(apply_time) "
+        f"AND apply_time >= parseDateTime64BestEffort({decrypt_records.clickhouse_quote(start.isoformat())}, 3) "
+        f"AND apply_time < parseDateTime64BestEffort({decrypt_records.clickhouse_quote(end.isoformat())}, 3)"
+    )
+    query = f"""
+SELECT
+  count() AS records,
+  countIf({standard_cond}) AS standard,
+  countIf({structure_bucket}) AS structure,
+  countIf({electrical_bucket}) AS electrical,
+  countIf((NOT ({standard_cond})) AND ({three_d_ext})) AS three_d,
+  countIf((NOT ({standard_cond})) AND ({two_d_ext})) AS dwg,
+  countIf({archive_ext}) AS archive
+FROM decrypt_records FINAL
+WHERE {time_filter}
+FORMAT JSONEachRow
+"""
+    try:
+        text = decrypt_records.clickhouse_request(args, query).decode("utf-8", errors="replace")
+        row = json.loads(text.splitlines()[0]) if text.strip() else {}
+    except Exception:
+        return {"records": 0, "standard": 0, "structure": 0, "electrical": 0, "three_d": 0, "dwg": 0, "archive": 0}
+    return {
+        "records": int(row.get("records") or 0),
+        "standard": int(row.get("standard") or 0),
+        "structure": int(row.get("structure") or 0),
+        "electrical": int(row.get("electrical") or 0),
+        "three_d": int(row.get("three_d") or 0),
+        "dwg": int(row.get("dwg") or 0),
+        "archive": int(row.get("archive") or 0),
+    }
+
+
+def live_decrypt_trend_summary_html(config: AppConfig, start: datetime, end: datetime) -> str:
+    if not config.use_clickhouse:
+        return ""
+    tz = local_tz(config.timezone)
+    trend_end = end.astimezone(tz).date()
+    days = [trend_end - timedelta(days=offset) for offset in range(29, -1, -1)]
+    day_index = {item: idx for idx, item in enumerate(days)}
+    args, _tz, _internal_domains = live_decrypt_policy_context(config)
+    base_expr = "replaceRegexpOne(lowerUTF8(file_name), '^.*[\\\\\\\\/]', '')"
+    ext_expr = "lowerUTF8(file_ext)"
+    structure_direct = live_decrypt_sql_or(live_decrypt_pattern_conditions(report_gen.CRITICAL_STRUCTURE_LABEL, base_expr))
+    electrical_direct = live_decrypt_sql_or(live_decrypt_pattern_conditions(report_gen.CRITICAL_ELECTRICAL_LABEL, base_expr))
+    yb_direct = live_decrypt_sql_or(live_decrypt_pattern_conditions(getattr(report_gen, "CRITICAL_YB_STANDARD_LABEL", "油变标准方案"), base_expr))
+    two_d_ext = live_decrypt_ext_has(report_gen.CONTROLLED_2D_CAD_EXTS, ext_expr)
+    three_d_ext = live_decrypt_ext_has(report_gen.CONTROLLED_3D_EXTS, ext_expr)
+    archive_ext = live_decrypt_ext_has(report_gen.ARCHIVE_EXTS, ext_expr)
+    standard_cond = f"(({structure_direct}) OR ({electrical_direct}) OR ({yb_direct}))"
+    structure_bucket = f"(({structure_direct}) OR ((NOT ({structure_direct})) AND (NOT ({electrical_direct})) AND ({yb_direct}) AND (NOT ({two_d_ext}))))"
+    electrical_bucket = f"((NOT ({structure_direct})) AND (({electrical_direct}) OR ((NOT ({electrical_direct})) AND ({yb_direct}) AND ({two_d_ext}))))"
+    bucket_expr = (
+        "multiIf("
+        f"{structure_bucket}, '结构', "
+        f"{electrical_bucket}, '电气', "
+        f"(NOT ({standard_cond})) AND ({three_d_ext}), '三维模型', "
+        f"(NOT ({standard_cond})) AND ({two_d_ext}), 'DWG图纸', "
+        f"{archive_ext}, '压缩包', "
+        "'其他')"
+    )
+    trend_start = datetime.combine(days[0], datetime.min.time(), tz)
+    query = f"""
+SELECT
+  toDate(toTimeZone(apply_time, {decrypt_records.clickhouse_quote(config.timezone)})) AS day,
+  {bucket_expr} AS bucket,
+  raw_org_path,
+  raw_company,
+  raw_department,
+  count() AS count
+FROM decrypt_records FINAL
+WHERE isNotNull(apply_time)
+  AND apply_time >= parseDateTime64BestEffort({decrypt_records.clickhouse_quote(trend_start.isoformat())}, 3)
+  AND apply_time < parseDateTime64BestEffort({decrypt_records.clickhouse_quote(end.isoformat())}, 3)
+GROUP BY day, bucket, raw_org_path, raw_company, raw_department
+FORMAT JSONEachRow
+"""
+    object_names = ["结构", "电气", "三维模型", "DWG图纸"]
+    object_counts: dict[str, list[int]] = {name: [0 for _ in days] for name in object_names}
+    company_daily: dict[str, list[int]] = {}
+    company_totals: Counter = Counter()
+    aliases = decrypt_records.normalize_aliases(load_policy_doc(config))
+    try:
+        rows = [json.loads(line) for line in decrypt_records.clickhouse_request(args, query).decode("utf-8", errors="replace").splitlines() if line.strip()]
+    except Exception:
+        return ""
+    for row in rows:
+        try:
+            day_value = date.fromisoformat(str(row.get("day") or ""))
+        except ValueError:
+            continue
+        idx = day_index.get(day_value)
+        if idx is None:
+            continue
+        count = int(row.get("count") or 0)
+        bucket = str(row.get("bucket") or "")
+        if bucket in object_counts:
+            object_counts[bucket][idx] += count
+        company, _department, matched = decrypt_records.resolve_org_alias(
+            str(row.get("raw_org_path") or ""),
+            str(row.get("raw_company") or ""),
+            str(row.get("raw_department") or ""),
+            aliases,
+        )
+        company = str(company or "").strip()
+        if matched and company and not company.startswith("未"):
+            company_daily.setdefault(company, [0 for _ in days])[idx] += count
+            company_totals[company] += count
+    labels = [item.strftime("%m-%d") for item in days]
+    object_colors = {
+        "结构": "#7c3aed",
+        "电气": "#b45309",
+        "三维模型": "#be123c",
+        "DWG图纸": "#2563eb",
+    }
+    object_series = [
+        {"label": name, "current": values, "current_total": sum(values), "color": object_colors[name]}
+        for name, values in object_counts.items()
+        if sum(values) > 0
+    ]
+    company_series = [
+        {
+            "label": company,
+            "current": company_daily.get(company, [0 for _ in days]),
+            "current_total": sum(company_daily.get(company, [])),
+            "color": report_gen.TREND_COLORS[idx % len(report_gen.TREND_COLORS)],
+        }
+        for idx, (company, _total) in enumerate(company_totals.most_common(5))
+    ]
+    if not object_series and not company_series:
+        return ""
+    object_chart = report_gen.trend_chart_html("解密对象趋势", object_series, labels, "近30天", "按天", include_small_multiples=False).replace(
+        'class="trend-chart-card"', 'class="trend-chart-card decrypt-trend-card"', 1
+    )
+    organization_chart = report_gen.trend_chart_html("解密组织 Top5 趋势", company_series, labels, "近30天", "按近30天公司 Top5", include_small_multiples=False).replace(
+        'class="trend-chart-card"', 'class="trend-chart-card decrypt-trend-card"', 1
+    )
+    return f"""
+      <div class="decrypt-trend-panel">
+        <div class="decrypt-trend-row" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:stretch;">
+          {object_chart}
+          {organization_chart}
+        </div>
+      </div>
+"""
+
+
 def live_decrypt_bucket_for_row(row: dict[str, Any]) -> str:
     file_name = str(row.get("file_name") or "")
     file_ext = str(row.get("file_ext") or report_gen.extension(file_name)).lower()
@@ -4639,16 +4827,14 @@ def live_decrypt_fragment(config: AppConfig, start: datetime, end: datetime) -> 
 
 
 def live_decrypt_summary_fragment(config: AppConfig, start: datetime, end: datetime) -> bytes:
-    rows = live_decrypt_summary_rows(config, start, end)
-    live_decrypt_schedule_warm_cache(config, start, end)
+    counts = live_decrypt_summary_counts(config, start, end)
     links = live_decrypt_links(start, end)
-    counts = live_decrypt_object_counts(rows)
-    structure = int(counts.get("结构", 0) or 0)
-    electrical = int(counts.get("电气", 0) or 0)
-    standard = structure + electrical
-    three_d = int(counts.get("三维模型", 0) or 0)
-    dwg = int(counts.get("DWG图纸", 0) or 0)
-    archive = int(counts.get("压缩包", 0) or 0)
+    structure = int(counts.get("structure", 0) or 0)
+    electrical = int(counts.get("electrical", 0) or 0)
+    standard = int(counts.get("standard", 0) or 0)
+    three_d = int(counts.get("three_d", 0) or 0)
+    dwg = int(counts.get("dwg", 0) or 0)
+    archive = int(counts.get("archive", 0) or 0)
     conclusions = [
         f"本期一级风险为标准图纸解密 {standard} 条，其中结构 {structure} 条、电气 {electrical} 条；该口径与下方结构/电气卡片及标准图纸明细一致。",
         f"普通对象作为辅助复核：三维模型 {three_d} 条、DWG图纸 {dwg} 条、压缩包 {archive} 条；不计入本模块一级风险汇总。",
@@ -4692,7 +4878,8 @@ def live_decrypt_summary_fragment(config: AppConfig, start: datetime, end: datet
         card("DWG图纸", dwg, "DWG 图纸解密记录", links.get("dwg"), "slate"),
         card("发现后续流转", "计算中", "后续流转链路正在后台计算", links.get("linked"), "red"),
     ]
-    return (overview + f'<div class="decrypt-card-grid">{"".join(cards)}</div>').encode("utf-8")
+    trend_html = live_decrypt_trend_summary_html(config, start, end)
+    return (overview + f'<div class="decrypt-card-grid">{"".join(cards)}</div>' + trend_html).encode("utf-8")
 
 
 def filter_live_decrypt_records(
@@ -4920,11 +5107,16 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
       }}
       var freshCards = wrapper.querySelector(".decrypt-card-grid");
       var oldCards = section.querySelector(".decrypt-card-grid");
-      if (freshCards && oldCards) {{
-        oldCards.replaceWith(freshCards);
-      }}
-      if (freshOverview || freshCards) {{
-        section.setAttribute("data-live-decrypt-state", "summary");
+	      if (freshCards && oldCards) {{
+	        oldCards.replaceWith(freshCards);
+	      }}
+	      var freshTrend = wrapper.querySelector(".decrypt-trend-panel");
+	      var oldTrend = section.querySelector(".decrypt-trend-panel");
+	      if (freshTrend && oldTrend) {{
+	        oldTrend.replaceWith(freshTrend);
+	      }}
+	      if (freshOverview || freshCards) {{
+	        section.setAttribute("data-live-decrypt-state", "summary");
         if (status && status.parentNode) {{
           status.textContent = "一级风险数字已刷新，趋势和公司矩阵正在继续计算";
         }}
@@ -4968,22 +5160,20 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
         }}
       }}
     }}
-    fetch(summaryUrl, {{credentials: "same-origin", cache: "no-store"}})
-      .then(function(resp) {{
+    function fetchHtml(url) {{
+      return fetch(url, {{credentials: "same-origin", cache: "no-store"}})
+        .then(function(resp) {{
         if (!resp.ok) throw new Error("HTTP " + resp.status);
         return resp.text();
-      }})
-      .then(applySummary)
-      .catch(showError);
-    fetch(detailUrl, {{credentials: "same-origin", cache: "no-store"}})
-      .then(function(resp) {{
-        if (!resp.ok) throw new Error("HTTP " + resp.status);
-        return resp.text();
+      }});
+    }}
+    fetchHtml(summaryUrl)
+      .then(function(html) {{
+        applySummary(html);
+        return fetchHtml(detailUrl);
       }})
       .then(applyDetail)
-      .catch(function(err) {{
-        showError(err);
-      }});
+      .catch(showError);
   }}
   if (document.readyState === "loading") {{
     document.addEventListener("DOMContentLoaded", loadLiveDecrypt);
@@ -6618,9 +6808,22 @@ def terminal_check_work_area_html(
     reviews: list[terminal_review.TerminalBehaviorReview],
     start: datetime,
     end: datetime,
+    summary_only: bool = False,
 ) -> str:
+    wrapper_attr = ' data-terminal-check-summary="1"' if summary_only else ' data-terminal-check-ready="1"'
+    save_button = (
+        '<button class="primary" type="button" disabled title="证据明细正在后台补齐，完成后可保存复核结果">证据补齐后可保存</button>'
+        if summary_only
+        else '<button class="primary" type="submit">保存核查结果</button>'
+    )
+    note = (
+        "矩阵数字已按 ClickHouse 聚合快速刷新；证据明细和保存能力正在后台补齐。"
+        if summary_only
+        else "矩阵口径与报告首页终端风险保持一致；点击“核查状态”切换状态，点击“核查结果”填写结论。"
+    )
+    saved_note = "已保存记录已刷新；候选证据补齐完成后可下钻查看。" if summary_only else "周报按事件发生时间自动汇总本周期已进入报告的核查记录。"
     return f"""
-<div data-terminal-check-ready="1">
+<div{wrapper_attr}>
   {terminal_check_metrics_html(candidates, reviews)}
   <form class="terminal-check-review-form" method="post" action="/terminal-check/review">
     <input type="hidden" name="start" value="{esc(datetime_input_value(start))}">
@@ -6629,16 +6832,16 @@ def terminal_check_work_area_html(
       <div class="terminal-check-section-head">
         <div>
           <h2>候选异常终端</h2>
-          <p class="muted">矩阵口径与报告首页终端风险保持一致；点击“核查状态”切换状态，点击“核查结果”填写结论。</p>
+          <p class="muted">{esc(note)}</p>
         </div>
-        <div class="actions"><button class="primary" type="submit">保存核查结果</button></div>
+        <div class="actions">{save_button}</div>
       </div>
       {terminal_candidates_table(candidates, start, end)}
     </section>
   </form>
   <section>
     <h2>已保存核查记录</h2>
-    <p class="muted">周报按事件发生时间自动汇总本周期已进入报告的核查记录。</p>
+    <p class="muted">{esc(saved_note)}</p>
     {terminal_reviews_table(reviews)}
   </section>
 </div>
@@ -6698,8 +6901,14 @@ def terminal_check_fragment_html(config: AppConfig, start: datetime, end: dateti
         return terminal_check_work_area_html(payload.get("candidates") or [], payload.get("reviews") or [], start, end).encode("utf-8")
     if entry and entry.get("status") == "error":
         return terminal_check_error_html(str(entry.get("error") or "候选生成失败")).encode("utf-8")
+    try:
+        candidates = terminal_review.generate_candidate_summaries(config, policy_doc, start, end)
+        reviews = terminal_review.fetch_reviews(config, start, end, include_all_status=True)
+        html_text = terminal_check_work_area_html(candidates, reviews, start, end, summary_only=True)
+    except Exception:
+        html_text = terminal_check_loading_html(start, end)
     terminal_check_schedule_warm_cache(config, policy_doc, start, end)
-    return terminal_check_loading_html(start, end).encode("utf-8")
+    return html_text.encode("utf-8")
 
 
 def terminal_check_loader_script(start: datetime, end: datetime) -> str:
@@ -6726,7 +6935,7 @@ def terminal_check_loader_script(start: datetime, end: datetime) -> str:
         }})
         .then(function (html) {{
           target.innerHTML = html;
-          if (target.querySelector("[data-terminal-check-loading='1']")) {{
+          if (target.querySelector("[data-terminal-check-loading='1'],[data-terminal-check-summary='1']")) {{
             timer = window.setTimeout(load, 2000);
           }}
         }})
@@ -6734,7 +6943,14 @@ def terminal_check_loader_script(start: datetime, end: datetime) -> str:
           renderError(error && error.message ? error.message : "加载失败");
         }});
     }}
-    load();
+    if (target.querySelector("[data-terminal-check-ready='1']")) {{
+      return;
+    }}
+    if (target.querySelector("[data-terminal-check-summary='1']")) {{
+      timer = window.setTimeout(load, 2000);
+    }} else {{
+      load();
+    }}
   }})();
 </script>
 """
@@ -6744,7 +6960,6 @@ def terminal_check_page(config: AppConfig, session: AuthSession, params: dict[st
     params = params or {}
     start, end, preset = terminal_check_period_from_params(config, params)
     policy_doc = load_policy_doc(config)
-    terminal_check_schedule_warm_cache(config, policy_doc, start, end)
     initial_fragment = terminal_check_fragment_html(config, start, end).decode("utf-8")
     body = f"""
     <header>
