@@ -121,7 +121,6 @@ def standard_design_rename_home_html(findings: list[ThreeDRenameFinding], links:
     current_period = sum(1 for finding in findings if finding.in_report_period)
     structure = [finding for finding in findings if finding.critical_design_label == CRITICAL_STRUCTURE_LABEL]
     electrical = [finding for finding in findings if finding.critical_design_label == CRITICAL_ELECTRICAL_LABEL]
-    yb_standard = [finding for finding in findings if finding.critical_design_label == CRITICAL_YB_STANDARD_LABEL]
     channel_counts = Counter((finding.destination_channel or "未知去向").split("/", 1)[0] for finding in findings)
     top_channel, top_channel_count = ("-", 0)
     if channel_counts:
@@ -133,7 +132,6 @@ def standard_design_rename_home_html(findings: list[ThreeDRenameFinding], links:
         three_d_rename_card_html("预警总数", total, f"标准图纸更名后发现外发/外设，本周期新增 {current_period} 条", links.get("all"), "red"),
         three_d_rename_card_html("结构", len(structure), "结构标准方案更名后外发/外设", links.get("structure"), "violet"),
         three_d_rename_card_html("电气", len(electrical), "电气标准方案更名后外发/外设", links.get("electrical"), "amber"),
-        three_d_rename_card_html("油变", len(yb_standard), "3YB/5YB/8YB 油变标准方案更名后外发/外设", links.get("yb_standard"), "blue"),
         three_d_rename_card_html("主要去向", f"{top_channel} · {top_channel_count}", "按最终可观测去向聚合", links.get("top_channel"), "slate"),
     ]
     return f"""
@@ -263,9 +261,6 @@ def build_tianqing_rename_tracking_result(
     standard_rename_electrical = [
         finding for finding in standard_rename_findings if finding.critical_design_label == CRITICAL_ELECTRICAL_LABEL
     ]
-    standard_rename_yb = [
-        finding for finding in standard_rename_findings if finding.critical_design_label == CRITICAL_YB_STANDARD_LABEL
-    ]
     standard_channel_counts = Counter((finding.destination_channel or "未知去向").split("/", 1)[0] for finding in standard_rename_findings)
     standard_top_channel = standard_channel_counts.most_common(1)[0][0] if standard_channel_counts else ""
     standard_rename_top_channel = [
@@ -283,7 +278,6 @@ def build_tianqing_rename_tracking_result(
         "all": sidecar_page_filename(args, "rename-standard", "all"),
         "structure": sidecar_page_filename(args, "rename-standard", "structure"),
         "electrical": sidecar_page_filename(args, "rename-standard", "electrical"),
-        "yb_standard": sidecar_page_filename(args, "rename-standard", "yb-standard"),
         "top_channel": sidecar_page_filename(args, "rename-standard", "top-channel"),
     }
     sidecar_pages = {
@@ -343,7 +337,7 @@ def build_tianqing_rename_tracking_result(
             primary_metric_note="本页按最高频三维后缀伪装变化过滤",
         ),
         standard_links["all"]: build_three_d_rename_detail_page(
-            "油变标准方案更名外发预警",
+            "标准图纸更名外发预警",
             standard_rename_findings,
             tz,
             report_period,
@@ -374,17 +368,6 @@ def build_tianqing_rename_tracking_result(
             context_label="电气更名外发",
             section_title="电气标准图纸更名外发预警清单",
             primary_metric_note="本页仅展示电气标准图纸更名后外发或外设拷贝记录",
-        ),
-        standard_links["yb_standard"]: build_three_d_rename_detail_page(
-            "标准图纸更名外发预警",
-            standard_rename_yb,
-            tz,
-            report_period,
-            source_label,
-            "3YB/5YB/8YB 油变标准方案更名后追踪到外发、上传或外设拷贝的记录。",
-            context_label="标准更名外发",
-            section_title="油变标准方案更名外发预警清单",
-            primary_metric_note="本页仅展示 3YB/5YB/8YB 油变标准方案更名后外发或外设拷贝记录",
         ),
         standard_links["top_channel"]: build_three_d_rename_detail_page(
             f"标准图纸更名外发主要去向：{standard_top_channel or '-'}",
