@@ -5285,9 +5285,43 @@ def terminal_check_css() -> str:
   table.terminal-check-table td.compact { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .terminal-check-status { min-width: 132px; }
   .terminal-check-notes { min-width: 180px; min-height: 38px; }
+  .terminal-check-review-form {
+    display: block;
+    width: 100%;
+  }
+  .terminal-check-section {
+    margin-top: 18px;
+  }
+  .terminal-check-section-head {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 16px;
+    width: 100%;
+    margin: 0 0 12px;
+    border-bottom: 1px solid #e6edf5;
+    padding-bottom: 12px;
+  }
+  .terminal-check-section-head h2 {
+    margin: 0;
+    font-size: 19px;
+    font-weight: 860;
+    color: #122033;
+  }
+  .terminal-check-section-head p {
+    margin: 5px 0 0;
+  }
+  .terminal-check-section-head .actions {
+    margin: 0;
+    flex: 0 0 auto;
+  }
+  .terminal-check-review-form .table-wrap {
+    width: 100%;
+  }
   @media (max-width: 980px) {
     .terminal-check-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .terminal-check-toolbar form { display: grid; grid-template-columns: 1fr; width: 100%; }
+    .terminal-check-section-head { align-items: flex-start; flex-direction: column; }
   }
 </style>
 """
@@ -5435,17 +5469,19 @@ def terminal_check_page(config: AppConfig, session: AuthSession, params: dict[st
       {f'<p class="badge off danger">{esc(error)}</p>' if error else ''}
       {terminal_check_metrics_html(candidates, reviews)}
     </section>
-    <form method="post" action="/terminal-check/review">
+    <form class="terminal-check-review-form" method="post" action="/terminal-check/review">
       <input type="hidden" name="start" value="{esc(datetime_input_value(start))}">
       <input type="hidden" name="end" value="{esc(datetime_input_value(end))}">
-      <div class="settings-toolbar">
-        <div>
-          <h2>候选异常终端</h2>
-          <p class="muted">按终端、使用人、日期和异常类型聚合；勾选后保存为人工核查记录。</p>
+      <section class="terminal-check-section">
+        <div class="terminal-check-section-head">
+          <div>
+            <h2>候选异常终端</h2>
+            <p class="muted">按终端、使用人、日期和异常类型聚合；勾选后保存为人工核查记录。</p>
+          </div>
+          <div class="actions"><button class="primary" type="submit">保存选中核查记录</button></div>
         </div>
-        <div class="actions"><button class="primary" type="submit">保存选中核查记录</button></div>
-      </div>
-      {terminal_candidates_table(candidates, start, end)}
+        {terminal_candidates_table(candidates, start, end)}
+      </section>
     </form>
     <section>
       <h2>已保存核查记录</h2>
