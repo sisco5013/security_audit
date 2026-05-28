@@ -1407,38 +1407,6 @@ def report_period_for_static_path(config: AppConfig, target: Path) -> tuple[date
     return None
 
 
-def inject_terminal_behavior_review_summary(data: bytes, config: AppConfig, target: Path) -> bytes:
-    text = data.decode("utf-8", errors="replace")
-    if 'id="decrypt-audit"' not in text and 'id="tianqing-audit"' not in text:
-        return data
-    period = report_period_for_html_or_path(config, target, data)
-    if not period:
-        return data
-    start, end = period
-    block = terminal_review.report_summary_html(config, start, end)
-    if "terminal-review-summary-style" not in text:
-        style = terminal_review.report_summary_style()
-        if re.search(r"</head>", text, flags=re.IGNORECASE):
-            text = re.sub(r"</head>", style + r"\g<0>", text, count=1, flags=re.IGNORECASE)
-        else:
-            text = style + text
-    marker = re.search(r'<section\b[^>]*\bid="(?:decrypt-audit|tianqing-audit)"', text, flags=re.IGNORECASE)
-    summary_marker = re.search(r'<section\b[^>]*\bid="global-management-summary"[\s\S]*?</section>', text, flags=re.IGNORECASE)
-    existing_match = re.search(
-        r'<section\b[^>]*\bid="terminal-behavior-review-summary"[\s\S]*?(?=<section\b[^>]*\bid="(?:decrypt-audit|tianqing-audit|plm-login-audit)"|<footer\b|</main>)',
-        text,
-        flags=re.IGNORECASE,
-    )
-    if existing_match:
-        text = text[: existing_match.start()] + block + "\n" + text[existing_match.end() :]
-        return text.encode("utf-8")
-    insert_at = summary_marker.end() if summary_marker else (marker.start() if marker else -1)
-    if insert_at < 0:
-        return data
-    text = text[:insert_at] + "\n" + block + "\n" + text[insert_at:]
-    return text.encode("utf-8")
-
-
 def archive_dropdown_label(entry: dict[str, Any]) -> str:
     period = str(entry.get("period") or "报告")
     report_range = str(entry.get("report_range") or "").strip()
@@ -9115,7 +9083,6 @@ class ReportHandler(BaseHTTPRequestHandler):
             data = inject_report_navigation_patch(data, self.config, target)
             data = inject_top_risk_definition(data)
             data = inject_global_management_summary(data, self.config, target)
-            data = inject_terminal_behavior_review_summary(data, self.config, target)
             data = inject_home_history_dropdown(data, self.config, session)
             data = inject_temporary_report_cleanup(data, self.config, target)
             path = unquote(request_path.split("?", 1)[0].split("#", 1)[0])
