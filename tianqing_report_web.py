@@ -1284,17 +1284,17 @@ def inject_global_management_summary(data: bytes, config: AppConfig | None = Non
     marker_match = re.search(r'<section\b[^>]*\bid="(?:decrypt-audit|tianqing-audit)"', text, flags=re.IGNORECASE)
     if not existing_match and not marker_match:
         return data
+    if existing_match:
+        text = text[: existing_match.start()] + block + "\n" + text[existing_match.end() :]
+    else:
+        idx = marker_match.start()
+        text = text[:idx] + block + "\n" + text[idx:]
     if "global-management-summary-style" not in text:
         style = global_management_summary_style()
         if re.search(r"</head>", text, flags=re.IGNORECASE):
             text = re.sub(r"</head>", style + r"\g<0>", text, count=1, flags=re.IGNORECASE)
         else:
             text = style + text
-    if existing_match:
-        text = text[: existing_match.start()] + block + "\n" + text[existing_match.end() :]
-    else:
-        idx = marker_match.start()
-        text = text[:idx] + block + "\n" + text[idx:]
     return text.encode("utf-8")
 
 
