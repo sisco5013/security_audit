@@ -79,6 +79,8 @@ DEFAULT_REVIEW_POLICY: dict[str, Any] = {
     "baseline_days": 90,
     "baseline_multiplier": 5,
     "baseline_min_events": 30,
+    "top_terminal_limit": 10,
+    "top_terminal_min_events": 100,
     "candidate_limit": 300,
 }
 DEFAULT_THREE_D_EXTS = {"prt", "asm", "sldasm", "sldprt", "step"}
@@ -288,6 +290,8 @@ def candidate_scope_event(event: dict[str, Any]) -> bool:
     relation = str(event.get("recipient_relation") or "").strip().lower()
     if channel == "内部系统上传" or "内部系统上传" in reasons:
         return False
+    if channel == "文件重命名" or "文件重命名" in reasons:
+        return False
     if relation == "internal":
         return False
     return True
@@ -322,6 +326,11 @@ def significant_event(event: dict[str, Any], three_d: set[str], two_d: set[str],
     return bool(counts["structure"] or counts["electrical"] or counts["three_d"] or counts["dwg"] or counts["archive"] or counts["sensitive"])
 
 
+def primary_risk_event(event: dict[str, Any], three_d: set[str], two_d: set[str], archives: set[str], patterns: list[tuple[str, re.Pattern[str]]]) -> bool:
+    counts = event_object_counts(event, three_d, two_d, archives, patterns)
+    return bool(counts["structure"] or counts["electrical"])
+
+
 def fetch_audit_events(config: Any, start: datetime, end: datetime, policy_doc: dict[str, Any]) -> list[dict[str, Any]]:
     three_d, two_d, archives, _patterns = policy_exts(policy_doc)
     signal_exts = sorted(three_d | two_d | archives)
@@ -338,7 +347,9 @@ WHERE ts >= parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
   AND length(file_names) > 0
   AND recipient_relation != 'internal'
   AND channel != '内部系统上传'
+  AND channel != '文件重命名'
   AND NOT has(reasons, '内部系统上传')
+  AND NOT has(reasons, '文件重命名')
   AND (
       hasAny(file_exts, {ch_array(signal_exts)})
       OR hasAny(reasons, ['外设拷贝','外部站点上传','外部上传/下载地址','个人邮箱域名','外部收件域名','网盘/高风险外联目标'])
@@ -395,7 +406,9 @@ WHERE ts >= parseDateTime64BestEffort({ch_quote(baseline_start.isoformat())}, 3)
   AND length(file_names) > 0
   AND recipient_relation != 'internal'
   AND channel != '内部系统上传'
+  AND channel != '文件重命名'
   AND NOT has(reasons, '内部系统上传')
+  AND NOT has(reasons, '文件重命名')
   AND (hasAny(file_exts, {ch_array(signal_exts)}) OR hasAny(reasons, ['外设拷贝','外部站点上传','外部上传/下载地址','个人邮箱域名','外部收件域名','网盘/高风险外联目标']) OR level = 'HIGH')
 GROUP BY client_name, client_ip
 FORMAT JSONEachRow
@@ -498,68 +511,38 @@ def generate_candidates(config: Any, policy_doc: dict[str, Any], start: datetime
     events = fetch_audit_events(config, start, end, policy_doc)
     three_d, two_d, archives, patterns = policy_exts(policy_doc)
     mac_map = fetch_mac_map(config)
-    baseline = baseline_counts(config, start, policy_doc, policy)
-    groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for event in events:
         ts = event.get("parsed_ts")
         if not ts:
             continue
-        key = (ts.date().isoformat(), str(event.get("client_name") or ""), str(event.get("client_ip") or ""), str(event.get("resolved_person") or event.get("person") or ""))
+        key = (str(event.get("client_name") or ""), str(event.get("client_ip") or ""), str(event.get("resolved_person") or event.get("person") or ""))
         groups[key].append(event)
     candidates: dict[str, TerminalBehaviorCandidate] = {}
-    for (_day, client_name, client_ip, _person), group in groups.items():
+    significant_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for key, group in groups.items():
         significant = [event for event in group if significant_event(event, three_d, two_d, archives, patterns)]
         if not significant:
             continue
-        design_events = [
-            event
-            for event in significant
-            if event_object_counts(event, three_d, two_d, archives, patterns)["structure"]
-            or event_object_counts(event, three_d, two_d, archives, patterns)["electrical"]
-            or event_object_counts(event, three_d, two_d, archives, patterns)["three_d"]
-            or event_object_counts(event, three_d, two_d, archives, patterns)["dwg"]
-        ]
-        periph_design = [event for event in design_events if display_channel(event) == "外设拷贝"]
-        if len(periph_design) >= policy_int(policy, "peripheral_design_daily") or len([event for event in group if display_channel(event) == "外设拷贝"]) >= policy_int(policy, "peripheral_total_daily"):
-            candidate = build_candidate("外设批量拷贝设计资料", periph_design or group, policy_doc, mac_map, "同日同终端外设拷贝图纸/压缩包数量超过阈值。")
+        significant_groups[key] = significant
+        primary_events = [event for event in significant if primary_risk_event(event, three_d, two_d, archives, patterns)]
+        if primary_events:
+            candidate = build_candidate("一级风险：标准图纸流转", primary_events, policy_doc, mac_map, "命中结构/电气等标准图纸一级风险对象。")
             candidates[candidate.candidate_id] = candidate
-        if len(design_events) >= policy_int(policy, "core_design_daily"):
-            candidate = build_candidate("核心图纸高频操作", design_events, policy_doc, mac_map, "同日同终端标准图纸、三维模型或 DWG 操作数量超过阈值。")
-            candidates[candidate.candidate_id] = candidate
-        burst = burst_window(significant, policy_int(policy, "burst_window_minutes"), policy_int(policy, "burst_min_events"))
-        if burst:
-            candidate = build_candidate("短时间集中发送", burst, policy_doc, mac_map, "短时间窗口内图纸、压缩包或敏感名称事件数量超过阈值。")
-            candidates[candidate.candidate_id] = candidate
-        channels = {display_channel(event) for event in significant}
-        if len(channels) >= policy_int(policy, "multi_channel_min_channels") and len(significant) >= policy_int(policy, "multi_channel_min_events"):
-            candidate = build_candidate("多通道尝试", significant, policy_doc, mac_map, "同日同终端出现多个外发/拷贝通道。")
-            candidates[candidate.candidate_id] = candidate
-        unique_targets = {target for event in significant for target in event_targets(event)}
-        if len(unique_targets) >= policy_int(policy, "multi_target_min_targets") and len(significant) >= policy_int(policy, "multi_target_min_events"):
-            candidate = build_candidate("多目标扩散", significant, policy_doc, mac_map, "同日同终端接收方、目标或域名数量超过阈值。")
-            candidates[candidate.candidate_id] = candidate
-        unknown_events = [
-            event
-            for event in significant
-            if str(event.get("recipient_relation") or "") == "unknown" and (str(event.get("topic") or "") == "im_audit" or display_channel(event) in {"应用发送", "应用发送/传输"})
-        ]
-        if len(unknown_events) >= policy_int(policy, "unknown_target_min_events"):
-            candidate = build_candidate("未知接收方高频", unknown_events, policy_doc, mac_map, "IM/应用发送接收方缺失且高频命中重点文件对象。")
-            candidates[candidate.candidate_id] = candidate
-        external_mail = [event for event in significant if is_external_mailbox(str(event.get("sender_mailbox") or ""))]
-        if len(external_mail) >= policy_int(policy, "external_mailbox_min_events"):
-            candidate = build_candidate("外部邮箱发件箱异常", external_mail, policy_doc, mac_map, "终端使用非 daqo.com 发件箱发送重点附件。")
-            candidates[candidate.candidate_id] = candidate
-        avg = baseline.get((client_name, client_ip), 0.0)
-        baseline_min = policy_int(policy, "baseline_min_events")
-        multiplier = max(1, policy_int(policy, "baseline_multiplier"))
-        if len(significant) >= baseline_min and (avg <= 0 or len(significant) >= max(baseline_min, int(avg * multiplier))):
-            candidate = build_candidate("相对历史突增", significant, policy_doc, mac_map, f"本日重点事件 {len(significant)} 条，高于近{policy_int(policy, 'baseline_days')}天日均 {avg:.1f}。")
+
+    top_limit = max(1, policy_int(policy, "top_terminal_limit") or 10)
+    top_min_events = max(1, policy_int(policy, "top_terminal_min_events") or 100)
+    top_groups = sorted(significant_groups.values(), key=len, reverse=True)[:top_limit]
+    for significant in top_groups:
+        if len(significant) >= top_min_events:
+            candidate = build_candidate("终端TOP10：明细数量过大", significant, policy_doc, mac_map, f"本报告周期终端重点明细数进入 Top{top_limit}，且达到 {top_min_events} 条阈值。")
             candidates[candidate.candidate_id] = candidate
     result = sorted(
         candidates.values(),
         key=lambda item: (
+            0 if item.anomaly_type.startswith("一级风险") else 1,
             -item.event_count,
+            -(item.structure_count + item.electrical_count),
             -item.three_d_count,
             -item.dwg_count,
             item.company,

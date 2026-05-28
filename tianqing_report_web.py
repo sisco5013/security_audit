@@ -5174,7 +5174,7 @@ def settings_page(config: AppConfig) -> bytes:
       <div class="settings-card">
         <h3>异常终端核查策略</h3>
         <p class="metric">{'启用' if terminal_review.normalized_review_policy(policy_doc).get('enabled', True) else '关闭'}</p>
-        <p class="muted">配置外设批量拷贝、短时间集中发送、多通道、多目标等候选阈值；候选需人工确认后才进报告。</p>
+        <p class="muted">候选只保留一级风险和终端 Top10 中明细数量特别大的终端；候选需人工确认后才进报告。</p>
         <div class="actions"><a class="button primary" href="/settings/terminal-behavior-review">维护核查阈值</a></div>
       </div>
         </div>
@@ -5570,19 +5570,8 @@ def terminal_behavior_policy_page(config: AppConfig, message: str = "", error: s
     doc = load_policy_doc(config)
     policy = terminal_review.normalized_review_policy(doc)
     field_labels = [
-        ("peripheral_design_daily", "外设设计资料日阈值"),
-        ("peripheral_total_daily", "外设总事件日阈值"),
-        ("core_design_daily", "核心图纸日阈值"),
-        ("burst_window_minutes", "集中发送窗口分钟"),
-        ("burst_min_events", "集中发送事件阈值"),
-        ("multi_channel_min_channels", "多通道最少通道数"),
-        ("multi_channel_min_events", "多通道事件阈值"),
-        ("multi_target_min_targets", "多目标最少目标数"),
-        ("multi_target_min_events", "多目标事件阈值"),
-        ("unknown_target_min_events", "未知接收方事件阈值"),
-        ("baseline_days", "历史基线天数"),
-        ("baseline_multiplier", "历史突增倍数"),
-        ("baseline_min_events", "历史突增最低事件数"),
+        ("top_terminal_limit", "终端排行范围"),
+        ("top_terminal_min_events", "TOP终端明细数量阈值"),
         ("candidate_limit", "候选列表上限"),
     ]
     inputs = "".join(
@@ -5591,7 +5580,7 @@ def terminal_behavior_policy_page(config: AppConfig, message: str = "", error: s
     )
     body = f"""
     <header>
-      <div><h1>异常终端核查策略</h1><div class="muted">只影响候选生成，不会自动把候选写入日报/周报。</div></div>
+      <div><h1>异常终端核查策略</h1><div class="muted">候选只取一级风险和终端 Top10 中明细数量特别大的终端；不会自动把候选写入日报/周报。</div></div>
       <div class="actions"><a class="button" href="/settings">策略中心</a><a class="button" href="/terminal-check">核查工作台</a></div>
     </header>
     {f'<p class="badge on">{esc(message)}</p>' if message else ''}
