@@ -5602,12 +5602,46 @@ def terminal_check_prune_cache(now: float | None = None) -> None:
     now = time.time() if now is None else now
     for key, value in list(TERMINAL_CHECK_CACHE.items()):
         if now - float(value.get("created_at") or 0) > TERMINAL_CHECK_CACHE_TTL_SECONDS:
+            event = value.get("event")
             TERMINAL_CHECK_CACHE.pop(key, None)
+            if hasattr(event, "set"):
+                event.set()
     if len(TERMINAL_CHECK_CACHE) <= TERMINAL_CHECK_CACHE_MAX_ENTRIES:
         return
     ordered = sorted(TERMINAL_CHECK_CACHE.items(), key=lambda item: float(item[1].get("created_at") or 0))
-    for key, _value in ordered[: max(0, len(TERMINAL_CHECK_CACHE) - TERMINAL_CHECK_CACHE_MAX_ENTRIES)]:
+    for key, value in ordered[: max(0, len(TERMINAL_CHECK_CACHE) - TERMINAL_CHECK_CACHE_MAX_ENTRIES)]:
+        event = value.get("event")
         TERMINAL_CHECK_CACHE.pop(key, None)
+        if hasattr(event, "set"):
+            event.set()
+
+
+def terminal_check_payload(
+    candidates: list[terminal_review.TerminalBehaviorCandidate],
+    reviews: list[terminal_review.TerminalBehaviorReview],
+) -> dict[str, Any]:
+    attach_terminal_review_state(candidates, reviews)
+    return {
+        "candidates": candidates,
+        "reviews": reviews,
+        "by_id": {candidate.candidate_id: candidate for candidate in candidates},
+    }
+
+
+def terminal_check_build_payload(config: AppConfig, policy_doc: dict[str, Any], start: datetime, end: datetime) -> dict[str, Any]:
+    candidates = terminal_review.generate_candidates(config, policy_doc, start, end)
+    reviews = terminal_review.fetch_reviews(config, start, end, include_all_status=True)
+    return terminal_check_payload(candidates, reviews)
+
+
+def terminal_check_cache_entry(key: tuple[str, str, str]) -> dict[str, Any] | None:
+    now = time.time()
+    with TERMINAL_CHECK_CACHE_LOCK:
+        terminal_check_prune_cache(now)
+        entry = TERMINAL_CHECK_CACHE.get(key)
+        if entry and now - float(entry.get("created_at") or 0) <= TERMINAL_CHECK_CACHE_TTL_SECONDS:
+            return entry
+    return None
 
 
 def terminal_check_put_cache(
@@ -5617,34 +5651,143 @@ def terminal_check_put_cache(
     candidates: list[terminal_review.TerminalBehaviorCandidate],
     reviews: list[terminal_review.TerminalBehaviorReview],
 ) -> dict[str, Any]:
-    attach_terminal_review_state(candidates, reviews)
+    payload = terminal_check_payload(candidates, reviews)
+    key = terminal_check_cache_key(policy_doc, start, end)
     value = {
         "created_at": time.time(),
-        "candidates": candidates,
-        "reviews": reviews,
-        "by_id": {candidate.candidate_id: candidate for candidate in candidates},
+        "status": "ready",
+        "payload": payload,
     }
     with TERMINAL_CHECK_CACHE_LOCK:
         terminal_check_prune_cache(value["created_at"])
-        TERMINAL_CHECK_CACHE[terminal_check_cache_key(policy_doc, start, end)] = value
-    return value
+        existing = TERMINAL_CHECK_CACHE.get(key) or {}
+        event = existing.get("event")
+        if hasattr(event, "set"):
+            value["event"] = event
+        TERMINAL_CHECK_CACHE[key] = value
+        if hasattr(event, "set"):
+            event.set()
+    return payload
 
 
-def terminal_check_cached_data(config: AppConfig, policy_doc: dict[str, Any], start: datetime, end: datetime) -> dict[str, Any]:
+def terminal_check_cached_data(
+    config: AppConfig,
+    policy_doc: dict[str, Any],
+    start: datetime,
+    end: datetime,
+    *,
+    wait_seconds: float = 0,
+    build_if_missing: bool = True,
+) -> dict[str, Any] | None:
     key = terminal_check_cache_key(policy_doc, start, end)
-    now = time.time()
+    entry = terminal_check_cache_entry(key)
+    if entry and entry.get("status") == "ready":
+        return entry.get("payload")
+    if entry and entry.get("status") == "loading":
+        event = entry.get("event")
+        if hasattr(event, "wait") and wait_seconds > 0:
+            event.wait(wait_seconds)
+            entry = terminal_check_cache_entry(key)
+            if entry and entry.get("status") == "ready":
+                return entry.get("payload")
+            if entry and entry.get("status") == "error" and build_if_missing:
+                raise RuntimeError(str(entry.get("error") or "候选生成失败"))
+        return None
+    if not build_if_missing:
+        return None
+
+    event = threading.Event()
     with TERMINAL_CHECK_CACHE_LOCK:
-        terminal_check_prune_cache(now)
-        cached = TERMINAL_CHECK_CACHE.get(key)
-        if cached and now - float(cached.get("created_at") or 0) <= TERMINAL_CHECK_CACHE_TTL_SECONDS:
-            return cached
-    candidates = terminal_review.generate_candidates(config, policy_doc, start, end)
-    reviews = terminal_review.fetch_reviews(config, start, end, include_all_status=True)
-    return terminal_check_put_cache(policy_doc, start, end, candidates, reviews)
+        terminal_check_prune_cache()
+        existing = TERMINAL_CHECK_CACHE.get(key)
+        if existing and existing.get("status") == "ready":
+            return existing.get("payload")
+        if existing and existing.get("status") == "loading":
+            event = existing.get("event")
+            should_build = False
+        else:
+            TERMINAL_CHECK_CACHE[key] = {"created_at": time.time(), "status": "loading", "event": event}
+            should_build = True
+    if not should_build:
+        if hasattr(event, "wait") and wait_seconds > 0:
+            event.wait(wait_seconds)
+            entry = terminal_check_cache_entry(key)
+            if entry and entry.get("status") == "ready":
+                return entry.get("payload")
+            if entry and entry.get("status") == "error":
+                raise RuntimeError(str(entry.get("error") or "候选生成失败"))
+        return None
+
+    try:
+        payload = terminal_check_build_payload(config, policy_doc, start, end)
+    except Exception as exc:
+        with TERMINAL_CHECK_CACHE_LOCK:
+            TERMINAL_CHECK_CACHE[key] = {
+                "created_at": time.time(),
+                "status": "error",
+                "event": event,
+                "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+            }
+            event.set()
+        raise
+    with TERMINAL_CHECK_CACHE_LOCK:
+        TERMINAL_CHECK_CACHE[key] = {
+            "created_at": time.time(),
+            "status": "ready",
+            "event": event,
+            "payload": payload,
+        }
+        event.set()
+    return payload
+
+
+def terminal_check_schedule_warm_cache(config: AppConfig, policy_doc: dict[str, Any], start: datetime, end: datetime) -> None:
+    key = terminal_check_cache_key(policy_doc, start, end)
+    with TERMINAL_CHECK_CACHE_LOCK:
+        terminal_check_prune_cache()
+        existing = TERMINAL_CHECK_CACHE.get(key)
+        if existing and existing.get("status") in {"loading", "ready"}:
+            return
+        event = threading.Event()
+        TERMINAL_CHECK_CACHE[key] = {"created_at": time.time(), "status": "loading", "event": event}
+
+    def worker() -> None:
+        try:
+            payload = terminal_check_build_payload(config, policy_doc, start, end)
+        except Exception as exc:
+            with TERMINAL_CHECK_CACHE_LOCK:
+                entry = TERMINAL_CHECK_CACHE.get(key) or {}
+                event_obj = entry.get("event") or event
+                TERMINAL_CHECK_CACHE[key] = {
+                    "created_at": time.time(),
+                    "status": "error",
+                    "event": event_obj,
+                    "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                }
+                if hasattr(event_obj, "set"):
+                    event_obj.set()
+            return
+        with TERMINAL_CHECK_CACHE_LOCK:
+            entry = TERMINAL_CHECK_CACHE.get(key) or {}
+            event_obj = entry.get("event") or event
+            TERMINAL_CHECK_CACHE[key] = {
+                "created_at": time.time(),
+                "status": "ready",
+                "event": event_obj,
+                "payload": payload,
+            }
+            if hasattr(event_obj, "set"):
+                event_obj.set()
+
+    threading.Thread(target=worker, name="terminal-check-cache-warm", daemon=True).start()
 
 
 def terminal_check_clear_cache() -> None:
     with TERMINAL_CHECK_CACHE_LOCK:
+        for value in TERMINAL_CHECK_CACHE.values():
+            event = value.get("event")
+            if hasattr(event, "set"):
+                event.set()
         TERMINAL_CHECK_CACHE.clear()
 
 
@@ -5868,6 +6011,43 @@ def terminal_check_css() -> str:
   }
   .terminal-check-hidden {
     display: none;
+  }
+  .terminal-check-loading {
+    margin-top: 18px;
+    border: 1px solid #d8e4f2;
+    border-radius: 14px;
+    padding: 22px;
+    background: linear-gradient(180deg, #ffffff 0%, #f7fbff 100%);
+    color: #43546c;
+    box-shadow: 0 12px 26px rgba(23, 32, 51, 0.045);
+  }
+  .terminal-check-loading strong {
+    display: block;
+    margin-bottom: 6px;
+    color: #122033;
+    font-size: 17px;
+    font-weight: 880;
+  }
+  .terminal-check-loading-bar {
+    width: 100%;
+    height: 7px;
+    margin-top: 14px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: #e8f0fa;
+  }
+  .terminal-check-loading-bar::after {
+    content: "";
+    display: block;
+    width: 38%;
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, #2f80ed, #8ec5ff);
+    animation: terminalCheckLoading 1.25s ease-in-out infinite;
+  }
+  @keyframes terminalCheckLoading {
+    0% { transform: translateX(-105%); }
+    100% { transform: translateX(275%); }
   }
   @media (max-width: 980px) {
     .terminal-check-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -6098,18 +6278,121 @@ def terminal_reviews_table(reviews: list[terminal_review.TerminalBehaviorReview]
 """
 
 
+def terminal_check_work_area_html(
+    candidates: list[terminal_review.TerminalBehaviorCandidate],
+    reviews: list[terminal_review.TerminalBehaviorReview],
+    start: datetime,
+    end: datetime,
+) -> str:
+    return f"""
+<div data-terminal-check-ready="1">
+  {terminal_check_metrics_html(candidates, reviews)}
+  <form class="terminal-check-review-form" method="post" action="/terminal-check/review">
+    <input type="hidden" name="start" value="{esc(datetime_input_value(start))}">
+    <input type="hidden" name="end" value="{esc(datetime_input_value(end))}">
+    <section class="terminal-check-section">
+      <div class="terminal-check-section-head">
+        <div>
+          <h2>候选异常终端</h2>
+          <p class="muted">矩阵口径与报告首页终端风险保持一致；点击“核查状态”切换状态，点击“核查结果”填写结论。</p>
+        </div>
+        <div class="actions"><button class="primary" type="submit">保存核查结果</button></div>
+      </div>
+      {terminal_candidates_table(candidates, start, end)}
+    </section>
+  </form>
+  <section>
+    <h2>已保存核查记录</h2>
+    <p class="muted">周报按事件发生时间自动汇总本周期已进入报告的核查记录。</p>
+    {terminal_reviews_table(reviews)}
+  </section>
+</div>
+"""
+
+
+def terminal_check_loading_html(start: datetime, end: datetime) -> str:
+    return f"""
+<div class="terminal-check-loading" data-terminal-check-loading="1">
+  <strong>正在生成风险终端候选</strong>
+  <div>统计周期：{esc(start.strftime('%Y-%m-%d %H:%M'))} 至 {esc(end.strftime('%Y-%m-%d %H:%M'))}。页面已打开，候选会在后台完成后自动显示。</div>
+  <div class="terminal-check-loading-bar" aria-hidden="true"></div>
+</div>
+"""
+
+
+def terminal_check_error_html(message: str) -> str:
+    return f"""
+<div class="terminal-check-loading">
+  <strong>风险终端候选生成失败</strong>
+  <div class="badge off danger">{esc(message)}</div>
+  <p class="muted">请刷新页面重试；如果仍失败，需要检查 ClickHouse 或审计底稿查询。</p>
+</div>
+"""
+
+
+def terminal_check_fragment_url(start: datetime, end: datetime) -> str:
+    return "/api/terminal-check-fragment?" + urlencode(
+        {"preset": "custom", "start": datetime_input_value(start), "end": datetime_input_value(end)}
+    )
+
+
+def terminal_check_fragment_html(config: AppConfig, start: datetime, end: datetime) -> bytes:
+    policy_doc = load_policy_doc(config)
+    key = terminal_check_cache_key(policy_doc, start, end)
+    entry = terminal_check_cache_entry(key)
+    if entry and entry.get("status") == "ready":
+        payload = entry.get("payload") or {}
+        return terminal_check_work_area_html(payload.get("candidates") or [], payload.get("reviews") or [], start, end).encode("utf-8")
+    if entry and entry.get("status") == "error":
+        return terminal_check_error_html(str(entry.get("error") or "候选生成失败")).encode("utf-8")
+    terminal_check_schedule_warm_cache(config, policy_doc, start, end)
+    return terminal_check_loading_html(start, end).encode("utf-8")
+
+
+def terminal_check_loader_script(start: datetime, end: datetime) -> str:
+    fragment_url = terminal_check_fragment_url(start, end)
+    fragment_url_json = json.dumps(fragment_url, ensure_ascii=False).replace("</", "<\\/")
+    return f"""
+<script id="terminal-check-loader">
+  (function () {{
+    var target = document.getElementById("terminal-check-dynamic");
+    if (!target) return;
+    var url = {fragment_url_json};
+    var timer = null;
+    function renderError(message) {{
+      target.innerHTML = '<div class="terminal-check-loading"><strong>风险终端候选加载失败</strong><div class="badge off danger">' +
+        message.replace(/[&<>"']/g, function (ch) {{ return ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}})[ch]; }}) +
+        '</div><p class="muted">请刷新页面重试。</p></div>';
+    }}
+    function load() {{
+      window.clearTimeout(timer);
+      fetch(url, {{ credentials: "same-origin", cache: "no-store" }})
+        .then(function (response) {{
+          if (!response.ok) throw new Error("HTTP " + response.status);
+          return response.text();
+        }})
+        .then(function (html) {{
+          target.innerHTML = html;
+          if (target.querySelector("[data-terminal-check-loading='1']")) {{
+            timer = window.setTimeout(load, 2000);
+          }}
+        }})
+        .catch(function (error) {{
+          renderError(error && error.message ? error.message : "加载失败");
+        }});
+    }}
+    load();
+  }})();
+</script>
+"""
+
+
 def terminal_check_page(config: AppConfig, session: AuthSession, params: dict[str, list[str]] | None = None, message: str = "", error: str = "") -> bytes:
     params = params or {}
     start, end, preset = terminal_check_period_from_params(config, params)
     policy_doc = load_policy_doc(config)
-    try:
-        cached_data = terminal_check_cached_data(config, policy_doc, start, end)
-        candidates = cached_data["candidates"]
-        reviews = cached_data["reviews"]
-    except Exception as exc:
-        candidates = []
-        reviews = []
-        error = error or f"候选生成失败：{exc}"
+    terminal_check_schedule_warm_cache(config, policy_doc, start, end)
+    initial_fragment = terminal_check_fragment_html(config, start, end).decode("utf-8")
     body = f"""
     <header>
       <div>
@@ -6133,27 +6416,9 @@ def terminal_check_page(config: AppConfig, session: AuthSession, params: dict[st
       </div>
       {f'<p class="badge on">{esc(message)}</p>' if message else ''}
       {f'<p class="badge off danger">{esc(error)}</p>' if error else ''}
-      {terminal_check_metrics_html(candidates, reviews)}
     </section>
-    <form class="terminal-check-review-form" method="post" action="/terminal-check/review">
-      <input type="hidden" name="start" value="{esc(datetime_input_value(start))}">
-      <input type="hidden" name="end" value="{esc(datetime_input_value(end))}">
-      <section class="terminal-check-section">
-        <div class="terminal-check-section-head">
-          <div>
-            <h2>候选异常终端</h2>
-            <p class="muted">矩阵口径与报告首页终端风险保持一致；点击“核查状态”切换状态，点击“核查结果”填写结论。</p>
-          </div>
-          <div class="actions"><button class="primary" type="submit">保存核查结果</button></div>
-        </div>
-        {terminal_candidates_table(candidates, start, end)}
-      </section>
-    </form>
-    <section>
-      <h2>已保存核查记录</h2>
-      <p class="muted">周报按事件发生时间自动汇总本周期已进入报告的核查记录。</p>
-      {terminal_reviews_table(reviews)}
-    </section>
+    <section id="terminal-check-dynamic">{initial_fragment}</section>
+    {terminal_check_loader_script(start, end)}
 """
     return page_shell("风险终端复核", body)
 
@@ -6164,8 +6429,8 @@ def terminal_check_events_page(config: AppConfig, params: dict[str, list[str]]) 
     detail_events: list[report_gen.AuditEvent] = []
     title = "异常终端候选证据"
     if candidate_id:
-        cached_data = terminal_check_cached_data(config, load_policy_doc(config), start, end)
-        candidate = cached_data["by_id"].get(candidate_id)
+        cached_data = terminal_check_cached_data(config, load_policy_doc(config), start, end, wait_seconds=90)
+        candidate = (cached_data or {}).get("by_id", {}).get(candidate_id)
         if candidate:
             title = f"{candidate.anomaly_type} / {candidate.client_ip}"
             tz = local_tz(config.timezone)
@@ -7288,6 +7553,24 @@ class ReportHandler(BaseHTTPRequestHandler):
                 return
             self.send_html(terminal_check_events_page(self.config, parse_qs(parsed.query)))
             return
+        if parsed.path == "/api/terminal-check-fragment":
+            if session.role not in {"admin", "global"}:
+                self.send_forbidden("仅授权查看全集团报告的用户可以进行风险终端复核。")
+                return
+            try:
+                start, end, _preset = terminal_check_period_from_params(self.config, parse_qs(parsed.query))
+            except Exception as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+            data = terminal_check_fragment_html(self.config, start, end)
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(data)
+            return
         if parsed.path == "/jobs":
             self.redirect("/reports")
             return
@@ -7719,7 +8002,9 @@ class ReportHandler(BaseHTTPRequestHandler):
             return
         try:
             policy_doc = load_policy_doc(self.config)
-            cached_data = terminal_check_cached_data(self.config, policy_doc, start, end)
+            cached_data = terminal_check_cached_data(self.config, policy_doc, start, end, wait_seconds=90)
+            if not cached_data:
+                raise RuntimeError("候选仍在后台生成，请稍后再保存。")
             candidates = cached_data["candidates"]
             existing_reviews = {review.candidate_id: review for review in cached_data["reviews"]}
         except Exception as exc:
