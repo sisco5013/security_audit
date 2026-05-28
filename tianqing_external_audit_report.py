@@ -380,7 +380,7 @@ REASON_DISPLAY_PRIORITY = [
 ]
 HIDDEN_LEADERSHIP_REASONS = {"二维/三维设计图纸", "设计图纸后缀"}
 DESIGN_CATEGORY_DISPLAY_ORDER = CRITICAL_DESIGN_LABELS + ["三维模型", "DWG二维图纸", "设计资料"]
-LARGE_ARCHIVE_RISK_BYTES = 50 * 1024 * 1024
+LARGE_ARCHIVE_RISK_BYTES = 100 * 1024 * 1024
 
 
 @dataclass
@@ -9035,7 +9035,7 @@ def build_html_report(
     )
     home_focus_text = (
         "一级风险定义：标准图纸解密；天擎标准图纸外发/拷贝；"
-        "天擎大于50MB压缩包外发/上传/外设拷贝；PLM技术、研发、工艺账号池外登录。"
+        "天擎大于100MB压缩包外发/上传/外设拷贝；PLM技术、研发、工艺账号池外登录。"
     )
     home_evidence_text = "一级风险进入顶部汇总管理结论，矩阵、趋势和明细用于定位组织、终端与证据链。"
     home_modules = [

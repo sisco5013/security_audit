@@ -202,11 +202,11 @@ def build_global_management_summary_html(
     if decrypt_standard or tianqing_level_one or plm_risks:
         lead = (
             f"本周期一级风险概况：标准图纸解密 {decrypt_standard} 条；"
-            f"天擎一级风险 {tianqing_level_one} 条（标准图纸 {tianqing_standard} 条，大于50MB压缩包 {tianqing_large_archive} 条）；"
+            f"天擎一级风险 {tianqing_level_one} 条（标准图纸 {tianqing_standard} 条，大于100MB压缩包 {tianqing_large_archive} 条）；"
             f"PLM 登录审计{plm_label}{' ' + str(plm_risks) + ' 条' if plm_enabled else ''}。"
         )
     else:
-        lead = "本周期三大审计模块暂无一级风险数据，仍按标准图纸解密、天擎标准图纸外发/拷贝、大于50MB压缩包和 PLM 池外登录保留持续监测。"
+        lead = "本周期三大审计模块暂无一级风险数据，仍按标准图纸解密、天擎标准图纸外发/拷贝、大于100MB压缩包和 PLM 池外登录保留持续监测。"
 
     def row_html(label: str, body: str, href: str = "", tone: str = "blue") -> str:
         tag = "a" if href else "div"
@@ -226,7 +226,7 @@ def build_global_management_summary_html(
         ),
         row_html(
             "天擎外发审计",
-            f"一级风险：标准图纸外发/拷贝 {tianqing_standard} 条（结构 {tianqing_structure} 条、电气 {tianqing_electrical} 条），大于50MB压缩包 {tianqing_large_archive} 条。",
+            f"一级风险：标准图纸外发/拷贝 {tianqing_standard} 条（结构 {tianqing_structure} 条、电气 {tianqing_electrical} 条），大于100MB压缩包 {tianqing_large_archive} 条。",
             "#tianqing-audit",
             "tianqing",
         ),

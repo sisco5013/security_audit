@@ -115,7 +115,7 @@ DEFAULT_PLM_TERMINAL_MATCH_FIELDS = ["ip_address", "computer_name"]
 ENCRYPTION_TERMINAL_TRUST_DAYS = 7
 TOP_RISK_DEFINITION_TEXT = (
     "一级风险定义：标准图纸解密；天擎标准图纸外发/拷贝；"
-    "天擎大于50MB压缩包外发/上传/外设拷贝；PLM技术、研发、工艺账号池外登录。"
+    "天擎大于100MB压缩包外发/上传/外设拷贝；PLM技术、研发、工艺账号池外登录。"
 )
 TOP_RISK_EVIDENCE_TEXT = "一级风险进入顶部汇总管理结论，矩阵、趋势和明细用于定位组织、终端与证据链。"
 
@@ -1213,7 +1213,7 @@ def _fallback_tianqing_management_metrics(text: str) -> dict[str, Any]:
     tianqing_plain = _html_plain_text(tianqing_section)
     structure = _first_regex_int(r"结构(?:标准方案)?\s*(\d+)", tianqing_plain)
     electrical = _first_regex_int(r"电气(?:标准方案)?\s*(\d+)", tianqing_plain)
-    large_archive = _first_regex_int(r"(?:大于50MB|超过50MB|>50MB)\s*压缩包\s*(\d+)", tianqing_plain)
+    large_archive = _first_regex_int(r"(?:大于100MB|超过100MB|>100MB)\s*压缩包\s*(\d+)", tianqing_plain)
     standard = structure + electrical
     return {
         "critical_design": standard,
@@ -6033,7 +6033,7 @@ def settings_page(config: AppConfig) -> bytes:
       <div class="settings-card">
         <h3>风险终端复核策略</h3>
         <p class="metric">{'启用' if terminal_review.normalized_review_policy(policy_doc).get('enabled', True) else '关闭'}</p>
-        <p class="muted">候选只保留标准图纸流转、普通图纸高频和敏感文件高频，人工确认后才进报告。</p>
+        <p class="muted">候选只保留标准图纸、大于100MB压缩包、普通图纸高频和敏感文件高频，人工确认后才进报告。</p>
         <div class="actions"><a class="button primary" href="/settings/terminal-behavior-review">维护核查阈值</a></div>
       </div>
         </div>
@@ -7224,7 +7224,7 @@ def terminal_behavior_policy_page(config: AppConfig, message: str = "", error: s
     )
     body = f"""
     <header>
-      <div><h1>风险终端复核策略</h1><div class="muted">候选只取标准图纸流转、普通图纸超过阈值、敏感文件超过阈值三类；同一终端同一周期只生成一条候选。</div></div>
+      <div><h1>风险终端复核策略</h1><div class="muted">候选只取标准图纸流转、大于100MB压缩包流转、普通图纸超过阈值、敏感文件超过阈值四类；同一终端同一周期只生成一条候选。</div></div>
       <div class="actions"><a class="button" href="/settings">策略中心</a><a class="button" href="/terminal-check">复核工作台</a></div>
     </header>
     {f'<p class="badge on">{esc(message)}</p>' if message else ''}
@@ -7237,7 +7237,7 @@ def terminal_behavior_policy_page(config: AppConfig, message: str = "", error: s
         </select>
       </label>
       {inputs}
-      <p class="muted full">当前口径：标准图纸经邮件、IM、外部站点上传或外设拷贝等通道流转即入候选；普通三维/DWG 图纸默认超过 100 条入候选；敏感名称文件默认超过 1000 条入候选。</p>
+      <p class="muted full">当前口径：标准图纸和大于100MB压缩包经邮件、IM、外部站点上传或外设拷贝等通道流转即入候选；普通三维/DWG 图纸默认超过 100 条入候选；敏感名称文件默认超过 1000 条入候选。</p>
       <div class="actions"><button class="primary" type="submit">保存复核策略</button></div>
     </form>
 """

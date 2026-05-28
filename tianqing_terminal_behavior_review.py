@@ -417,6 +417,16 @@ def sensitive_name_event(event: dict[str, Any], three_d: set[str], two_d: set[st
     return event_matrix_bucket(event, three_d, two_d, archives, patterns) == "敏感名称"
 
 
+def large_archive_event(event: dict[str, Any], three_d: set[str], two_d: set[str], archives: set[str], patterns: list[tuple[str, re.Pattern[str]]]) -> bool:
+    if event_matrix_bucket(event, three_d, two_d, archives, patterns) != "压缩包":
+        return False
+    try:
+        file_size = int(event.get("file_size") or 0)
+    except (TypeError, ValueError):
+        file_size = 0
+    return file_size > report_gen.LARGE_ARCHIVE_RISK_BYTES
+
+
 def report_arg_namespace(config: Any) -> SimpleNamespace:
     app_dir = Path(getattr(config, "app_dir", "."))
     return SimpleNamespace(
@@ -456,6 +466,7 @@ def load_cached_wecom_items(config: Any) -> list[dict[str, Any]]:
 def configure_report_policy_context(config: Any, policy_doc: dict[str, Any]) -> tuple[SimpleNamespace, set[str]]:
     args = report_arg_namespace(config)
     report_gen.configure_audit_policy(policy_doc if isinstance(policy_doc, dict) else {})
+    report_gen.bind_report_submodule_dependencies()
     try:
         report_gen.configure_sensitive_keyword_rules(report_gen.load_sensitive_keyword_rules(args.sensitive_keywords_file))
     except Exception:
@@ -814,6 +825,13 @@ def generate_candidates(config: Any, policy_doc: dict[str, Any], start: datetime
             for event in standard_events:
                 selected_events[str(event.get("event_id") or id(event))] = event
 
+        large_archive_events = [event for event in significant if large_archive_event(event, three_d, two_d, archives, patterns)]
+        if large_archive_events:
+            reason_labels.append("一级风险：大于100MB压缩包流转")
+            reason_basis.append("大于100MB压缩包经邮件、IM、外部站点上传或外设拷贝等通道流转。")
+            for event in large_archive_events:
+                selected_events[str(event.get("event_id") or id(event))] = event
+
         ordinary_drawing_events = [event for event in significant if ordinary_drawing_event(event, three_d, two_d, archives, patterns)]
         if len(ordinary_drawing_events) >= other_drawing_min:
             reason_labels.append("普通图纸高频流转")
@@ -850,6 +868,7 @@ def generate_candidates(config: Any, policy_doc: dict[str, Any], start: datetime
 def fast_review_policy_context(policy_doc: dict[str, Any]) -> set[str]:
     policy_doc = policy_doc if isinstance(policy_doc, dict) else {}
     report_gen.configure_audit_policy(policy_doc)
+    report_gen.bind_report_submodule_dependencies()
     internal_domains = set(report_gen.DEFAULT_INTERNAL_DOMAINS)
     internal_domains.update(report_gen.policy_internal_domains(policy_doc))
     return internal_domains
@@ -869,6 +888,7 @@ def generate_candidate_summaries(config: Any, policy_doc: dict[str, Any], start:
     object_expr, channel_expr, focus_expr = report_gen.clickhouse_matrix_classification_exprs(internal_domains)
     other_drawing_min = max(1, policy_int(policy, "other_drawing_min_events") or 100)
     sensitive_min = max(1, policy_int(policy, "sensitive_name_min_events") or 1000)
+    large_archive_bytes = int(report_gen.LARGE_ARCHIVE_RISK_BYTES)
     query = f"""
 SELECT
     client_name,
@@ -879,6 +899,7 @@ SELECT
     channel_group,
     object,
     count() AS count,
+    countIf(ifNull(file_size, 0) > {large_archive_bytes}) AS large_archive_count,
     min(ts) AS event_start,
     max(ts) AS event_end,
     groupUniqArray(256)(event_id) AS event_ids
@@ -911,7 +932,7 @@ FROM
     WHERE ts >= parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
       AND ts < parseDateTime64BestEffort({ch_quote(end.isoformat())}, 3)
 )
-WHERE object != '' AND channel_group != '' AND focus_signal
+WHERE object != '' AND channel_group != '' AND (focus_signal OR (object = '压缩包' AND ifNull(file_size, 0) > {large_archive_bytes}))
 GROUP BY client_name, client_ip, person_label, company_label, department_label, channel_group, object
 FORMAT JSONEachRow
 """
@@ -943,6 +964,7 @@ FORMAT JSONEachRow
                 "three_d_count": 0,
                 "dwg_count": 0,
                 "archive_count": 0,
+                "large_archive_count": 0,
                 "standard_count": 0,
                 "sensitive_count": 0,
             },
@@ -973,6 +995,7 @@ FORMAT JSONEachRow
             item["dwg_count"] += count
         if bucket == "压缩包":
             item["archive_count"] += count
+            item["large_archive_count"] += int(row.get("large_archive_count") or 0)
         if bucket == "敏感名称":
             item["sensitive_count"] += count
         for event_id in row.get("event_ids") or []:
@@ -993,6 +1016,9 @@ FORMAT JSONEachRow
         if int(item["standard_count"] or 0) > 0:
             reason_labels.append("一级风险：标准图纸流转")
             reason_basis.append("标准图纸经邮件、IM、外部站点上传或外设拷贝等通道流转。")
+        if int(item["large_archive_count"] or 0) > 0:
+            reason_labels.append("一级风险：大于100MB压缩包流转")
+            reason_basis.append("大于100MB压缩包经邮件、IM、外部站点上传或外设拷贝等通道流转。")
         ordinary_count = int(item["three_d_count"] or 0) + int(item["dwg_count"] or 0)
         if ordinary_count >= other_drawing_min:
             reason_labels.append("普通图纸高频流转")
