@@ -269,6 +269,10 @@ TERMINAL_CHECK_CACHE_TTL_SECONDS = 30 * 60
 TERMINAL_CHECK_CACHE_MAX_ENTRIES = 6
 TERMINAL_CHECK_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
 TERMINAL_CHECK_CACHE_LOCK = threading.Lock()
+DECRYPT_ANALYSIS_CACHE_TTL_SECONDS = 30 * 60
+DECRYPT_ANALYSIS_CACHE_MAX_ENTRIES = 6
+DECRYPT_ANALYSIS_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
+DECRYPT_ANALYSIS_CACHE_LOCK = threading.Lock()
 RECENT_JOB_SECONDS = 12 * 3600
 CUSTOM_REPORT_TTL_DAYS = int(os.getenv("TIANQING_CUSTOM_REPORT_TTL_DAYS", "7") or "7")
 JOB_LOG_TTL_DAYS = int(os.getenv("TIANQING_JOB_LOG_TTL_DAYS", "30") or "30")
@@ -4376,6 +4380,185 @@ def load_live_decrypt_analysis(
     return report_gen.load_decrypt_risk_analysis(args, start, end, tz, [], internal_domains)
 
 
+def live_decrypt_policy_fingerprint(config: AppConfig) -> str:
+    with RULES_LOCK:
+        policy_doc = load_policy_doc(config)
+    return terminal_check_policy_fingerprint(policy_doc)
+
+
+def live_decrypt_cache_key(config: AppConfig, start: datetime, end: datetime) -> tuple[str, str, str]:
+    return (datetime_input_value(start), datetime_input_value(end), live_decrypt_policy_fingerprint(config))
+
+
+def live_decrypt_prune_cache(now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    for key, value in list(DECRYPT_ANALYSIS_CACHE.items()):
+        if now - float(value.get("created_at") or 0) > DECRYPT_ANALYSIS_CACHE_TTL_SECONDS:
+            event = value.get("event")
+            DECRYPT_ANALYSIS_CACHE.pop(key, None)
+            if hasattr(event, "set"):
+                event.set()
+    if len(DECRYPT_ANALYSIS_CACHE) <= DECRYPT_ANALYSIS_CACHE_MAX_ENTRIES:
+        return
+    ordered = sorted(DECRYPT_ANALYSIS_CACHE.items(), key=lambda item: float(item[1].get("created_at") or 0))
+    for key, value in ordered[: max(0, len(DECRYPT_ANALYSIS_CACHE) - DECRYPT_ANALYSIS_CACHE_MAX_ENTRIES)]:
+        event = value.get("event")
+        DECRYPT_ANALYSIS_CACHE.pop(key, None)
+        if hasattr(event, "set"):
+            event.set()
+
+
+def live_decrypt_clear_cache() -> None:
+    with DECRYPT_ANALYSIS_CACHE_LOCK:
+        for value in DECRYPT_ANALYSIS_CACHE.values():
+            event = value.get("event")
+            if hasattr(event, "set"):
+                event.set()
+        DECRYPT_ANALYSIS_CACHE.clear()
+
+
+def live_decrypt_build_payload(config: AppConfig, start: datetime, end: datetime) -> dict[str, Any]:
+    args, tz, internal_domains = live_decrypt_policy_context(config)
+    analysis = report_gen.load_decrypt_risk_analysis(args, start, end, tz, [], internal_domains)
+    links = live_decrypt_links(start, end)
+    company_links = live_decrypt_company_links(analysis.records, start, end)
+    html_text = report_gen.decrypt_risk_home_html(analysis, links, company_links, tz, end)
+    html_text = html_text.replace('<div class="decrypt-card-grid">', live_decrypt_meta_html(config) + '<div class="decrypt-card-grid">', 1)
+    return {
+        "analysis": analysis,
+        "home_html": html_text,
+        "links": links,
+        "company_links": company_links,
+        "tz": tz,
+        "built_at": time.time(),
+    }
+
+
+def live_decrypt_cache_entry(key: tuple[str, str, str]) -> dict[str, Any] | None:
+    now = time.time()
+    with DECRYPT_ANALYSIS_CACHE_LOCK:
+        live_decrypt_prune_cache(now)
+        entry = DECRYPT_ANALYSIS_CACHE.get(key)
+        if entry and now - float(entry.get("created_at") or 0) <= DECRYPT_ANALYSIS_CACHE_TTL_SECONDS:
+            return entry
+    return None
+
+
+def live_decrypt_cached_payload(
+    config: AppConfig,
+    start: datetime,
+    end: datetime,
+    *,
+    wait_seconds: float = 0,
+    build_if_missing: bool = True,
+) -> dict[str, Any] | None:
+    key = live_decrypt_cache_key(config, start, end)
+    entry = live_decrypt_cache_entry(key)
+    if entry and entry.get("status") == "ready":
+        return entry.get("payload")
+    if entry and entry.get("status") == "loading":
+        event = entry.get("event")
+        if hasattr(event, "wait") and wait_seconds > 0:
+            event.wait(wait_seconds)
+            entry = live_decrypt_cache_entry(key)
+            if entry and entry.get("status") == "ready":
+                return entry.get("payload")
+        if not build_if_missing:
+            return None
+    if not build_if_missing:
+        return None
+
+    event = threading.Event()
+    with DECRYPT_ANALYSIS_CACHE_LOCK:
+        live_decrypt_prune_cache()
+        existing = DECRYPT_ANALYSIS_CACHE.get(key)
+        if existing and existing.get("status") == "ready":
+            return existing.get("payload")
+        if existing and existing.get("status") == "loading":
+            event = existing.get("event")
+            should_build = False
+        else:
+            DECRYPT_ANALYSIS_CACHE[key] = {"created_at": time.time(), "status": "loading", "event": event}
+            should_build = True
+    if not should_build:
+        if hasattr(event, "wait") and wait_seconds > 0:
+            event.wait(wait_seconds)
+            entry = live_decrypt_cache_entry(key)
+            if entry and entry.get("status") == "ready":
+                return entry.get("payload")
+        return None
+
+    try:
+        payload = live_decrypt_build_payload(config, start, end)
+    except Exception as exc:
+        with DECRYPT_ANALYSIS_CACHE_LOCK:
+            DECRYPT_ANALYSIS_CACHE[key] = {
+                "created_at": time.time(),
+                "status": "error",
+                "event": event,
+                "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+            }
+            event.set()
+        raise
+    with DECRYPT_ANALYSIS_CACHE_LOCK:
+        DECRYPT_ANALYSIS_CACHE[key] = {
+            "created_at": time.time(),
+            "status": "ready",
+            "event": event,
+            "payload": payload,
+        }
+        event.set()
+    return payload
+
+
+def live_decrypt_warm_cache(config: AppConfig, start: datetime, end: datetime) -> None:
+    try:
+        live_decrypt_cached_payload(config, start, end, wait_seconds=0, build_if_missing=True)
+    except Exception:
+        return
+
+
+def live_decrypt_schedule_warm_cache(config: AppConfig, start: datetime, end: datetime) -> None:
+    key = live_decrypt_cache_key(config, start, end)
+    with DECRYPT_ANALYSIS_CACHE_LOCK:
+        live_decrypt_prune_cache()
+        existing = DECRYPT_ANALYSIS_CACHE.get(key)
+        if existing and existing.get("status") in {"loading", "ready"}:
+            return
+        event = threading.Event()
+        DECRYPT_ANALYSIS_CACHE[key] = {"created_at": time.time(), "status": "loading", "event": event}
+
+    def worker() -> None:
+        try:
+            payload = live_decrypt_build_payload(config, start, end)
+        except Exception as exc:
+            with DECRYPT_ANALYSIS_CACHE_LOCK:
+                entry = DECRYPT_ANALYSIS_CACHE.get(key) or {}
+                event_obj = entry.get("event") or event
+                DECRYPT_ANALYSIS_CACHE[key] = {
+                    "created_at": time.time(),
+                    "status": "error",
+                    "event": event_obj,
+                    "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+                }
+                if hasattr(event_obj, "set"):
+                    event_obj.set()
+            return
+        with DECRYPT_ANALYSIS_CACHE_LOCK:
+            entry = DECRYPT_ANALYSIS_CACHE.get(key) or {}
+            event_obj = entry.get("event") or event
+            DECRYPT_ANALYSIS_CACHE[key] = {
+                "created_at": time.time(),
+                "status": "ready",
+                "event": event_obj,
+                "payload": payload,
+            }
+            if hasattr(event_obj, "set"):
+                event_obj.set()
+
+    threading.Thread(target=worker, name="decrypt-analysis-cache-warm", daemon=True).start()
+
+
 def live_decrypt_summary_rows(config: AppConfig, start: datetime, end: datetime) -> list[dict[str, Any]]:
     live_decrypt_policy_context(config)
     return decrypt_query(
@@ -4449,17 +4632,15 @@ def live_decrypt_company_links(
 
 
 def live_decrypt_fragment(config: AppConfig, start: datetime, end: datetime) -> bytes:
-    args, tz, _internal_domains = live_decrypt_policy_context(config)
-    analysis = report_gen.load_decrypt_risk_analysis(args, start, end, tz, [], _internal_domains)
-    links = live_decrypt_links(start, end)
-    company_links = live_decrypt_company_links(analysis.records, start, end)
-    html_text = report_gen.decrypt_risk_home_html(analysis, links, company_links, tz, end)
-    html_text = html_text.replace('<div class="decrypt-card-grid">', live_decrypt_meta_html(config) + '<div class="decrypt-card-grid">', 1)
-    return html_text.encode("utf-8")
+    payload = live_decrypt_cached_payload(config, start, end, wait_seconds=60, build_if_missing=True)
+    if not payload:
+        raise RuntimeError("解密分析缓存尚未生成完成")
+    return str(payload.get("home_html") or "").encode("utf-8")
 
 
 def live_decrypt_summary_fragment(config: AppConfig, start: datetime, end: datetime) -> bytes:
     rows = live_decrypt_summary_rows(config, start, end)
+    live_decrypt_schedule_warm_cache(config, start, end)
     links = live_decrypt_links(start, end)
     counts = live_decrypt_object_counts(rows)
     structure = int(counts.get("结构", 0) or 0)
@@ -4543,8 +4724,13 @@ def filter_live_decrypt_records(
 
 
 def live_decrypt_detail_page(config: AppConfig, start: datetime, end: datetime, params: dict[str, list[str]]) -> bytes:
-    args, tz, _internal_domains = live_decrypt_policy_context(config)
-    analysis = report_gen.load_decrypt_risk_analysis(args, start, end, tz, [], _internal_domains)
+    payload = live_decrypt_cached_payload(config, start, end, wait_seconds=60, build_if_missing=True)
+    if not payload:
+        raise RuntimeError("解密分析缓存尚未生成完成")
+    analysis = payload.get("analysis")
+    tz = payload.get("tz")
+    if analysis is None or tz is None:
+        raise RuntimeError("解密分析缓存无效")
     scope = (params.get("scope") or ["all"])[-1]
     company = (params.get("company") or [""])[-1]
     bucket = (params.get("bucket") or [""])[-1]
@@ -7692,6 +7878,7 @@ class ReportHandler(BaseHTTPRequestHandler):
             f"标准图纸命中 {critical_rows}，未归一组织 {unmatched_rows}。"
             f" 明细：{detail}"
         )
+        live_decrypt_clear_cache()
         self.send_html(decrypt_records_page(self.config, message=message))
 
     def handle_encryption_terminals_post(
