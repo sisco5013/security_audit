@@ -5415,7 +5415,7 @@ def terminal_candidates_table(candidates: list[terminal_review.TerminalBehaviorC
     return f"""
 <div class="table-wrap">
   <table class="terminal-check-table">
-    <thead><tr><th>选择</th><th>异常类型</th><th>公司/部门</th><th>使用人</th><th>IP/MAC</th><th>终端名</th><th>事件</th><th>结构/电气/三维/DWG/压缩</th><th>通道</th><th>目标</th><th>代表文件</th><th>状态</th><th>结论</th><th>责任部门</th><th>期限</th><th>备注</th><th>证据</th></tr></thead>
+    <thead><tr><th>选择</th><th>入选原因</th><th>公司/部门</th><th>使用人</th><th>IP/MAC</th><th>终端名</th><th>事件</th><th>结构/电气/三维/DWG/压缩</th><th>通道</th><th>目标</th><th>代表文件</th><th>核查状态</th><th>核查结论</th><th>责任部门</th><th>期限</th><th>备注</th><th>证据</th></tr></thead>
     <tbody>{''.join(rows)}</tbody>
   </table>
 </div>
@@ -5515,7 +5515,7 @@ def terminal_check_page(config: AppConfig, session: AuthSession, params: dict[st
         <div class="terminal-check-section-head">
           <div>
             <h2>候选异常终端</h2>
-            <p class="muted">按终端、使用人、日期和异常类型聚合；勾选后保存为人工核查记录。</p>
+            <p class="muted">候选直接复用本周期报表重点明细事件的终端、人员、公司和部门字段；勾选后仅追加核查状态和核查结论。</p>
           </div>
           <div class="actions"><button class="primary" type="submit">保存选中核查记录</button></div>
         </div>

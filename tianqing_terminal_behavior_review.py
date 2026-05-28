@@ -13,7 +13,10 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterable
+
+import tianqing_external_audit_report as report_gen
 
 
 TERMINAL_BEHAVIOR_REVIEW_TABLE_SQL = """
@@ -176,6 +179,10 @@ def ch_array(values: Iterable[str]) -> str:
     return "[" + ",".join(ch_quote(value) for value in values) + "]"
 
 
+def ch_tuple(values: Iterable[str]) -> str:
+    return "(" + ",".join(ch_quote(value) for value in values) + ")"
+
+
 def clickhouse_headers(config: Any) -> dict[str, str]:
     headers: dict[str, str] = {}
     user = str(getattr(config, "clickhouse_user", "") or "").strip()
@@ -191,6 +198,14 @@ def clickhouse_query(config: Any, query: str, data: bytes | None = None) -> str:
     params = {"database": getattr(config, "clickhouse_database", "tianqing"), "query": query}
     url = str(getattr(config, "clickhouse_url", "http://127.0.0.1:8123")).rstrip("/") + "/?" + urllib.parse.urlencode(params)
     request = urllib.request.Request(url, data=data, headers=clickhouse_headers(config), method="POST")
+    with urllib.request.urlopen(request, timeout=int(getattr(config, "clickhouse_timeout", 120) or 120)) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def clickhouse_query_body(config: Any, query: str) -> str:
+    params = {"database": getattr(config, "clickhouse_database", "tianqing")}
+    url = str(getattr(config, "clickhouse_url", "http://127.0.0.1:8123")).rstrip("/") + "/?" + urllib.parse.urlencode(params)
+    request = urllib.request.Request(url, data=query.encode("utf-8"), headers=clickhouse_headers(config), method="POST")
     with urllib.request.urlopen(request, timeout=int(getattr(config, "clickhouse_timeout", 120) or 120)) as response:
         return response.read().decode("utf-8", errors="replace")
 
@@ -331,7 +346,183 @@ def primary_risk_event(event: dict[str, Any], three_d: set[str], two_d: set[str]
     return bool(counts["structure"] or counts["electrical"])
 
 
-def fetch_audit_events(config: Any, start: datetime, end: datetime, policy_doc: dict[str, Any]) -> list[dict[str, Any]]:
+def report_arg_namespace(config: Any) -> SimpleNamespace:
+    app_dir = Path(getattr(config, "app_dir", "."))
+    return SimpleNamespace(
+        use_clickhouse=True,
+        clickhouse_url=getattr(config, "clickhouse_url", "http://127.0.0.1:8123"),
+        clickhouse_database=getattr(config, "clickhouse_database", "tianqing"),
+        clickhouse_user=getattr(config, "clickhouse_user", ""),
+        clickhouse_password=getattr(config, "clickhouse_password", ""),
+        clickhouse_timeout=int(getattr(config, "clickhouse_timeout", 120) or 120),
+        audit_policy_file=str(getattr(config, "policy_file", app_dir / "audit_policy.json")),
+        sensitive_keywords_file=str(getattr(config, "keywords_file", app_dir / "sensitive_keywords.json")),
+        exclusion_file=str(getattr(config, "exclusions_file", app_dir / "audit_exclusions.json")),
+        people_map=str(app_dir / "people_mapping.csv"),
+        recipient_map=str(app_dir / "recipient_mapping.csv"),
+        disable_wecom_directory=False,
+        wecom_directory_host=getattr(config, "ai_host", ""),
+        wecom_directory_container=getattr(config, "ai_container", ""),
+        wecom_directory_cache=str(app_dir / "wecom_directory_cache.json"),
+        wecom_directory_cache_hours=24 * 365 * 20,
+        wecom_directory_refresh=False,
+        wecom_directory_min_users=100,
+        wecom_directory_authoritative=False,
+        terminal_identity_max_age_days=30,
+    )
+
+
+def load_cached_wecom_items(config: Any) -> list[dict[str, Any]]:
+    cache_path = Path(getattr(config, "app_dir", ".")) / "wecom_directory_cache.json"
+    try:
+        data = json.loads(cache_path.read_text("utf-8"))
+    except Exception:
+        return []
+    items = data.get("items") if isinstance(data, dict) else data
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
+def configure_report_policy_context(config: Any, policy_doc: dict[str, Any]) -> tuple[SimpleNamespace, set[str]]:
+    args = report_arg_namespace(config)
+    report_gen.configure_audit_policy(policy_doc if isinstance(policy_doc, dict) else {})
+    try:
+        report_gen.configure_sensitive_keyword_rules(report_gen.load_sensitive_keyword_rules(args.sensitive_keywords_file))
+    except Exception:
+        report_gen.configure_sensitive_keyword_rules([])
+    internal_domains = set(report_gen.DEFAULT_INTERNAL_DOMAINS)
+    internal_domains.update(report_gen.policy_internal_domains(policy_doc if isinstance(policy_doc, dict) else {}))
+    people_map = report_gen.load_people_map(args.people_map)
+    wecom_items = load_cached_wecom_items(config)
+    args.people_map_loaded = people_map
+    args.wecom_people_map_loaded = report_gen.build_wecom_people_map(wecom_items)
+    args.wecom_directory_meta = {"source": "cache", "ok": bool(wecom_items), "count": len(wecom_items)}
+    return args, internal_domains
+
+
+def report_detail_row(event: Any, internal_domains: set[str]) -> dict[str, Any]:
+    channel = report_gen.audit_channel_group(event, internal_domains) or str(getattr(event, "channel", "") or "")
+    return {
+        "event_id": str(getattr(event, "event_id", "") or ""),
+        "event_date": (getattr(event, "ts", None).date().isoformat() if getattr(event, "ts", None) else ""),
+        "ts": getattr(event, "ts", None).isoformat() if getattr(event, "ts", None) else "",
+        "topic": str(getattr(event, "topic", "") or ""),
+        "channel": channel,
+        "level": str(getattr(event, "level", "") or ""),
+        "company": report_gen.event_company_label(event),
+        "department": report_gen.event_department_label(event),
+        "resolved_person": str(getattr(event, "resolved_person", "") or getattr(event, "person", "") or ""),
+        "person": str(getattr(event, "person", "") or ""),
+        "client_name": str(getattr(event, "client_name", "") or ""),
+        "client_ip": str(getattr(event, "client_ip", "") or ""),
+        "process_name": str(getattr(event, "process_name", "") or ""),
+        "sender_mailbox": str(getattr(event, "sender_mailbox", "") or ""),
+        "recipient_relation": str(getattr(event, "recipient_relation", "") or ""),
+        "targets": [str(item) for item in getattr(event, "targets", []) or []],
+        "target_domains": [str(item) for item in getattr(event, "target_domains", []) or []],
+        "recipients": [str(item) for item in getattr(event, "recipients", []) or []],
+        "file_names": [str(item) for item in getattr(event, "file_names", []) or []],
+        "file_exts": [str(item) for item in getattr(event, "file_exts", []) or []],
+        "file_size": getattr(event, "file_size", None),
+        "reasons": [str(item) for item in getattr(event, "reasons", []) or []],
+        "parsed_ts": getattr(event, "ts", None),
+    }
+
+
+def limited_terminal_identity_history(
+    config: Any,
+    args: SimpleNamespace,
+    events: list[Any],
+    tz: Any,
+    start: datetime,
+    end: datetime,
+) -> dict[tuple[str, str], list[Any]]:
+    wecom_people_map = getattr(args, "wecom_people_map_loaded", {}) or {}
+    if not wecom_people_map or not events:
+        return {}
+    max_age_days = int(getattr(args, "terminal_identity_max_age_days", 30) or 0)
+    identity_start = start - timedelta(days=max_age_days) if max_age_days > 0 else start
+    names = sorted({str(getattr(event, "client_name", "") or "").strip() for event in events if str(getattr(event, "client_name", "") or "").strip()})
+    ips = sorted({str(getattr(event, "client_ip", "") or "").strip() for event in events if str(getattr(event, "client_ip", "") or "").strip()})
+    filters: list[str] = []
+    if names:
+        filters.append(f"JSONExtractString(raw_json, 'client_name') IN {ch_tuple(names[:1000])}")
+    if ips:
+        filters.append(f"JSONExtractString(raw_json, 'client_ip') IN {ch_tuple(ips[:1000])}")
+    if not filters:
+        return {}
+    query = f"""
+SELECT ts,
+  JSONExtractString(raw_json, 'process_name') AS process_name,
+  JSONExtractString(raw_json, 'client_name') AS client_name,
+  JSONExtractString(raw_json, 'client_ip') AS client_ip,
+  JSONExtractString(raw_json, 'client_login_account') AS login_account,
+  JSONExtractString(raw_json, 'local_account') AS local_account,
+  JSONExtractString(raw_json, 'local_nickname') AS local_nickname
+FROM raw_syslog
+WHERE ts >= parseDateTime64BestEffort({ch_quote(identity_start.isoformat())}, 3)
+  AND ts < parseDateTime64BestEffort({ch_quote(end.isoformat())}, 3)
+  AND topic = 'im_audit'
+  AND lower(JSONExtractString(raw_json, 'process_name')) = 'wxwork.exe'
+  AND (length(JSONExtractString(raw_json, 'client_login_account')) > 0 OR length(JSONExtractString(raw_json, 'local_nickname')) > 0)
+  AND ({' OR '.join(filters)})
+FORMAT JSONEachRow
+"""
+    rows = (json.loads(line) for line in clickhouse_query_body(config, query).splitlines() if line.strip())
+    return report_gen.build_terminal_identity_history_from_rows(rows, tz, wecom_people_map)
+
+
+def fetch_report_detail_events(config: Any, start: datetime, end: datetime, policy_doc: dict[str, Any]) -> list[dict[str, Any]]:
+    args, internal_domains = configure_report_policy_context(config, policy_doc)
+    tz = report_gen.get_tz(getattr(config, "timezone", "Asia/Shanghai"))
+    three_d, two_d, archives, _patterns = policy_exts(policy_doc)
+    signal_exts = sorted(three_d | two_d | archives)
+    query = f"""
+SELECT {report_gen.CLICKHOUSE_AUDIT_EVENT_SELECT}
+FROM audit_events
+WHERE ts >= parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
+  AND ts < parseDateTime64BestEffort({ch_quote(end.isoformat())}, 3)
+  AND topic IN ('mail_audit','im_audit','file_audit')
+  AND length(file_names) > 0
+  AND recipient_relation != 'internal'
+  AND channel != '内部系统上传'
+  AND channel != '文件重命名'
+  AND NOT has(reasons, '内部系统上传')
+  AND NOT has(reasons, '文件重命名')
+  AND (
+      hasAny(file_exts, {ch_array(signal_exts)})
+      OR hasAny(reasons, ['外设拷贝','外部站点上传','外部上传/下载地址','个人邮箱域名','外部收件域名','网盘/高风险外联目标','三维模型','DWG二维图纸','压缩包'])
+      OR arrayExists(reason -> startsWith(reason, '敏感'), reasons)
+      OR arrayExists(reason -> startsWith(reason, '{report_gen.CRITICAL_DESIGN_REASON_PREFIX}'), reasons)
+      OR level = 'HIGH'
+      OR ifNull(file_size, 0) >= 10485760
+  )
+FORMAT JSONEachRow
+"""
+    audit_events = [
+        report_gen.audit_event_from_clickhouse_row(json.loads(line), tz)
+        for line in clickhouse_query(config, query).splitlines()
+        if line.strip()
+    ]
+    if not audit_events:
+        return []
+    terminal_identity_history = limited_terminal_identity_history(config, args, audit_events, tz, start, end)
+    report_gen.apply_report_policies(audit_events, {}, internal_domains)
+    report_gen.enrich_events(
+        audit_events,
+        getattr(args, "people_map_loaded", {}) or {},
+        getattr(args, "wecom_people_map_loaded", {}) or {},
+        {},
+        {},
+        terminal_identity_history=terminal_identity_history,
+        terminal_identity_max_age_days=getattr(args, "terminal_identity_max_age_days", 30),
+    )
+    report_gen.apply_terminal_majority_identity(audit_events, terminal_identity_history)
+    detail_events, _false_positive_reasons = report_gen.report_focus_events(audit_events, internal_domains)
+    rows = [report_detail_row(event, internal_domains) for event in detail_events]
+    return [row for row in rows if row.get("parsed_ts") and candidate_scope_event(row)]
+
+
+def fetch_audit_events_from_table(config: Any, start: datetime, end: datetime, policy_doc: dict[str, Any]) -> list[dict[str, Any]]:
     three_d, two_d, archives, _patterns = policy_exts(policy_doc)
     signal_exts = sorted(three_d | two_d | archives)
     query = f"""
@@ -367,6 +558,13 @@ FORMAT JSONEachRow
         if candidate_scope_event(row):
             events.append(row)
     return events
+
+
+def fetch_audit_events(config: Any, start: datetime, end: datetime, policy_doc: dict[str, Any]) -> list[dict[str, Any]]:
+    try:
+        return fetch_report_detail_events(config, start, end, policy_doc)
+    except Exception:
+        return fetch_audit_events_from_table(config, start, end, policy_doc)
 
 
 def fetch_mac_map(config: Any) -> dict[tuple[str, str], str]:
@@ -462,6 +660,8 @@ def build_candidate(
         files.extend(str(name) for name in event.get("file_names") or [] if normalize_text(name))
         event_ids.append(str(event.get("event_id") or ""))
     person = top_counter((str(event.get("resolved_person") or event.get("person") or "") for event in ordered), "未匹配使用人")
+    company = top_counter((str(event.get("company") or "") for event in ordered), "未匹配公司")
+    department = top_counter((str(event.get("department") or "") for event in ordered), "未匹配部门")
     candidate_id = candidate_hash([event_date_value.isoformat(), client_name, client_ip, person, anomaly_type])
     return TerminalBehaviorCandidate(
         candidate_id=candidate_id,
@@ -469,8 +669,8 @@ def build_candidate(
         event_start=first.get("parsed_ts") or datetime.now(),
         event_end=last.get("parsed_ts") or first.get("parsed_ts") or datetime.now(),
         anomaly_type=anomaly_type,
-        company=top_counter((str(event.get("company") or "") for event in ordered), "未匹配公司"),
-        department=top_counter((str(event.get("department") or "") for event in ordered), "未匹配部门"),
+        company=company,
+        department=department,
         person=person,
         client_name=client_name,
         client_ip=client_ip,
