@@ -164,6 +164,7 @@ AUTH_SESSION_FILE = ".auth_sessions.json"
 DEFAULT_POLICY_ADMIN_USERIDS = [FIXED_POLICY_ADMIN_USERID]
 DEFAULT_PLM_CONSTRAINED_DEPARTMENTS = ["技术部", "研发部", "工艺部"]
 DEFAULT_PLM_TERMINAL_MATCH_FIELDS = ["ip_address", "computer_name"]
+ENCRYPTION_TERMINAL_TRUST_DAYS = 7
 
 
 @dataclass
@@ -4191,7 +4192,10 @@ SELECT
     min(import_time) AS import_time,
     count() AS rows,
     uniqExactIf(tuple(ip_address, computer_name), notEmpty(ip_address) AND notEmpty(computer_name)) AS terminal_keys,
+    uniqExactIf(tuple(ip_address, computer_name), notEmpty(ip_address) AND notEmpty(computer_name) AND last_seen >= now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY) AS trusted_terminal_keys,
     uniqExactIf(ip_address, notEmpty(ip_address)) AS ips,
+    uniqExactIf(ip_address, notEmpty(ip_address) AND last_seen >= now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY) AS trusted_ips,
+    countIf(isNull(last_seen) OR last_seen < now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY) AS expired_rows,
     uniqExactIf(company, notEmpty(company)) AS companies
 FROM encryption_terminal_inventory FINAL
 GROUP BY import_batch
@@ -4205,14 +4209,17 @@ FORMAT JSONEachRow
 def latest_encryption_terminal_pool(config: AppConfig) -> dict[str, Any]:
     rows = encryption_terminal_query(
         config,
-        """
+        f"""
 SELECT
     import_batch,
     anyLast(source_file) AS source_file,
     max(import_time) AS import_time,
     count() AS rows,
     uniqExactIf(tuple(ip_address, computer_name), notEmpty(ip_address) AND notEmpty(computer_name)) AS terminal_keys,
+    uniqExactIf(tuple(ip_address, computer_name), notEmpty(ip_address) AND notEmpty(computer_name) AND last_seen >= now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY) AS trusted_terminal_keys,
     uniqExactIf(ip_address, notEmpty(ip_address)) AS ips,
+    uniqExactIf(ip_address, notEmpty(ip_address) AND last_seen >= now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY) AS trusted_ips,
+    countIf(isNull(last_seen) OR last_seen < now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY) AS expired_rows,
     uniqExactIf(company, notEmpty(company)) AS companies
 FROM encryption_terminal_inventory FINAL
 GROUP BY import_batch
@@ -4250,6 +4257,8 @@ SELECT
     t.client_version,
     t.encryption_status,
     t.last_seen,
+    t.is_trusted,
+    t.trust_status,
     d.ip_rows,
     d.terminal_keys
 FROM
@@ -4265,7 +4274,9 @@ FROM
         os_version,
         client_version,
         encryption_status,
-        last_seen
+        last_seen,
+        if(last_seen >= now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY, 1, 0) AS is_trusted,
+        multiIf(isNull(last_seen), '无最后在线时间', last_seen < now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY, '超过{ENCRYPTION_TERMINAL_TRUST_DAYS}天未在线', '授信有效') AS trust_status
     FROM encryption_terminal_inventory FINAL
     WHERE import_batch = {quoted_batch} AND notEmpty(ip_address)
 ) AS t
@@ -4382,6 +4393,8 @@ SELECT
     t.client_version,
     t.encryption_status,
     t.last_seen,
+    t.is_trusted,
+    t.trust_status,
     ifNull(d.ip_rows, 0) AS ip_rows
 FROM
 (
@@ -4396,7 +4409,9 @@ FROM
         os_version,
         client_version,
         encryption_status,
-        last_seen
+        last_seen,
+        if(last_seen >= now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY, 1, 0) AS is_trusted,
+        multiIf(isNull(last_seen), '无最后在线时间', last_seen < now('Asia/Shanghai') - INTERVAL {ENCRYPTION_TERMINAL_TRUST_DAYS} DAY, '超过{ENCRYPTION_TERMINAL_TRUST_DAYS}天未在线', '授信有效') AS trust_status
     FROM encryption_terminal_inventory FINAL
     WHERE import_batch = {quoted_batch}
     {duplicate_filter}
@@ -4631,7 +4646,7 @@ def settings_page(config: AppConfig) -> bytes:
     terminal_pool = latest_encryption_terminal_pool(config)
     terminal_metric = "未导入"
     if terminal_pool:
-        terminal_metric = f"{int(terminal_pool.get('terminal_keys') or 0)} 个终端键"
+        terminal_metric = f"{int(terminal_pool.get('trusted_terminal_keys') or 0)} 个授信终端键"
     body = f"""
     <header>
       <div>
@@ -4722,13 +4737,13 @@ def settings_page(config: AppConfig) -> bytes:
       <div class="settings-card">
         <h3>加密终端列表</h3>
         <p class="metric">{esc(terminal_metric)}</p>
-        <p class="muted">上传加密软件终端清单，最新批次按 IP+计算机名作为 PLM 合规终端池来源。</p>
+        <p class="muted">上传加密软件终端清单，最新批次中 7 天内在线的 IP+计算机名作为 PLM 授信终端池来源。</p>
         <div class="actions"><a class="button primary" href="/settings/encryption-terminals">上传终端列表</a></div>
       </div>
       <div class="settings-card">
         <h3>PLM登录审计策略</h3>
         <p class="metric">{len(plm_departments)} 个部门</p>
-        <p class="muted">仅跟踪强约束部门账号；登录终端不在加密终端池时判一级风险。</p>
+        <p class="muted">仅跟踪强约束部门账号；登录终端不在 7 天内在线的加密终端池时判一级风险。</p>
         <div class="actions"><a class="button primary" href="/settings/plm-login">维护PLM策略</a></div>
       </div>
         </div>
@@ -4976,7 +4991,7 @@ def plm_login_policy_page(config: AppConfig, message: str = "", error: str = "")
     <header>
       <div>
         <h1>PLM登录审计策略</h1>
-        <div class="muted">定义需要强制使用加密终端合规终端池登录 PLM 的部门范围。</div>
+        <div class="muted">定义需要强制使用 7 天内在线的加密终端授信池登录 PLM 的部门范围。</div>
       </div>
       <div class="actions">
         <a class="button" href="/settings">策略中心</a>
@@ -4992,14 +5007,14 @@ def plm_login_policy_page(config: AppConfig, message: str = "", error: str = "")
         <label class="full">部门名称，逗号分隔
           <textarea name="constrained_departments" spellcheck="false" placeholder="技术部, 研发部, 工艺部">{esc(department_text)}</textarea>
         </label>
-        <p class="muted full">PLM账号匹配到企业微信通讯录，且部门命中该列表时，登录 IP + 计算机名不在最新加密终端合规终端池内即判一级风险。列表外部门暂不跟踪。</p>
+        <p class="muted full">PLM账号匹配到企业微信通讯录，且部门命中该列表时，登录 IP + 计算机名不在最新加密终端授信池内即判一级风险；最后在线超过 {ENCRYPTION_TERMINAL_TRUST_DAYS} 天的终端视为加密失效，不进入授信池。列表外部门暂不跟踪。</p>
         <div class="full actions"><button class="primary" type="submit">保存覆盖</button></div>
       </form>
     </section>
     <section class="panel">
       <h2>当前口径</h2>
-      <p class="muted">合规终端键：{esc(' + '.join(terminal_match_fields))}。PLM 登录接口接入后会按该键匹配最新加密终端批次。</p>
-      <div class="table-wrap"><table><thead><tr><th>部门</th><th>规则</th></tr></thead><tbody>{"".join(f"<tr><td>{esc(item)}</td><td>登录IP+计算机名不在合规终端池判一级风险</td></tr>" for item in departments) or '<tr><td colspan="2" class="muted">暂无强约束部门。</td></tr>'}</tbody></table></div>
+      <p class="muted">授信终端键：{esc(' + '.join(terminal_match_fields))}；有效条件：最后在线时间在 {ENCRYPTION_TERMINAL_TRUST_DAYS} 天内。PLM 登录接口接入后会按该键匹配最新加密终端批次。</p>
+      <div class="table-wrap"><table><thead><tr><th>部门</th><th>规则</th></tr></thead><tbody>{"".join(f"<tr><td>{esc(item)}</td><td>登录IP+计算机名不在7天内在线授信终端池判一级风险</td></tr>" for item in departments) or '<tr><td colspan="2" class="muted">暂无强约束部门。</td></tr>'}</tbody></table></div>
     </section>
 """
     return page_shell("PLM登录审计策略", body)
@@ -5094,15 +5109,22 @@ def encryption_terminals_page(
             f"<td>{esc(item.get('source_file') or '-')}</td>"
             f"<td>{esc(item.get('import_time') or '-')}</td>"
             f"<td>{esc(item.get('rows') or 0)}</td>"
+            f"<td>{esc(item.get('trusted_terminal_keys') or 0)}</td>"
             f"<td>{esc(item.get('terminal_keys') or 0)}</td>"
             f"<td>{esc(item.get('ips') or 0)}</td>"
+            f"<td>{esc(item.get('expired_rows') or 0)}</td>"
             f"<td>{esc(item.get('companies') or 0)}</td>"
             "</tr>"
         )
-    batch_table = "".join(rows) or '<tr><td colspan="7" class="muted">暂无导入批次。</td></tr>'
+    batch_table = "".join(rows) or '<tr><td colspan="9" class="muted">暂无导入批次。</td></tr>'
     duplicate_html = []
     for item in duplicate_rows:
         ip_rows = int(item.get("ip_rows") or 0)
+        trust_badge = (
+            '<span class="mini-badge">授信</span>'
+            if int(item.get("is_trusted") or 0)
+            else f'<span class="mini-badge danger" title="{esc(item.get("trust_status") or "失效")}">失效</span>'
+        )
         duplicate_html.append(
             '<tr class="duplicate-ip-row">'
             f"<td>{esc(item.get('ip_address') or '-')}</td>"
@@ -5115,14 +5137,20 @@ def encryption_terminals_page(
             f"<td>{esc(item.get('department') or '-')}</td>"
             f"<td>{esc(item.get('os_version') or '-')}</td>"
             f"<td>{esc(item.get('encryption_status') or '-')}</td>"
+            f"<td>{trust_badge}</td>"
             f"<td>{esc(item.get('last_seen') or '-')}</td>"
             "</tr>"
         )
-    duplicate_table = "".join(duplicate_html) or '<tr><td colspan="11" class="muted">最新批次未发现重复 IP。</td></tr>'
+    duplicate_table = "".join(duplicate_html) or '<tr><td colspan="12" class="muted">最新批次未发现重复 IP。</td></tr>'
     terminal_html = []
     for item in terminal_records:
         ip_rows = int(item.get("ip_rows") or 0)
         duplicate_badge = f'<span class="mini-badge warn">重复 {ip_rows}</span>' if ip_rows > 1 else '<span class="mini-badge">唯一</span>'
+        trust_badge = (
+            '<span class="mini-badge">授信</span>'
+            if int(item.get("is_trusted") or 0)
+            else f'<span class="mini-badge danger" title="{esc(item.get("trust_status") or "失效")}">失效</span>'
+        )
         terminal_html.append(
             "<tr>"
             f"<td>{esc(item.get('ip_address') or '-')}</td>"
@@ -5136,10 +5164,11 @@ def encryption_terminals_page(
             f"<td>{esc(item.get('os_version') or '-')}</td>"
             f"<td>{esc(item.get('client_version') or '-')}</td>"
             f"<td>{esc(item.get('encryption_status') or '-')}</td>"
+            f"<td>{trust_badge}</td>"
             f"<td>{esc(item.get('last_seen') or '-')}</td>"
             "</tr>"
         )
-    terminal_table = "".join(terminal_html) or '<tr><td colspan="12" class="muted">暂无终端记录。</td></tr>'
+    terminal_table = "".join(terminal_html) or '<tr><td colspan="13" class="muted">暂无终端记录。</td></tr>'
     def list_url(target_page: int = 1, size: int | None = None, duplicate: bool | None = None) -> str:
         query = {
             "page": str(max(1, target_page)),
@@ -5167,8 +5196,10 @@ def encryption_terminals_page(
     if latest_pool:
         pool_text = (
             f"最新批次 {latest_pool.get('import_batch') or '-'}："
-            f"{int(latest_pool.get('terminal_keys') or 0)} 个合规终端键，"
+            f"{int(latest_pool.get('trusted_terminal_keys') or 0)} 个授信终端键，"
+            f"{int(latest_pool.get('terminal_keys') or 0)} 个全部终端键，"
             f"{int(latest_pool.get('ips') or 0)} 个去重 IP，"
+            f"{int(latest_pool.get('expired_rows') or 0)} 条超过{ENCRYPTION_TERMINAL_TRUST_DAYS}天未在线/无在线时间记录，"
             f"{int(latest_pool.get('rows') or 0)} 条终端记录。"
         )
     msg = f'<p class="muted">{esc(message)}</p>' if message else ""
@@ -5177,7 +5208,7 @@ def encryption_terminals_page(
     <header>
       <div>
         <h1>加密终端列表导入</h1>
-        <div class="muted">上传加密软件终端清单 .xlsx；最新导入批次按 IP + 计算机名作为合规终端池来源。</div>
+        <div class="muted">上传加密软件终端清单 .xlsx；最新导入批次中 7 天内在线的 IP + 计算机名作为授信终端池来源。</div>
       </div>
       <div class="actions">
         <a class="button" href="/settings">策略中心</a>
@@ -5188,9 +5219,9 @@ def encryption_terminals_page(
     {msg}
     {error_html}
     <section class="panel">
-      <h2>当前合规终端池来源</h2>
+      <h2>当前授信终端池来源</h2>
       <p class="metric">{esc(pool_text)}</p>
-      <p class="muted">该页面只维护数据源。PLM 登录审计等模块后续会读取最新批次中的 `IP地址 + 计算机名` 作为合规终端键，不使用历史批次叠加；若 PLM 登录记录缺少计算机名，应单独标记为待复核，不按纯 IP 自动放行。</p>
+      <p class="muted">该页面只维护数据源。PLM 登录审计等模块后续会读取最新批次中 `IP地址 + 计算机名` 且最后在线时间在 {ENCRYPTION_TERMINAL_TRUST_DAYS} 天内的记录作为授信终端键；超过 {ENCRYPTION_TERMINAL_TRUST_DAYS} 天未在线视为加密失效，不进入授信池。若 PLM 登录记录缺少计算机名，应单独标记为待复核，不按纯 IP 自动放行。</p>
     </section>
     <section class="panel">
       <div class="settings-toolbar">
@@ -5200,17 +5231,17 @@ def encryption_terminals_page(
         </div>
         <span class="mini-badge danger">{duplicate_ip_count} 个重复IP / {len(duplicate_rows)} 条记录</span>
       </div>
-      <div class="table-wrap"><table><thead><tr><th>IP地址</th><th>重复标注</th><th>计算机名</th><th>MAC地址</th><th>使用人</th><th>账号</th><th>公司</th><th>部门</th><th>操作系统</th><th>状态</th><th>最后在线</th></tr></thead><tbody>{duplicate_table}</tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>IP地址</th><th>重复标注</th><th>计算机名</th><th>MAC地址</th><th>使用人</th><th>账号</th><th>公司</th><th>部门</th><th>操作系统</th><th>状态</th><th>授信状态</th><th>最后在线</th></tr></thead><tbody>{duplicate_table}</tbody></table></div>
     </section>
     <section class="panel">
       <div class="settings-toolbar">
         <div>
           <h2>最新批次终端清单</h2>
-          <p class="muted">当前显示 {esc('仅重复IP' if duplicate_ip_only else '全部终端')}，共 {total_records} 条；合规终端键为 `IP地址 + 计算机名`。</p>
+          <p class="muted">当前显示 {esc('仅重复IP' if duplicate_ip_only else '全部终端')}，共 {total_records} 条；授信终端键为 `IP地址 + 计算机名` 且最后在线时间在 {ENCRYPTION_TERMINAL_TRUST_DAYS} 天内。</p>
         </div>
         <div class="actions">{mode_actions}{size_actions}</div>
       </div>
-      <div class="table-wrap"><table><thead><tr><th>IP地址</th><th>计算机名</th><th>IP状态</th><th>MAC地址</th><th>使用人</th><th>账号</th><th>公司</th><th>部门</th><th>操作系统</th><th>客户端版本</th><th>状态</th><th>最后在线</th></tr></thead><tbody>{terminal_table}</tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>IP地址</th><th>计算机名</th><th>IP状态</th><th>MAC地址</th><th>使用人</th><th>账号</th><th>公司</th><th>部门</th><th>操作系统</th><th>客户端版本</th><th>状态</th><th>授信状态</th><th>最后在线</th></tr></thead><tbody>{terminal_table}</tbody></table></div>
       <div class="pager">
         <span>第 {page} / {page_count} 页，每页 {page_size} 条</span>
         <div class="actions">{pager_actions}</div>
@@ -5228,7 +5259,7 @@ def encryption_terminals_page(
     </section>
     <section class="panel">
       <h2>最近导入批次</h2>
-      <div class="table-wrap"><table><thead><tr><th>批次</th><th>源文件</th><th>导入时间</th><th>终端记录</th><th>终端键</th><th>IP数</th><th>公司数</th></tr></thead><tbody>{batch_table}</tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>批次</th><th>源文件</th><th>导入时间</th><th>终端记录</th><th>授信终端键</th><th>全部终端键</th><th>IP数</th><th>失效记录</th><th>公司数</th></tr></thead><tbody>{batch_table}</tbody></table></div>
     </section>
 """
     return page_shell("加密终端列表导入", body)
