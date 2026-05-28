@@ -95,6 +95,7 @@ from tianqing_report_modules import (
     TianqingOutboundModuleBuilders,
     TianqingRenameTrackingResult,
     build_decrypt_audit_home_module,
+    build_global_management_summary_html,
     build_plm_login_audit_home_module,
     build_tianqing_outbound_module_result,
     render_report_home_modules,
@@ -8990,11 +8991,17 @@ def build_html_report(
     debug_timing(
         f"tianqing outbound module complete pages={len(tianqing_module_result.sidecar_pages)} metrics={tianqing_module_result.metrics} sidecars={len(sidecar_reports)}"
     )
-    home_focus_text = "首页分为天擎外发审计和加密软件解密审计两大板块；趋势、矩阵和下钻明细均按各自数据源独立呈现。"
+    plm_home_module = build_plm_login_audit_home_module(enabled=False)
+    global_management_summary_html = build_global_management_summary_html(
+        decrypt_module_result.metrics,
+        tianqing_module_result.metrics,
+        {"enabled": False},
+    )
+    home_focus_text = "首页按三大模块组织：加密软件解密审计、天擎外发审计和 PLM 登录审计；趋势、矩阵和下钻明细均按各自数据源独立呈现。"
     home_modules = [
         decrypt_module_result.home_module,
         tianqing_module_result.home_module,
-        build_plm_login_audit_home_module(enabled=False),
+        plm_home_module,
     ]
     home_modules_html = render_report_home_modules(home_modules)
     main_html = f"""<!doctype html>
@@ -10993,6 +11000,115 @@ def build_html_report(
       background: rgba(255, 255, 255, 0.94);
       box-shadow: var(--shadow-soft);
     }}
+    .global-management-summary {{
+      position: relative;
+      overflow: hidden;
+      margin-top: 28px;
+      border: 1px solid rgba(18, 32, 51, 0.10);
+      border-radius: 18px;
+      padding: 22px;
+      background:
+        radial-gradient(circle at 92% 4%, rgba(23, 92, 211, 0.12) 0, transparent 32%),
+        linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+      box-shadow: var(--shadow-soft);
+    }}
+    .global-management-summary::before {{
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 5px;
+      background: linear-gradient(180deg, #7c3aed, var(--blue), var(--teal));
+    }}
+    .global-management-head {{
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 16px;
+    }}
+    .global-management-head h2 {{
+      margin: 3px 0 0;
+      color: #122033;
+      font-size: 24px;
+      font-weight: 900;
+      letter-spacing: 0;
+    }}
+    .global-management-head p {{
+      max-width: 880px;
+      margin: 0;
+      color: #475467;
+      font-size: 14px;
+      font-weight: 720;
+      line-height: 1.75;
+    }}
+    .management-module-grid {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }}
+    .management-module-card {{
+      display: flex;
+      min-height: 150px;
+      flex-direction: column;
+      border: 1px solid #dbe6f3;
+      border-radius: 14px;
+      padding: 16px;
+      color: #122033;
+      background: #ffffff;
+      box-shadow: 0 10px 24px rgba(18, 32, 51, 0.055);
+      text-decoration: none;
+      transition: transform 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
+    }}
+    .management-module-card:hover {{
+      transform: translateY(-1px);
+      border-color: #93c5fd;
+      box-shadow: 0 14px 30px rgba(18, 32, 51, 0.085);
+    }}
+    .management-module-card span {{
+      color: #175cd3;
+      font-size: 12px;
+      font-weight: 850;
+    }}
+    .management-module-card strong {{
+      margin-top: 8px;
+      font-size: 30px;
+      font-weight: 920;
+      line-height: 1;
+    }}
+    .management-module-card em {{
+      margin-top: 7px;
+      color: #475467;
+      font-size: 13px;
+      font-style: normal;
+      font-weight: 800;
+      line-height: 1.4;
+    }}
+    .management-module-card p {{
+      margin: auto 0 0;
+      padding-top: 12px;
+      color: #667085;
+      font-size: 13px;
+      font-weight: 680;
+      line-height: 1.65;
+    }}
+    .management-module-card-decrypt {{
+      border-color: rgba(124, 58, 237, 0.22);
+    }}
+    .management-module-card-tianqing {{
+      border-color: rgba(15, 118, 110, 0.22);
+    }}
+    .management-module-card-plm {{
+      border-color: rgba(180, 83, 9, 0.22);
+    }}
+    .global-management-action {{
+      margin: 14px 0 0;
+      border-top: 1px solid #e6edf5;
+      padding-top: 13px;
+      color: #475467;
+      font-size: 13px;
+      font-weight: 760;
+      line-height: 1.7;
+    }}
     .audit-domain {{
       margin-top: 30px;
     }}
@@ -11292,6 +11408,8 @@ def build_html_report(
       .kpi, .kpi:first-child, .kpi:nth-child(2) {{ grid-column: span 1; }}
       .section-block {{ padding: 18px; }}
       .section-title-row {{ flex-direction: column; }}
+      .global-management-head {{ flex-direction: column; align-items: flex-start; }}
+      .management-module-grid {{ grid-template-columns: 1fr; }}
       .audit-domain-head {{ flex-direction: column; align-items: flex-start; }}
       .audit-domain-source {{ text-align: left; }}
       .section-action {{ width: 100%; }}
@@ -11339,6 +11457,8 @@ def build_html_report(
         <span>重点看风险、责任和闭环。</span>
       </aside>
     </header>
+
+    {global_management_summary_html}
 
     {home_modules_html}
 

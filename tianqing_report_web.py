@@ -1080,6 +1080,219 @@ def inject_report_navigation_patch(data: bytes) -> bytes:
     return updated.encode("utf-8") if updated != text else data
 
 
+def _html_plain_text(fragment: str) -> str:
+    text = re.sub(r"(?is)<script\b.*?</script>|<style\b.*?</style>", " ", fragment)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", html.unescape(text)).strip()
+
+
+def _section_html(text: str, section_id: str) -> str:
+    pattern = rf'<section\b[^>]*\bid="{re.escape(section_id)}"[\s\S]*?(?=<section\b[^>]*\bid="(?:decrypt-audit|tianqing-audit|plm-login-audit)"|<footer\b|</main>)'
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    return match.group(0) if match else ""
+
+
+def _first_conclusion_text(section: str, fallback: str) -> str:
+    match = re.search(r"<li\b[^>]*>([\s\S]*?)</li>", section, flags=re.IGNORECASE)
+    if not match:
+        match = re.search(r"<p\b[^>]*>([\s\S]*?)</p>", section, flags=re.IGNORECASE)
+    if not match:
+        return fallback
+    return _html_plain_text(match.group(1)) or fallback
+
+
+def _first_regex_value(pattern: str, text: str, default: str = "-") -> str:
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    return match.group(1) if match else default
+
+
+def inject_global_management_summary(data: bytes) -> bytes:
+    text = data.decode("utf-8", errors="replace")
+    if 'id="global-management-summary"' in text:
+        return data
+    if 'id="decrypt-audit"' not in text and 'id="tianqing-audit"' not in text:
+        return data
+
+    decrypt_section = _section_html(text, "decrypt-audit")
+    tianqing_section = _section_html(text, "tianqing-audit")
+    decrypt_plain = _html_plain_text(decrypt_section)
+    tianqing_plain = _html_plain_text(tianqing_section)
+    decrypt_value = _first_regex_value(r"解密审计记录\s*(\d+)\s*条", decrypt_plain)
+    decrypt_standard = _first_regex_value(r"标准图纸\s*(\d+)\s*条", decrypt_plain)
+    tianqing_value = _first_regex_value(r"重点事件\s*(\d+)\s*条", tianqing_plain)
+    tianqing_terminals = _first_regex_value(r"风险终端\s*(\d+)\s*台", tianqing_plain)
+    if decrypt_value == "-" and "暂无解密记录" in decrypt_plain:
+        decrypt_value = "0"
+    if decrypt_standard == "-":
+        decrypt_standard = _first_regex_value(r"标准图纸解密总数\s*(\d+)", decrypt_plain)
+    if tianqing_terminals == "-":
+        tianqing_terminals = _first_regex_value(r"(\d+)\s*台风险终端", tianqing_plain)
+    decrypt_sentence = _first_conclusion_text(
+        decrypt_section,
+        "加密软件解密审计重点关注标准图纸、三维模型、DWG 图纸及其后续流转线索。",
+    )
+    tianqing_sentence = _first_conclusion_text(
+        tianqing_section,
+        "天擎外发审计重点关注邮件、IM、外部站点上传和外设拷贝中的设计资料与敏感附件。",
+    )
+    lead = (
+        f"本周期风险概况：加密软件解密 {decrypt_value} 条，标准图纸 {decrypt_standard} 条；"
+        f"天擎外发重点事件 {tianqing_value} 条，涉及风险终端 {tianqing_terminals} 台；"
+        "PLM 登录审计待接入。"
+    )
+    style = """
+<style id="global-management-summary-style">
+  .global-management-summary {
+    position: relative;
+    overflow: hidden;
+    margin-top: 28px;
+    border: 1px solid rgba(18, 32, 51, 0.10);
+    border-radius: 18px;
+    padding: 22px;
+    background: radial-gradient(circle at 92% 4%, rgba(23, 92, 211, 0.12) 0, transparent 32%), linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+    box-shadow: 0 14px 34px rgba(16, 24, 40, 0.08);
+  }
+  .global-management-summary::before {
+    content: "";
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 5px;
+    background: linear-gradient(180deg, #7c3aed, #245edb, #08746f);
+  }
+  .global-management-head {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 18px;
+    margin-bottom: 16px;
+  }
+  .global-management-head h2 {
+    margin: 3px 0 0;
+    color: #122033;
+    font-size: 24px;
+    font-weight: 900;
+    letter-spacing: 0;
+  }
+  .global-management-head p {
+    max-width: 880px;
+    margin: 0;
+    color: #475467;
+    font-size: 14px;
+    font-weight: 720;
+    line-height: 1.75;
+  }
+  .management-module-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+  }
+  .management-module-card {
+    display: flex;
+    min-height: 150px;
+    flex-direction: column;
+    border: 1px solid #dbe6f3;
+    border-radius: 14px;
+    padding: 16px;
+    color: #122033;
+    background: #fff;
+    box-shadow: 0 10px 24px rgba(18, 32, 51, 0.055);
+    text-decoration: none;
+  }
+  .management-module-card:hover {
+    transform: translateY(-1px);
+    border-color: #93c5fd;
+    box-shadow: 0 14px 30px rgba(18, 32, 51, 0.085);
+  }
+  .management-module-card span {
+    color: #175cd3;
+    font-size: 12px;
+    font-weight: 850;
+  }
+  .management-module-card strong {
+    margin-top: 8px;
+    font-size: 30px;
+    font-weight: 920;
+    line-height: 1;
+  }
+  .management-module-card em {
+    margin-top: 7px;
+    color: #475467;
+    font-size: 13px;
+    font-style: normal;
+    font-weight: 800;
+    line-height: 1.4;
+  }
+  .management-module-card p {
+    margin: auto 0 0;
+    padding-top: 12px;
+    color: #667085;
+    font-size: 13px;
+    font-weight: 680;
+    line-height: 1.65;
+  }
+  .management-module-card-decrypt { border-color: rgba(124, 58, 237, 0.22); }
+  .management-module-card-tianqing { border-color: rgba(15, 118, 110, 0.22); }
+  .management-module-card-plm { border-color: rgba(180, 83, 9, 0.22); }
+  .global-management-action {
+    margin: 14px 0 0;
+    border-top: 1px solid #e6edf5;
+    padding-top: 13px;
+    color: #475467;
+    font-size: 13px;
+    font-weight: 760;
+    line-height: 1.7;
+  }
+  @media (max-width: 900px) {
+    .global-management-head { flex-direction: column; align-items: flex-start; }
+    .management-module-grid { grid-template-columns: 1fr; }
+  }
+</style>
+"""
+    block = f"""
+    <section id="global-management-summary" class="global-management-summary" aria-labelledby="global-management-summary-title">
+      <div class="global-management-head">
+        <div>
+          <span class="section-eyebrow">Management Summary</span>
+          <h2 id="global-management-summary-title">三大模块管理结论</h2>
+        </div>
+        <p>{esc(lead)}</p>
+      </div>
+      <div class="management-module-grid">
+        <a class="management-module-card management-module-card-decrypt" href="#decrypt-audit">
+          <span>加密软件解密审计</span>
+          <strong>{esc(decrypt_value)}</strong>
+          <em>标准图纸 {esc(decrypt_standard)}</em>
+          <p>{esc(decrypt_sentence)}</p>
+        </a>
+        <a class="management-module-card management-module-card-tianqing" href="#tianqing-audit">
+          <span>天擎外发审计</span>
+          <strong>{esc(tianqing_value)}</strong>
+          <em>风险终端 {esc(tianqing_terminals)}</em>
+          <p>{esc(tianqing_sentence)}</p>
+        </a>
+        <div class="management-module-card management-module-card-plm">
+          <span>PLM登录审计</span>
+          <strong>未纳入</strong>
+          <em>待接入</em>
+          <p>接口接入后重点校验技术、研发、工艺账号是否从 MAC+计算机名授信终端登录。</p>
+        </div>
+      </div>
+      <p class="global-management-action">管理动作建议：先看标准图纸解密和天擎外发矩阵，再下钻公司、部门和终端；PLM 模块上线后作为账号登录合规补充，不替代天擎外发和解密流转证据。</p>
+    </section>
+"""
+    marker_match = re.search(r'<section\b[^>]*\bid="(?:decrypt-audit|tianqing-audit)"', text, flags=re.IGNORECASE)
+    if not marker_match:
+        return data
+    if "global-management-summary-style" not in text:
+        if re.search(r"</head>", text, flags=re.IGNORECASE):
+            text = re.sub(r"</head>", style + r"\g<0>", text, count=1, flags=re.IGNORECASE)
+        else:
+            text = style + text
+    idx = marker_match.start()
+    text = text[:idx] + block + "\n" + text[idx:]
+    return text.encode("utf-8")
+
+
 def archive_dropdown_label(entry: dict[str, Any]) -> str:
     period = str(entry.get("period") or "报告")
     report_range = str(entry.get("report_range") or "").strip()
@@ -6679,6 +6892,7 @@ class ReportHandler(BaseHTTPRequestHandler):
                 data = suppress_static_ai_section(data)
             data = inject_identity_bar(data, session)
             data = inject_report_navigation_patch(data)
+            data = inject_global_management_summary(data)
             data = inject_home_history_dropdown(data, self.config, session)
             data = inject_temporary_report_cleanup(data, self.config, target)
             path = unquote(request_path.split("?", 1)[0].split("#", 1)[0])
