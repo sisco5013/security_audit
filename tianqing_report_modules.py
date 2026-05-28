@@ -181,7 +181,6 @@ def build_global_management_summary_html(
     decrypt_electrical = _metric_int(decrypt_metrics, "electrical")
 
     tianqing_standard = _standard_design_total_from_metrics(tianqing_metrics)
-    tianqing_level_one = _tianqing_level_one_total_from_metrics(tianqing_metrics)
     tianqing_structure = _metric_int(tianqing_metrics, "critical_structure")
     tianqing_electrical = _metric_int(tianqing_metrics, "critical_electrical")
     tianqing_large_archive = _metric_int(tianqing_metrics, "critical_large_archive")
@@ -198,16 +197,6 @@ def build_global_management_summary_html(
     review_total = _metric_int(review_metrics, "total")
     review_pending = _metric_int(review_metrics, "pending")
     review_done = _metric_int(review_metrics, "reviewed")
-
-    if decrypt_standard or tianqing_level_one or plm_risks:
-        lead = (
-            f"本周期一级风险概况：标准图纸解密 {decrypt_standard} 条；"
-            f"天擎标准图纸外发/拷贝 {tianqing_standard} 条（结构 {tianqing_structure} 条、电气 {tianqing_electrical} 条），"
-            f"大于100MB压缩包 {tianqing_large_archive} 条；"
-            f"PLM 登录审计{plm_label}{' ' + str(plm_risks) + ' 条' if plm_enabled else ''}。"
-        )
-    else:
-        lead = "本周期三大审计模块暂无一级风险数据，仍按标准图纸解密、天擎标准图纸外发/拷贝、大于100MB压缩包和 PLM 池外登录保留持续监测。"
 
     def row_html(label: str, body: str, href: str = "", tone: str = "blue") -> str:
         tag = "a" if href else "div"
@@ -252,7 +241,6 @@ def build_global_management_summary_html(
           <span class="section-eyebrow">Management Summary</span>
           <h2 id="global-management-summary-title">三大模块汇总管理结论</h2>
         </div>
-        <p>{_esc(lead)}</p>
       </div>
       <div class="management-summary-list">
         {"".join(rows)}
