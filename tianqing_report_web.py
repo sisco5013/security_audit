@@ -4795,118 +4795,88 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
         return data
     summary_url = live_decrypt_url("/api/decrypt-risk-summary-fragment", start, end)
     detail_url = live_decrypt_url("/api/decrypt-risk-fragment", start, end)
-    placeholder = live_decrypt_loading_placeholder_html(start, end)
-    placeholder_json = json.dumps(placeholder, ensure_ascii=False)
     prehide_style = """
 <style id="tq-live-decrypt-prehide">
-  #decrypt-risk-tracking[data-live-decrypt-state="loading"] > :not(.live-decrypt-stage) {
+  #decrypt-risk-overview[data-live-decrypt-state="loading"] {
     display: none !important;
   }
-  #decrypt-risk-tracking[data-live-decrypt-state="summary"] .live-decrypt-stage {
-    margin-top: 14px;
+  #decrypt-risk-tracking .live-decrypt-inline-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 12px;
+    color: #475467;
+    font-size: 13px;
+    font-weight: 760;
   }
-  #decrypt-risk-tracking[data-live-decrypt-state="summary"] .decrypt-trend-panel,
-  #decrypt-risk-tracking[data-live-decrypt-state="summary"] .decrypt-company-matrix,
+  #decrypt-risk-tracking .live-decrypt-inline-status::before {
+    content: "";
+    width: 7px;
+    height: 7px;
+    border-radius: 999px;
+    background: #175cd3;
+    box-shadow: 11px 0 0 rgba(23, 92, 211, .38), 22px 0 0 rgba(23, 92, 211, .18);
+    animation: liveDecryptDots 1.05s infinite ease-in-out;
+  }
+  #decrypt-risk-tracking[data-live-decrypt-state="loading"] .rename-empty,
   #decrypt-risk-tracking[data-live-decrypt-state="summary"] .rename-empty {
     display: none !important;
   }
-  .live-decrypt-stage {
+  #decrypt-risk-tracking[data-live-decrypt-state="loading"] .decrypt-card-grid strong,
+  #decrypt-risk-tracking[data-live-decrypt-state="loading"] .decrypt-card-grid span,
+  #decrypt-risk-tracking[data-live-decrypt-state="summary"] .decrypt-trend-panel .trend-legend-item strong,
+  #decrypt-risk-tracking[data-live-decrypt-state="summary"] .decrypt-trend-panel .trend-axis-label,
+  #decrypt-risk-tracking[data-live-decrypt-state="summary"] .decrypt-company-matrix .matrix-count,
+  #decrypt-risk-tracking[data-live-decrypt-state="summary"] .decrypt-company-matrix .matrix-total,
+  #decrypt-risk-tracking[data-live-decrypt-state="loading"] .decrypt-trend-panel .trend-legend-item strong,
+  #decrypt-risk-tracking[data-live-decrypt-state="loading"] .decrypt-trend-panel .trend-axis-label,
+  #decrypt-risk-tracking[data-live-decrypt-state="loading"] .decrypt-company-matrix .matrix-count,
+  #decrypt-risk-tracking[data-live-decrypt-state="loading"] .decrypt-company-matrix .matrix-total {
     position: relative;
-    overflow: hidden;
-    border: 1px solid #d8e4f2;
-    border-radius: 16px;
-    padding: 18px 20px;
-    background: linear-gradient(180deg, #ffffff 0%, #f7fbff 100%);
-    box-shadow: 0 12px 28px rgba(18, 32, 51, 0.055);
+    color: transparent !important;
   }
-  .live-decrypt-stage::before {
-    content: "";
+  #decrypt-risk-tracking[data-live-decrypt-state="loading"] .decrypt-card-grid strong::after,
+  #decrypt-risk-tracking[data-live-decrypt-state="loading"] .decrypt-card-grid span::after,
+  #decrypt-risk-tracking[data-live-decrypt-state="summary"] .decrypt-trend-panel .trend-legend-item strong::after,
+  #decrypt-risk-tracking[data-live-decrypt-state="summary"] .decrypt-trend-panel .trend-axis-label::after,
+  #decrypt-risk-tracking[data-live-decrypt-state="summary"] .decrypt-company-matrix .matrix-count::after,
+  #decrypt-risk-tracking[data-live-decrypt-state="summary"] .decrypt-company-matrix .matrix-total::after,
+  #decrypt-risk-tracking[data-live-decrypt-state="loading"] .decrypt-trend-panel .trend-legend-item strong::after,
+  #decrypt-risk-tracking[data-live-decrypt-state="loading"] .decrypt-trend-panel .trend-axis-label::after,
+  #decrypt-risk-tracking[data-live-decrypt-state="loading"] .decrypt-company-matrix .matrix-count::after,
+  #decrypt-risk-tracking[data-live-decrypt-state="loading"] .decrypt-company-matrix .matrix-total::after {
+    content: "...";
     position: absolute;
-    inset: 0 auto 0 0;
-    width: 4px;
-    background: linear-gradient(180deg, #7c3aed, #175cd3, #08746f);
-  }
-  .live-decrypt-stage-head {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 18px;
-  }
-  .live-decrypt-stage-head span {
-    display: block;
-    color: #667085;
-    font-size: 12px;
-    font-weight: 900;
-    letter-spacing: .03em;
-    text-transform: uppercase;
-  }
-  .live-decrypt-stage-head strong {
-    display: block;
-    margin-top: 4px;
-    color: #122033;
-    font-size: 19px;
-    line-height: 1.25;
-    font-weight: 920;
-  }
-  .live-decrypt-stage-head p {
-    max-width: 860px;
-    margin: 8px 0 0;
-    color: #475467;
-    font-size: 13px;
-    font-weight: 720;
-    line-height: 1.7;
-  }
-  .live-decrypt-stage-head em {
-    flex: 0 0 auto;
-    border-radius: 999px;
-    padding: 7px 11px;
-    background: #eef4ff;
+    inset: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     color: #175cd3;
-    font-size: 12px;
-    font-style: normal;
     font-weight: 900;
+    letter-spacing: 1px;
+    animation: liveDecryptTextDots 1.05s infinite steps(3, end);
   }
-  .live-decrypt-stage-grid {
-    display: grid;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
-    gap: 10px;
-    margin-top: 16px;
+  #decrypt-risk-tracking[data-live-decrypt-state="loading"] .decrypt-trend-panel .trend-line,
+  #decrypt-risk-tracking[data-live-decrypt-state="summary"] .decrypt-trend-panel .trend-line {
+    opacity: .36;
+    stroke-dasharray: 4 8;
+    animation: liveDecryptLine 1.6s linear infinite;
   }
-  .live-decrypt-stage-grid i {
-    display: block;
-    height: 58px;
-    border-radius: 12px;
-    background: linear-gradient(110deg, #edf3fb 8%, #f8fbff 28%, #edf3fb 46%);
-    background-size: 220% 100%;
-    animation: liveDecryptShimmer 1.35s ease-in-out infinite;
+  #decrypt-risk-tracking[data-live-decrypt-state="loading"] .decrypt-trend-panel .trend-point-hit,
+  #decrypt-risk-tracking[data-live-decrypt-state="summary"] .decrypt-trend-panel .trend-point-hit {
+    opacity: 0;
   }
-  .live-decrypt-stage-bar {
-    height: 5px;
-    margin-top: 16px;
-    overflow: hidden;
-    border-radius: 999px;
-    background: #e6eef8;
+  @keyframes liveDecryptDots {
+    0%, 100% { box-shadow: 11px 0 0 rgba(23, 92, 211, .38), 22px 0 0 rgba(23, 92, 211, .18); }
+    33% { box-shadow: 11px 0 0 #175cd3, 22px 0 0 rgba(23, 92, 211, .38); }
+    66% { box-shadow: 11px 0 0 rgba(23, 92, 211, .38), 22px 0 0 #175cd3; }
   }
-  .live-decrypt-stage-bar::after {
-    content: "";
-    display: block;
-    width: 34%;
-    height: 100%;
-    border-radius: inherit;
-    background: linear-gradient(90deg, #7c3aed, #175cd3, #11a69c);
-    animation: liveDecryptBar 1.45s ease-in-out infinite;
+  @keyframes liveDecryptTextDots {
+    0%, 100% { opacity: .38; }
+    50% { opacity: 1; }
   }
-  @keyframes liveDecryptShimmer {
-    0% { background-position: 180% 0; }
-    100% { background-position: -60% 0; }
-  }
-  @keyframes liveDecryptBar {
-    0% { transform: translateX(-110%); }
-    100% { transform: translateX(300%); }
-  }
-  @media (max-width: 980px) {
-    .live-decrypt-stage-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .live-decrypt-stage-head { flex-direction: column; }
+  @keyframes liveDecryptLine {
+    to { stroke-dashoffset: -24; }
   }
 </style>
 """
@@ -4915,8 +4885,6 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
 (function() {{
   var summaryUrl = {json.dumps(summary_url, ensure_ascii=False)};
   var detailUrl = {json.dumps(detail_url, ensure_ascii=False)};
-  var placeholderHtml = {placeholder_json};
-  var detailLoadingHtml = '<div class="live-decrypt-stage" aria-live="polite"><div class="live-decrypt-stage-head"><div><span>Live Detail</span><strong>一级风险数字已刷新，正在补齐趋势和链路</strong><p>完整趋势、公司矩阵和后续流转链路计算完成后会自动替换当前模块。</p></div><em>继续计算</em></div><div class="live-decrypt-stage-bar" aria-hidden="true"></div></div>';
   function removePrehide() {{
     var style = document.getElementById("tq-live-decrypt-prehide");
     if (style && style.parentNode) {{
@@ -4926,19 +4894,40 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
   function loadLiveDecrypt() {{
     var section = document.getElementById("decrypt-risk-tracking");
     if (!section || section.getAttribute("data-live-decrypt-loaded") === "1") return;
+    var overview = document.getElementById("decrypt-risk-overview");
     section.setAttribute("data-live-decrypt-loaded", "1");
     section.setAttribute("data-live-decrypt-state", "loading");
-    var stage = section.querySelector(".live-decrypt-stage");
-    if (!stage) {{
-      section.insertAdjacentHTML("afterbegin", placeholderHtml);
+    if (overview) {{
+      overview.setAttribute("data-live-decrypt-state", "loading");
+    }}
+    var status = section.querySelector(".live-decrypt-inline-status");
+    if (!status) {{
+      status = document.createElement("p");
+      status.className = "live-decrypt-inline-status";
+      status.textContent = "解密审计实时刷新中，先刷新一级风险数字，趋势和矩阵随后补齐";
+      section.insertBefore(status, section.firstChild);
     }}
     var summaryApplied = false;
     function applySummary(html) {{
       var wrapper = document.createElement("div");
       wrapper.innerHTML = html;
-      if (wrapper.textContent && wrapper.textContent.trim()) {{
-        section.innerHTML = html + detailLoadingHtml;
+      var freshOverview = wrapper.querySelector("#decrypt-risk-overview");
+      var oldOverview = document.getElementById("decrypt-risk-overview");
+      if (freshOverview && oldOverview) {{
+        oldOverview.replaceWith(freshOverview);
+      }} else if (oldOverview) {{
+        oldOverview.removeAttribute("data-live-decrypt-state");
+      }}
+      var freshCards = wrapper.querySelector(".decrypt-card-grid");
+      var oldCards = section.querySelector(".decrypt-card-grid");
+      if (freshCards && oldCards) {{
+        oldCards.replaceWith(freshCards);
+      }}
+      if (freshOverview || freshCards) {{
         section.setAttribute("data-live-decrypt-state", "summary");
+        if (status && status.parentNode) {{
+          status.textContent = "一级风险数字已刷新，趋势和公司矩阵正在继续计算";
+        }}
         summaryApplied = true;
       }}
     }}
@@ -4958,6 +4947,10 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
     }}
     function showError(err) {{
       removePrehide();
+      var overview = document.getElementById("decrypt-risk-overview");
+      if (overview) {{
+        overview.removeAttribute("data-live-decrypt-state");
+      }}
       section.removeAttribute("data-live-decrypt-state");
       if (summaryApplied) {{
         var error = document.createElement("p");
@@ -4965,11 +4958,13 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
         error.textContent = "完整趋势和链路暂未刷新：" + err.message;
         section.appendChild(error);
       }} else {{
-        section.innerHTML = placeholderHtml;
-        var stage = section.querySelector(".live-decrypt-stage");
-        if (stage) {{
-          stage.querySelector("strong").textContent = "解密实时计算暂不可用";
-          stage.querySelector("p").textContent = "当前没有展示旧快照空态，请稍后刷新重试：" + err.message;
+        if (status && status.parentNode) {{
+          status.textContent = "解密实时计算暂不可用，当前显示归档快照：" + err.message;
+        }} else {{
+          var error = document.createElement("p");
+          error.className = "note";
+          error.textContent = "解密实时计算暂不可用，当前显示归档快照：" + err.message;
+          section.insertBefore(error, section.firstChild);
         }}
       }}
     }}
@@ -5001,16 +4996,16 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
     text = data.decode("utf-8", errors="replace")
     if 'id="tq-live-decrypt-prehide"' not in text:
         text = text.replace("</head>", prehide_style + "</head>", 1)
-    if 'class="live-decrypt-stage"' not in text:
-        def add_live_decrypt_placeholder(match: re.Match[str]) -> str:
-            open_tag = match.group(1)
-            if "data-live-decrypt-state=" not in open_tag:
-                open_tag = open_tag[:-1] + ' data-live-decrypt-state="loading">'
-            return open_tag + placeholder
+    def mark_live_decrypt_loading(match: re.Match[str]) -> str:
+        open_tag = match.group(1)
+        if "data-live-decrypt-state=" in open_tag:
+            return open_tag
+        return open_tag[:-1] + ' data-live-decrypt-state="loading">'
 
+    for section_id in ["decrypt-risk-overview", "decrypt-risk-tracking"]:
         text = re.sub(
-            r'(<section\b(?=[^>]*\bid="decrypt-risk-tracking")[^>]*>)',
-            add_live_decrypt_placeholder,
+            rf'(<section\b(?=[^>]*\bid="{section_id}")[^>]*>)',
+            mark_live_decrypt_loading,
             text,
             count=1,
             flags=re.IGNORECASE,
