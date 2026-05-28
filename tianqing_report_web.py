@@ -1064,8 +1064,38 @@ def inject_trend_visual_patch(data: bytes) -> bytes:
     return text.encode("utf-8")
 
 
-def inject_report_navigation_patch(data: bytes) -> bytes:
+def terminal_check_period_url(start: datetime, end: datetime, base_url: str = "") -> str:
+    params = urlencode(
+        {
+            "preset": "custom",
+            "start": datetime_input_value(start),
+            "end": datetime_input_value(end),
+        }
+    )
+    prefix = base_url.rstrip("/") if base_url else ""
+    return f"{prefix}/terminal-check?{params}"
+
+
+def report_period_for_html_or_path(config: AppConfig | None, target: Path | None, data: bytes) -> tuple[datetime, datetime] | None:
+    if config is not None and target is not None:
+        period = report_period_for_static_path(config, target)
+        if period:
+            return period
+    if config is None:
+        return None
+    html_period = report_period_from_html(data)
+    if not html_period:
+        return None
+    try:
+        return parse_local_datetime(html_period[0], config.timezone), parse_local_datetime(html_period[1], config.timezone)
+    except ValueError:
+        return None
+
+
+def inject_report_navigation_patch(data: bytes, config: AppConfig | None = None, target: Path | None = None) -> bytes:
     text = data.decode("utf-8", errors="replace")
+    period = report_period_for_html_or_path(config, target, data) if config is not None else None
+    terminal_check_href = terminal_check_period_url(*period) if period else "/terminal-check"
     updated = re.sub(
         r'\s*<a\s+class="top-action(?:\s+primary)?"\s+href="[^"]*/reports">历史报告</a>',
         "",
@@ -1080,10 +1110,19 @@ def inject_report_navigation_patch(data: bytes) -> bytes:
         count=1,
         flags=re.IGNORECASE,
     )
+    terminal_link = f'<a class="top-action" href="{esc(terminal_check_href)}">异常终端行为核查</a>'
+    updated_with_period = re.sub(
+        r'<a\s+class="top-action"\s+href="[^"]*/terminal-check(?:\?[^"]*)?"\s*>异常终端行为核查</a>',
+        terminal_link,
+        updated,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    updated = updated_with_period
     if "异常终端行为核查" not in updated:
         updated = re.sub(
             r'(<a\s+class="top-action"\s+href="[^"]*/settings">策略管理</a>)',
-            r'\1<a class="top-action" href="/terminal-check">异常终端行为核查</a>',
+            r"\1" + terminal_link,
             updated,
             count=1,
             flags=re.IGNORECASE,
@@ -6472,6 +6511,13 @@ class ReportHandler(BaseHTTPRequestHandler):
         self.login_redirect(parsed_path or "/")
         return None
 
+    @staticmethod
+    def request_next_path(parsed: Any) -> str:
+        next_path = parsed.path or "/"
+        if parsed.query:
+            next_path += "?" + parsed.query
+        return next_path
+
     def require_admin(self, session: AuthSession) -> bool:
         if session.role == "admin":
             return True
@@ -6612,7 +6658,7 @@ class ReportHandler(BaseHTTPRequestHandler):
             self.send_header("Set-Cookie", auth_cookie_header(self.config, AUTH_COOKIE_NAME, "", 0))
             self.end_headers()
             return
-        session = self.require_session(parsed.path or "/")
+        session = self.require_session(self.request_next_path(parsed))
         if not session:
             return
         if parsed.path == "/manual":
@@ -6759,7 +6805,7 @@ class ReportHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if self.redirect_canonical_host(parsed, HTTPStatus.TEMPORARY_REDIRECT):
             return
-        session = self.require_session(parsed.path or "/")
+        session = self.require_session(self.request_next_path(parsed))
         if not session:
             return
         parsed_form = self.parse_request_form(parsed.path)
@@ -7481,7 +7527,7 @@ class ReportHandler(BaseHTTPRequestHandler):
             if not ai_policy_enabled(self.config):
                 data = suppress_static_ai_section(data)
             data = inject_identity_bar(data, session)
-            data = inject_report_navigation_patch(data)
+            data = inject_report_navigation_patch(data, self.config, target)
             data = inject_global_management_summary(data)
             data = inject_terminal_behavior_review_summary(data, self.config, target)
             data = inject_home_history_dropdown(data, self.config, session)

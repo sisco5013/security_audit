@@ -8940,7 +8940,14 @@ def build_html_report(
     public_base_url = str(getattr(args, "public_base_url", "") or DEFAULT_PUBLIC_BASE_URL).rstrip("/")
     reports_url = f"{public_base_url}/reports"
     settings_url = f"{public_base_url}/settings"
-    terminal_check_url = f"{public_base_url}/terminal-check"
+    terminal_check_params = urllib.parse.urlencode(
+        {
+            "preset": "custom",
+            "start": start.strftime("%Y-%m-%dT%H:%M"),
+            "end": end.strftime("%Y-%m-%dT%H:%M"),
+        }
+    )
+    terminal_check_url = f"{public_base_url}/terminal-check?{terminal_check_params}"
     home_url = f"{public_base_url}/"
     sidecar_reports = SidecarReportStore(getattr(args, "sidecar_output_dir", None))
     decrypt_module_result = build_decrypt_audit_module_result(
