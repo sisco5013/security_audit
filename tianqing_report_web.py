@@ -4279,7 +4279,7 @@ def encryption_terminal_duplicates(config: AppConfig, batch_id: str, limit: int 
         config,
         f"""
 SELECT
-    t.ip_address,
+    t.ip_address AS ip_address,
     t.computer_name,
     t.mac_address,
     t.user_name,
@@ -4437,7 +4437,7 @@ AND ip_address IN (
         config,
         f"""
 SELECT
-    t.ip_address,
+    t.ip_address AS ip_address,
     t.computer_name,
     t.mac_address,
     t.user_name,
