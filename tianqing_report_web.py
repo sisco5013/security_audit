@@ -4852,7 +4852,7 @@ def live_decrypt_summary_fragment(config: AppConfig, start: datetime, end: datet
     conclusions = [
         f"本期一级风险为标准图纸解密 {standard} 条，其中结构 {structure} 条、电气 {electrical} 条；该口径与下方结构/电气卡片及标准图纸明细一致。",
         f"普通对象作为辅助复核：三维模型 {three_d} 条、DWG图纸 {dwg} 条、压缩包 {archive} 条；不计入本模块一级风险汇总。",
-        "首页只实时刷新数字、趋势和公司矩阵；后续流转链路和完整明细在点击下钻时再计算。",
+        "首页打开后同步预热完整流转链路和全部解密记录；点击下钻优先命中缓存。",
     ]
     overview = f"""
     <section id="decrypt-risk-overview" class="section-block risk-overview-shell decrypt-overview-shell">
@@ -4860,7 +4860,7 @@ def live_decrypt_summary_fragment(config: AppConfig, start: datetime, end: datet
         <div>
           <span class="section-eyebrow">Rule Overview</span>
           <h2>加密软件解密规则风险概览</h2>
-          <p>首页只按本周期文件名、后缀和组织做轻量聚合；流转链路和完整明细点击后再计算。</p>
+          <p>首页先按本周期文件名、后缀和组织做轻量聚合，同时预热完整流转链路和下钻明细缓存。</p>
         </div>
       </div>
       <div class="risk-overview-hero">
@@ -4890,7 +4890,7 @@ def live_decrypt_summary_fragment(config: AppConfig, start: datetime, end: datet
         card("电气", electrical, "电气标准方案解密记录", links.get("electrical"), "amber"),
         card("三维模型", three_d, "PRT/ASM/SLDASM/SLDPRT/STEP 解密记录", links.get("three_d"), "blue"),
         card("DWG图纸", dwg, "DWG 图纸解密记录", links.get("dwg"), "slate"),
-        card("发现后续流转", "下钻计算", "点击后按解密记录与天擎审计事件计算后续流转链路", links.get("linked"), "red"),
+        card("发现后续流转", "打开即预热", "首页打开后同步预热解密记录与天擎审计事件的后续流转链路", links.get("linked"), "red"),
     ]
     return (overview + f'<div class="decrypt-card-grid">{"".join(cards)}</div>' + trend_html + company_matrix_html).encode("utf-8")
 
@@ -4934,6 +4934,12 @@ def live_decrypt_detail_page(config: AppConfig, start: datetime, end: datetime, 
     scope = (params.get("scope") or ["all"])[-1]
     company = (params.get("company") or [""])[-1]
     bucket = (params.get("bucket") or [""])[-1]
+    cache_key = (scope, company, bucket)
+    with DECRYPT_ANALYSIS_CACHE_LOCK:
+        detail_cache = payload.setdefault("detail_html_cache", {})
+        cached_html = detail_cache.get(cache_key) if isinstance(detail_cache, dict) else None
+    if cached_html is not None:
+        return str(cached_html).encode("utf-8")
     records = filter_live_decrypt_records(analysis.records, scope, company, bucket)
     title_map = {
         "all": "解密图纸风险追踪",
@@ -4960,7 +4966,46 @@ def live_decrypt_detail_page(config: AppConfig, start: datetime, end: datetime, 
         "ClickHouse:tianqing.decrypt_records + audit_events",
         note,
     )
+    with DECRYPT_ANALYSIS_CACHE_LOCK:
+        detail_cache = payload.setdefault("detail_html_cache", {})
+        if isinstance(detail_cache, dict) and len(detail_cache) < 24:
+            detail_cache[cache_key] = html_text
     return html_text.encode("utf-8")
+
+
+def live_decrypt_warmup_json(config: AppConfig, start: datetime, end: datetime) -> bytes:
+    started_at = time.time()
+    payload = live_decrypt_cached_payload(config, start, end, wait_seconds=60, build_if_missing=True)
+    if not payload:
+        raise RuntimeError("解密分析缓存尚未生成完成")
+    analysis = payload.get("analysis")
+    records_count = len(getattr(analysis, "records", []) or [])
+    warmed_details: list[str] = []
+    for scope in ["all", "standard", "structure", "electrical", "three-d", "dwg", "linked"]:
+        live_decrypt_detail_page(config, start, end, {"scope": [scope]})
+        warmed_details.append(scope)
+    company_groups = report_gen.decrypt_company_groups(getattr(analysis, "records", []) or [])
+    ordered_companies = sorted(
+        company_groups.items(),
+        key=lambda item: (
+            -len(item[1]),
+            -sum(1 for record in item[1] if getattr(record, "object_bucket", "") in {"结构", "电气"}),
+            item[0],
+        ),
+    )
+    for company, _records in ordered_companies[:10]:
+        live_decrypt_detail_page(config, start, end, {"scope": ["company"], "company": [company], "bucket": ["__all__"]})
+        warmed_details.append(f"company:{company}")
+    elapsed = round(time.time() - started_at, 3)
+    return json.dumps(
+        {
+            "status": "ready",
+            "records": records_count,
+            "warmed_details": warmed_details,
+            "elapsed": elapsed,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
 
 
 def live_decrypt_loading_placeholder_html(start: datetime, end: datetime) -> str:
@@ -4994,6 +5039,7 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
     except ValueError:
         return data
     summary_url = live_decrypt_url("/api/decrypt-risk-summary-fragment", start, end)
+    warmup_url = live_decrypt_url("/api/decrypt-risk-warmup", start, end)
     prehide_style = """
 <style id="tq-live-decrypt-prehide">
   #decrypt-risk-overview[data-live-decrypt-state="loading"] {
@@ -5083,6 +5129,7 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
 <script id="tq-live-decrypt-loader">
 (function() {{
   var summaryUrl = {json.dumps(summary_url, ensure_ascii=False)};
+  var warmupUrl = {json.dumps(warmup_url, ensure_ascii=False)};
   function removePrehide() {{
     var style = document.getElementById("tq-live-decrypt-prehide");
     if (style && style.parentNode) {{
@@ -5106,6 +5153,23 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
       section.insertBefore(status, section.firstChild);
     }}
     var summaryApplied = false;
+    var summaryDone = false;
+    var warmupDone = false;
+    var warmupError = "";
+    function refreshStatus() {{
+      if (!status || !status.parentNode) return;
+      if (summaryDone && warmupDone) {{
+        status.textContent = "解密审计数字、趋势、公司矩阵和完整下钻缓存已刷新";
+      }} else if (summaryDone && warmupError) {{
+        status.textContent = "解密审计数字、趋势和公司矩阵已刷新；完整下钻缓存预热失败：" + warmupError;
+      }} else if (summaryDone) {{
+        status.textContent = "解密审计数字、趋势和公司矩阵已刷新；完整下钻缓存计算中";
+      }} else if (warmupDone) {{
+        status.textContent = "完整下钻缓存已刷新；首页数字刷新中";
+      }} else {{
+        status.textContent = "解密审计数字和完整下钻缓存同步刷新中";
+      }}
+    }}
     function applySummary(html) {{
       var wrapper = document.createElement("div");
       wrapper.innerHTML = html;
@@ -5141,9 +5205,8 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
       if (freshOverview || freshCards || freshTrend || freshCompany) {{
         section.setAttribute("data-live-decrypt-state", "ready");
         removePrehide();
-        if (status && status.parentNode) {{
-          status.textContent = "解密审计数字、趋势和公司矩阵已刷新；流转链路点击后计算";
-        }}
+        summaryDone = true;
+        refreshStatus();
         summaryApplied = true;
       }}
     }}
@@ -5177,6 +5240,25 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
         return resp.text();
       }});
     }}
+    function fetchJson(url) {{
+      return fetch(url, {{credentials: "same-origin", cache: "no-store"}})
+        .then(function(resp) {{
+          if (!resp.ok) throw new Error("HTTP " + resp.status);
+          return resp.json();
+        }});
+    }}
+    refreshStatus();
+    fetchJson(warmupUrl)
+      .then(function(data) {{
+        warmupDone = true;
+        section.setAttribute("data-live-decrypt-warmup", "ready");
+        refreshStatus();
+      }})
+      .catch(function(err) {{
+        warmupError = err.message || "unknown";
+        section.setAttribute("data-live-decrypt-warmup", "error");
+        refreshStatus();
+      }});
     fetchHtml(summaryUrl)
       .then(applySummary)
       .catch(showError);
@@ -8164,7 +8246,7 @@ class ReportHandler(BaseHTTPRequestHandler):
                 return
             self.send_html(job_page(self.config, job_id))
             return
-        if parsed.path in {"/api/decrypt-risk-summary-fragment", "/api/decrypt-risk-fragment", "/api/decrypt-risk-detail"}:
+        if parsed.path in {"/api/decrypt-risk-summary-fragment", "/api/decrypt-risk-fragment", "/api/decrypt-risk-detail", "/api/decrypt-risk-warmup"}:
             params = parse_qs(parsed.query)
             try:
                 start = parse_local_datetime((params.get("start") or [""])[-1], self.config.timezone)
@@ -8180,11 +8262,34 @@ class ReportHandler(BaseHTTPRequestHandler):
                 if parsed.path == "/api/decrypt-risk-detail":
                     self.send_html(live_decrypt_detail_page(self.config, start, end, params))
                     return
+                if parsed.path == "/api/decrypt-risk-warmup":
+                    data = live_decrypt_warmup_json(self.config, start, end)
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    if self.command != "HEAD":
+                        self.wfile.write(data)
+                    return
                 if parsed.path == "/api/decrypt-risk-summary-fragment":
                     data = live_decrypt_summary_fragment(self.config, start, end)
                 else:
                     data = live_decrypt_fragment(self.config, start, end)
             except Exception as exc:
+                if parsed.path == "/api/decrypt-risk-warmup":
+                    data = json.dumps(
+                        {"status": "error", "error": f"{type(exc).__name__}: {str(exc)[:240]}"},
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    self.send_response(HTTPStatus.INTERNAL_SERVER_ERROR)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    if self.command != "HEAD":
+                        self.wfile.write(data)
+                    return
                 data = (
                     '<section id="decrypt-risk-tracking" class="section-block decrypt-risk-shell">'
                     f'<p class="note">解密实时计算失败：{esc(type(exc).__name__)}: {esc(str(exc)[:240])}</p>'
