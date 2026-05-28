@@ -2093,6 +2093,41 @@ def report_archive_entries(config: AppConfig, session: AuthSession) -> list[dict
     return sorted(deduped, key=lambda item: str(item.get("sort_key") or ""), reverse=True)
 
 
+def default_home_report_path(config: AppConfig) -> Path | None:
+    tz = local_tz(config.timezone)
+    today = datetime.now(tz).date() if tz else datetime.now().date()
+    yesterday = today - timedelta(days=1)
+    exact: list[tuple[str, float, Path]] = []
+    fallback: list[tuple[str, float, Path]] = []
+    for item in read_report_archives(config):
+        if str(item.get("period") or "") != "previous-day":
+            continue
+        if str(item.get("scope") or "global") != "global":
+            continue
+        rel_path = str(item.get("path") or "")
+        path = (config.report_dir / rel_path).resolve()
+        try:
+            path.relative_to(config.report_dir.resolve())
+        except ValueError:
+            continue
+        if not path.exists() or not path.is_file():
+            continue
+        start_date = compact_archive_datetime(str(item.get("period_start") or ""))[:10]
+        sort_key = compact_archive_datetime(str(item.get("period_end") or item.get("generated_at") or ""))
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        row = (sort_key, mtime, path)
+        if start_date == yesterday.isoformat():
+            exact.append(row)
+        fallback.append(row)
+    candidates = exact or fallback
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda row: (row[0], row[1]), reverse=True)[0][2]
+
+
 def running_report_job_ids(config: AppConfig) -> set[str]:
     try:
         result = subprocess.run(
@@ -6602,12 +6637,15 @@ class ReportHandler(BaseHTTPRequestHandler):
     def static_target(self, request_path: str) -> Path | None:
         path = unquote(request_path.split("?", 1)[0].split("#", 1)[0])
         if path in {"", "/", "/index.html"}:
-            latest_home = (self.config.report_dir / "index.html").resolve()
-            if latest_home.exists() and latest_home.is_file():
-                return latest_home
+            archive_home = default_home_report_path(self.config)
+            if archive_home and archive_home.exists() and archive_home.is_file():
+                return archive_home
             official_home = (self.config.report_dir / "tianqing_leadership_previous-day.html").resolve()
             if official_home.exists() and official_home.is_file():
                 return official_home
+            latest_home = (self.config.report_dir / "index.html").resolve()
+            if latest_home.exists() and latest_home.is_file():
+                return latest_home
             path = "/index.html"
         normalized = posixpath.normpath(path)
         parts = [part for part in normalized.split("/") if part and part not in {".", ".."}]
