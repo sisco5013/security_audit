@@ -343,6 +343,8 @@ def candidate_scope_event(event: dict[str, Any]) -> bool:
         return False
     if channel == "文件重命名" or "文件重命名" in reasons:
         return False
+    if str(event.get("recipient_relation") or "").strip().lower() == "group" or "企业微信群忽略" in reasons:
+        return False
     if trusted_internal_row(event):
         return False
     return True
@@ -476,11 +478,15 @@ def configure_report_policy_context(config: Any, policy_doc: dict[str, Any]) -> 
     internal_domains = set(report_gen.DEFAULT_INTERNAL_DOMAINS)
     internal_domains.update(report_gen.policy_internal_domains(policy_doc if isinstance(policy_doc, dict) else {}))
     people_map = report_gen.load_people_map(args.people_map)
-    recipient_map = report_gen.load_recipient_map(args.recipient_map)
+    manual_recipient_map = report_gen.load_recipient_map(args.recipient_map)
     wecom_items = load_cached_wecom_items(config)
+    wecom_people_map = report_gen.build_wecom_people_map(wecom_items)
+    recipient_map = report_gen.build_wecom_recipient_map(wecom_items)
+    recipient_map.update(report_gen.load_observed_wecom_account_recipient_map(args, wecom_people_map))
+    recipient_map.update(manual_recipient_map)
     args.people_map_loaded = people_map
     args.recipient_map_loaded = recipient_map
-    args.wecom_people_map_loaded = report_gen.build_wecom_people_map(wecom_items)
+    args.wecom_people_map_loaded = wecom_people_map
     args.wecom_directory_meta = {"source": "cache", "ok": bool(wecom_items), "count": len(wecom_items)}
     return args, internal_domains
 

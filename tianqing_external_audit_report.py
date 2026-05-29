@@ -145,7 +145,9 @@ RELATION_LABELS = {
     "supplier": "供应商",
     "unknown": "待判定",
     "internal": "内部",
+    "group": "群聊忽略",
 }
+WECOM_GROUP_TARGET_HINTS = ("群", "团队", "项目组", "工作组", "交流群", "沟通组", "沟通群", "对接群", "访客预约")
 PRIORITY_ACTION = "action"
 PRIORITY_REVIEW = "review"
 PRIORITY_GENERAL = "general"
@@ -2009,6 +2011,8 @@ def normalize_untrusted_internal_im_relation(event: AuditEvent) -> None:
     if event.topic == "im_audit" or is_im_file_audit_event(event):
         if "企业微信本人/文件助手" in event.reasons:
             return
+        if is_wecom_process_name(event.process_name):
+            return
         has_internal_network_target = any(
             target_is_internal_network(value, DEFAULT_INTERNAL_DOMAINS)
             for value in list(event.targets or []) + list(event.target_domains or []) + list(event.recipients or [])
@@ -2857,6 +2861,8 @@ def is_leadership_focus_event(event: AuditEvent, internal_domains: set[str] | No
     if is_normal_procurement_inquiry_event(event):
         return False
     if is_file_rename_event(event):
+        return False
+    if event.recipient_relation == "group" or "企业微信群忽略" in event.reasons:
         return False
     if is_upload_noise_event(event, set(internal_domains)):
         return False
@@ -3825,6 +3831,15 @@ def split_im_target(target: str) -> tuple[str, str]:
     return target.strip(), target.strip()
 
 
+def looks_like_wecom_group_target(nickname: str, account: str, target: str) -> bool:
+    label = str(nickname or target or "").strip()
+    if not label:
+        return False
+    if normalize_key(label) == normalize_key(account):
+        return False
+    return any(hint in label for hint in WECOM_GROUP_TARGET_HINTS)
+
+
 def looks_like_im_recipient_token(value: str) -> bool:
     text = str(value or "").strip()
     if not text:
@@ -4162,6 +4177,7 @@ def classify_recipients(
     relations: list[str] = []
     has_internal = False
     has_unknown = False
+    group_like: list[str] = []
 
     if topic == "mail_audit":
         for target in targets:
@@ -4195,16 +4211,19 @@ def classify_recipients(
             if entry:
                 display = display_recipient(target, entry)
                 if entry.relation == "internal":
-                    external_like.append(display)
-                    has_unknown = True
+                    has_internal = True
+                    internal_like.append(display)
                     continue
                 external_like.append(display)
                 relations.append(entry.relation)
             else:
-                external_like.append(target)
-                if wecom_directory_authoritative:
+                if trust_wecom_directory and looks_like_wecom_group_target(nickname, account, target):
+                    group_like.append(target)
+                elif wecom_directory_authoritative or trust_wecom_directory:
+                    external_like.append(target)
                     relations.append("external")
                 else:
+                    external_like.append(target)
                     has_unknown = True
 
     else:
@@ -4218,21 +4237,30 @@ def classify_recipients(
             if im_entry:
                 display = display_recipient(target, im_entry)
                 if im_entry.relation == "internal":
-                    external_like.append(display)
-                    has_unknown = True
+                    has_internal = True
+                    internal_like.append(display)
                     continue
                 external_like.append(display)
                 relations.append(im_entry.relation)
                 continue
+            if trust_wecom_directory and looks_like_wecom_group_target(nickname, account, target):
+                group_like.append(target)
+                continue
             if topic == "file_audit" and looks_like_im_recipient_token(target):
                 external_like.append(target)
-                has_unknown = True
+                if trust_wecom_directory:
+                    relations.append("external")
+                else:
+                    has_unknown = True
                 continue
             domain = host_domain(target)
             if not domain:
                 external_like.append(target)
                 if topic == "file_audit":
-                    has_unknown = True
+                    if trust_wecom_directory:
+                        relations.append("external")
+                    else:
+                        has_unknown = True
                 elif wecom_directory_authoritative:
                     relations.append("external")
                 else:
@@ -4266,6 +4294,8 @@ def classify_recipients(
         return external_like, "external"
     if has_internal:
         return list(dict.fromkeys([item for item in internal_like if item])), "internal"
+    if group_like:
+        return list(dict.fromkeys([item for item in group_like if item])), "group"
     return [], "unknown"
 
 
@@ -4491,6 +4521,8 @@ def build_event(
     external = is_external(target_domains, internal_domains)
     if recipients and recipient_relation in EXTERNAL_RELATIONS:
         external = True
+    if recipient_relation == "group":
+        reasons.append("企业微信群忽略")
     personal = any(domain in PERSONAL_EMAIL_DOMAINS for domain in target_domains)
     high_risk_dest = has_high_risk_destination(target_domains)
     keyword_hits = sensitive_keyword_hits(names)
@@ -12181,10 +12213,11 @@ def main() -> int:
     wecom_people_map = build_wecom_people_map(wecom_items)
     manual_recipient_map = load_recipient_map(args.recipient_map)
     recipient_map = build_wecom_recipient_map(wecom_items)
+    recipient_map.update(load_observed_wecom_account_recipient_map(args, wecom_people_map))
     recipient_map.update(manual_recipient_map)
     args.people_map_loaded = people_map
     args.wecom_people_map_loaded = wecom_people_map
-    args.recipient_map_loaded = manual_recipient_map
+    args.recipient_map_loaded = recipient_map
     disposition_by_event_id, disposition_by_search_id = load_dispositions(args.disposition_file)
 
     records: list[RawRecord] = []

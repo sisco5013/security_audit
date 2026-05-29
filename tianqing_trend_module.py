@@ -295,6 +295,8 @@ def clickhouse_matrix_classification_exprs(internal_domains: set[str] | None = N
         "OR (topic = 'file_audit' AND channel = '应用发送/传输' AND lowerUTF8(process_name) IN ('wxwork.exe','wxwork','wecom.exe','wecom'))"
         ")"
         ") "
+        "AND recipient_relation != 'group' "
+        "AND NOT has(reasons, '企业微信群忽略') "
         f"AND NOT ({rename_expr}) "
         f"AND NOT ({upload_noise_expr}) "
         "AND NOT ("
