@@ -996,6 +996,7 @@ def normalized_audit_events_from_clickhouse_period(
         wecom_people_map,
         {},
         {},
+        recipient_map=getattr(args, "recipient_map_loaded", {}) or {},
         terminal_identity_history=terminal_identity_history,
         terminal_identity_max_age_days=getattr(args, "terminal_identity_max_age_days", 30),
     )
@@ -1593,6 +1594,11 @@ def domain_is_internal(domain: str, internal_domains: set[str]) -> bool:
     return any(domain == internal or domain.endswith("." + internal) for internal in internal_domains)
 
 
+def target_is_internal_network(value: str, internal_domains: set[str]) -> bool:
+    domain = host_domain(str(value or ""))
+    return bool(domain and domain_is_internal(domain, internal_domains))
+
+
 def extension(name: str) -> str:
     clean = name.strip().lower().split("?", 1)[0]
     if "." not in clean:
@@ -2000,10 +2006,17 @@ def apply_report_policies(
 def normalize_untrusted_internal_im_relation(event: AuditEvent) -> None:
     if event.recipient_relation != "internal":
         return
-    if event.topic == "im_audit" and not is_wecom_process_name(event.process_name):
-        event.recipient_relation = "unknown"
-    elif is_im_file_audit_event(event) and not is_wecom_process_name(event.process_name):
-        event.recipient_relation = "unknown"
+    if event.topic == "im_audit" or is_im_file_audit_event(event):
+        if "企业微信本人/文件助手" in event.reasons:
+            return
+        has_internal_network_target = any(
+            target_is_internal_network(value, DEFAULT_INTERNAL_DOMAINS)
+            for value in list(event.targets or []) + list(event.target_domains or []) + list(event.recipients or [])
+        )
+        if not has_internal_network_target:
+            event.recipient_relation = "unknown"
+            if "接收端IP未确认" not in event.reasons:
+                event.reasons.append("接收端IP未确认")
 
 
 def is_im_file_audit_event(event: AuditEvent) -> bool:
@@ -3519,7 +3532,6 @@ def load_wecom_directory_items(args: argparse.Namespace) -> tuple[list[dict[str,
 
 def build_wecom_recipient_map(items: list[dict[str, Any]]) -> dict[tuple[str, str], RecipientEntry]:
     mapping: dict[tuple[str, str], RecipientEntry] = {}
-    name_counts = Counter(str(item.get("name") or "").strip() for item in items if str(item.get("name") or "").strip())
     for item in items:
         name = str(item.get("name") or "").strip()
         userid = str(item.get("userid") or "").strip()
@@ -3535,9 +3547,6 @@ def build_wecom_recipient_map(items: list[dict[str, Any]]) -> dict[tuple[str, st
             organization=org_label or "企业微信通讯录",
             note="wecom_directory",
         )
-        if name and name_counts[name] == 1:
-            mapping.setdefault(("im_nickname", normalize_key(name)), entry)
-            mapping.setdefault(("recipient", normalize_key(name)), entry)
         if userid:
             mapping.setdefault(("im_account", normalize_key(userid)), entry)
             mapping.setdefault(("recipient", normalize_key(userid)), entry)
@@ -3606,7 +3615,6 @@ FORMAT JSONEachRow
 def build_wecom_people_map(items: list[dict[str, Any]]) -> dict[tuple[str, str], PeopleEntry]:
     mapping: dict[tuple[str, str], PeopleEntry] = {}
     name_counts = Counter(str(item.get("name") or "").strip() for item in items if str(item.get("name") or "").strip())
-    first_active_by_name: dict[str, PeopleEntry] = {}
     for item in items:
         name = str(item.get("name") or "").strip()
         userid = str(item.get("userid") or "").strip()
@@ -3631,26 +3639,6 @@ def build_wecom_people_map(items: list[dict[str, Any]]) -> dict[tuple[str, str],
         if name and name_counts[name] == 1:
             for match_type in ["im_nickname", "person", "identity_hint"]:
                 mapping.setdefault((match_type, normalize_key(name)), entry)
-        if name and status == "1":
-            first_active_by_name.setdefault(normalize_key(name), entry)
-    for name_key, entry in first_active_by_name.items():
-        duplicate_count = name_counts.get(entry.person_name, 0)
-        if duplicate_count <= 1:
-            mapping.setdefault(("im_nickname_any", name_key), entry)
-            continue
-        mapping.setdefault(
-            ("im_nickname_any", name_key),
-            PeopleEntry(
-                match_type="wecom_directory_name",
-                match_value=entry.person_name,
-                person_name=entry.person_name,
-                company="企业微信内部",
-                department=f"同名{duplicate_count}人待确认",
-                position="",
-                status="1",
-                note="wecom_directory_duplicate_name",
-            ),
-        )
     return mapping
 
 
@@ -3878,18 +3866,12 @@ def im_recipient_entry_for_target(
         if recipient_entry_trusted_for_im(account_entry, trust_wecom_directory):
             return account_entry
     if account:
+        exact_entry = recipient_entry_for("recipient", target, recipient_map)
+        if exact_entry and exact_entry.note not in {"wecom_directory", "wecom_observed_account"}:
+            if recipient_entry_trusted_for_im(exact_entry, trust_wecom_directory):
+                return exact_entry
         nickname_entry = recipient_entry_for("im_nickname", nickname, recipient_map)
-        if (
-            nickname_entry
-            and trust_wecom_directory
-            and nickname_entry.note in {"wecom_directory", "wecom_observed_account"}
-            and nickname_entry.relation == "internal"
-        ):
-            return nickname_entry
-        for entry in (
-            nickname_entry,
-            recipient_entry_for("recipient", target, recipient_map),
-        ):
+        for entry in (nickname_entry,):
             if (
                 entry
                 and entry.note not in {"wecom_directory", "wecom_observed_account"}
@@ -3926,13 +3908,11 @@ def wecom_internal_entry_for_recipient_label(
         entry = active_wecom_people_entry(wecom_people_map.get(("im_account", normalize_key(account))))
         if entry:
             return entry
+        if normalize_key(account) != normalize_key(nickname):
+            return None
     if not nickname:
         return None
-    nickname_key = normalize_key(nickname)
-    return active_wecom_people_entry(
-        wecom_people_map.get(("im_nickname", nickname_key))
-        or wecom_people_map.get(("im_nickname_any", nickname_key))
-    )
+    return active_wecom_people_entry(wecom_people_map.get(("im_nickname", normalize_key(nickname))))
 
 
 def wecom_internal_recipient_label(entry: PeopleEntry) -> str:
@@ -3940,6 +3920,29 @@ def wecom_internal_recipient_label(entry: PeopleEntry) -> str:
     if org_label:
         return f"{entry.person_name}({org_label})"
     return entry.person_name
+
+
+def manual_internal_recipient_label_for_target(
+    target: str,
+    recipient_map: dict[tuple[str, str], RecipientEntry],
+) -> str:
+    if not recipient_map:
+        return ""
+    nickname, account = split_im_target(target)
+    candidates: list[tuple[str, str]] = []
+    if account:
+        candidates.append(("im_account", account))
+        candidates.append(("recipient", target))
+        if normalize_key(account) == normalize_key(nickname):
+            candidates.append(("im_nickname", nickname))
+    else:
+        candidates.append(("im_nickname", nickname))
+        candidates.append(("recipient", target))
+    for match_type, value in candidates:
+        entry = recipient_entry_for(match_type, value, recipient_map)
+        if entry and entry.relation == "internal":
+            return display_recipient(target, entry)
+    return ""
 
 
 def im_recipient_labels_need_wecom_repair(values: Iterable[str]) -> bool:
@@ -3970,8 +3973,10 @@ def readable_internal_recipient_labels(event: AuditEvent) -> list[str]:
 def repair_wecom_internal_recipient_relations(
     events: list[AuditEvent],
     wecom_people_map: dict[tuple[str, str], PeopleEntry],
+    recipient_map: dict[tuple[str, str], RecipientEntry] | None = None,
 ) -> None:
-    if not wecom_people_map:
+    recipient_map = recipient_map or {}
+    if not wecom_people_map and not recipient_map:
         return
     for event in events:
         if event.topic == "im_audit":
@@ -3991,17 +3996,23 @@ def repair_wecom_internal_recipient_relations(
         )
         if not needs_repair:
             continue
-        entries: list[PeopleEntry] = []
+        labels: list[str] = []
         unmatched = False
         for target in raw_targets:
             entry = wecom_internal_entry_for_recipient_label(target, wecom_people_map)
+            if entry:
+                labels.append(wecom_internal_recipient_label(entry))
+                continue
+            manual_label = manual_internal_recipient_label_for_target(target, recipient_map)
+            if manual_label:
+                labels.append(manual_label)
+                continue
             if not entry:
                 unmatched = True
                 break
-            entries.append(entry)
-        if unmatched or not entries:
+        if unmatched or not labels:
             continue
-        labels = list(dict.fromkeys(wecom_internal_recipient_label(entry) for entry in entries if entry.person_name))
+        labels = list(dict.fromkeys(label for label in labels if label))
         if not labels:
             continue
         event.recipient_relation = "internal"
@@ -4015,7 +4026,9 @@ def repair_wecom_internal_recipient_relations(
 def repair_wecom_recipients_from_event_context(
     events: list[AuditEvent],
     wecom_people_map: dict[tuple[str, str], PeopleEntry],
+    recipient_map: dict[tuple[str, str], RecipientEntry] | None = None,
 ) -> None:
+    recipient_map = recipient_map or {}
     internal_labels_by_account: dict[str, list[str]] = defaultdict(list)
     display_labels_by_account: dict[str, list[str]] = defaultdict(list)
     for event in events:
@@ -4036,6 +4049,10 @@ def repair_wecom_recipients_from_event_context(
             entry = wecom_internal_entry_for_recipient_label(raw_target, wecom_people_map)
             if entry:
                 internal_labels_by_account[normalized_account].append(wecom_internal_recipient_label(entry))
+                continue
+            manual_label = manual_internal_recipient_label_for_target(raw_target, recipient_map)
+            if manual_label:
+                internal_labels_by_account[normalized_account].append(manual_label)
                 continue
             if readable_internal:
                 internal_labels_by_account[normalized_account].extend(readable_internal)
@@ -4169,14 +4186,19 @@ def classify_recipients(
 
     elif topic == "im_audit":
         for target in targets:
+            if target_is_internal_network(target, internal_domains):
+                has_internal = True
+                internal_like.append(target)
+                continue
             nickname, account = split_im_target(target)
             entry = im_recipient_entry_for_target(nickname, account, target, recipient_map, trust_wecom_directory)
             if entry:
+                display = display_recipient(target, entry)
                 if entry.relation == "internal":
-                    has_internal = True
-                    internal_like.append(display_recipient(target, entry))
+                    external_like.append(display)
+                    has_unknown = True
                     continue
-                external_like.append(display_recipient(target, entry))
+                external_like.append(display)
                 relations.append(entry.relation)
             else:
                 external_like.append(target)
@@ -4187,14 +4209,19 @@ def classify_recipients(
 
     else:
         for target in targets:
+            if target_is_internal_network(target, internal_domains):
+                has_internal = True
+                internal_like.append(target)
+                continue
             nickname, account = split_im_target(target)
             im_entry = im_recipient_entry_for_target(nickname, account, target, recipient_map, trust_wecom_directory)
             if im_entry:
+                display = display_recipient(target, im_entry)
                 if im_entry.relation == "internal":
-                    has_internal = True
-                    internal_like.append(display_recipient(target, im_entry))
+                    external_like.append(display)
+                    has_unknown = True
                     continue
-                external_like.append(display_recipient(target, im_entry))
+                external_like.append(display)
                 relations.append(im_entry.relation)
                 continue
             if topic == "file_audit" and looks_like_im_recipient_token(target):
@@ -4318,15 +4345,19 @@ def enrich_events(
     wecom_people_map: dict[tuple[str, str], PeopleEntry],
     dispositions_by_event_id: dict[str, DispositionEntry],
     dispositions_by_search_id: dict[str, DispositionEntry],
+    recipient_map: dict[tuple[str, str], RecipientEntry] | None = None,
     terminal_identity_history: dict[tuple[str, str], list[TerminalIdentityObservation]] | None = None,
     terminal_identity_max_age_days: int | None = None,
 ) -> None:
     terminal_identity_history = terminal_identity_history or {}
-    repair_wecom_internal_recipient_relations(events, wecom_people_map)
+    recipient_map = recipient_map or {}
+    repair_wecom_internal_recipient_relations(events, wecom_people_map, recipient_map)
     enrich_file_audit_im_recipients(events)
-    repair_wecom_internal_recipient_relations(events, wecom_people_map)
-    repair_wecom_recipients_from_event_context(events, wecom_people_map)
+    repair_wecom_internal_recipient_relations(events, wecom_people_map, recipient_map)
+    repair_wecom_recipients_from_event_context(events, wecom_people_map, recipient_map)
     repair_wecom_self_recipient_relations(events)
+    for event in events:
+        normalize_untrusted_internal_im_relation(event)
     for event in events:
         event.resolved_person = event.resolved_person or event.person
         event.resolved_company = event.resolved_company or ""
@@ -12148,11 +12179,12 @@ def main() -> int:
             return 1
         return 0
     wecom_people_map = build_wecom_people_map(wecom_items)
+    manual_recipient_map = load_recipient_map(args.recipient_map)
     recipient_map = build_wecom_recipient_map(wecom_items)
-    recipient_map.update(load_observed_wecom_account_recipient_map(args, wecom_people_map))
-    recipient_map.update(load_recipient_map(args.recipient_map))
+    recipient_map.update(manual_recipient_map)
     args.people_map_loaded = people_map
     args.wecom_people_map_loaded = wecom_people_map
+    args.recipient_map_loaded = manual_recipient_map
     disposition_by_event_id, disposition_by_search_id = load_dispositions(args.disposition_file)
 
     records: list[RawRecord] = []
@@ -12197,6 +12229,7 @@ def main() -> int:
         wecom_people_map,
         disposition_by_event_id,
         disposition_by_search_id,
+        recipient_map=manual_recipient_map,
         terminal_identity_history=terminal_identity_history,
         terminal_identity_max_age_days=args.terminal_identity_max_age_days,
     )

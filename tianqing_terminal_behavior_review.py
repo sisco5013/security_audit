@@ -476,8 +476,10 @@ def configure_report_policy_context(config: Any, policy_doc: dict[str, Any]) -> 
     internal_domains = set(report_gen.DEFAULT_INTERNAL_DOMAINS)
     internal_domains.update(report_gen.policy_internal_domains(policy_doc if isinstance(policy_doc, dict) else {}))
     people_map = report_gen.load_people_map(args.people_map)
+    recipient_map = report_gen.load_recipient_map(args.recipient_map)
     wecom_items = load_cached_wecom_items(config)
     args.people_map_loaded = people_map
+    args.recipient_map_loaded = recipient_map
     args.wecom_people_map_loaded = report_gen.build_wecom_people_map(wecom_items)
     args.wecom_directory_meta = {"source": "cache", "ok": bool(wecom_items), "count": len(wecom_items)}
     return args, internal_domains
@@ -658,6 +660,7 @@ FORMAT JSONEachRow
         getattr(args, "wecom_people_map_loaded", {}) or {},
         {},
         {},
+        recipient_map=getattr(args, "recipient_map_loaded", {}) or {},
         terminal_identity_history=terminal_identity_history,
         terminal_identity_max_age_days=getattr(args, "terminal_identity_max_age_days", 30),
     )
@@ -672,7 +675,10 @@ FORMAT JSONEachRow
         report_gen.repair_wecom_recipients_from_event_context(
             audit_events + context_events,
             getattr(args, "wecom_people_map_loaded", {}) or {},
+            getattr(args, "recipient_map_loaded", {}) or {},
         )
+        for event in audit_events:
+            report_gen.normalize_untrusted_internal_im_relation(event)
     report_gen.apply_terminal_majority_identity(audit_events, terminal_identity_history)
     detail_events, _false_positive_reasons = report_gen.report_focus_events(audit_events, internal_domains)
     rows = [report_detail_row(event, internal_domains) for event in detail_events]
@@ -693,7 +699,6 @@ WHERE ts >= parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
   AND ts < parseDateTime64BestEffort({ch_quote(end.isoformat())}, 3)
   AND topic IN ('mail_audit','im_audit','file_audit')
   AND length(file_names) > 0
-  AND NOT {trusted_internal_sql()}
   AND channel != '内部系统上传'
   AND channel != '文件重命名'
   AND NOT has(reasons, '内部系统上传')
@@ -759,7 +764,6 @@ WHERE ts >= parseDateTime64BestEffort({ch_quote(baseline_start.isoformat())}, 3)
   AND ts < parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
   AND topic IN ('mail_audit','im_audit','file_audit')
   AND length(file_names) > 0
-  AND NOT {trusted_internal_sql()}
   AND channel != '内部系统上传'
   AND channel != '文件重命名'
   AND NOT has(reasons, '内部系统上传')
