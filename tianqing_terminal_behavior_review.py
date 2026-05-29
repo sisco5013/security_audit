@@ -1048,7 +1048,7 @@ FROM
     WHERE ts >= parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
       AND ts < parseDateTime64BestEffort({ch_quote(end.isoformat())}, 3)
 )
-WHERE object != '' AND channel_group != '' AND (focus_signal OR (object = '压缩包' AND ifNull(file_size, 0) > {large_archive_bytes}))
+WHERE object != '' AND channel_group != '' AND focus_signal
 GROUP BY client_name, client_ip, person_label, company_label, department_label, channel_group, object
 FORMAT JSONEachRow
 """

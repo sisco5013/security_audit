@@ -264,13 +264,35 @@ def destination_channel_for_raw(
     topic: str,
     obj: dict[str, Any],
     internal_domains: set[str],
+    recipient_map: dict[tuple[str, str], RecipientEntry] | None = None,
 ) -> tuple[str, str]:
     if topic == "mail_audit":
         targets, _domains = targets_for(obj, topic)
+        recipients, relation = classify_recipients(
+            topic,
+            targets,
+            _domains,
+            internal_domains,
+            recipient_map or {},
+            trust_wecom_directory=True,
+        )
+        sender_mailbox = mail_sender_mailbox_for(obj, topic)
+        if relation in {"internal", "group"} and not mailbox_is_external(sender_mailbox, internal_domains):
+            return "", "; ".join((recipients or targets)[:8])
         return "邮件外发", "; ".join(targets[:8])
     if topic == "im_audit":
         targets, _domains = targets_for(obj, topic)
         process = first_nonempty(obj, ["process_name"])
+        recipients, relation = classify_recipients(
+            topic,
+            targets,
+            _domains,
+            internal_domains,
+            recipient_map or {},
+            trust_wecom_directory=is_wecom_process_name(process),
+        )
+        if relation in {"internal", "group"}:
+            return "", "; ".join((recipients or targets)[:8])
         channel = "IM附件"
         if normalize_key(process) in {"wxwork.exe", "wxwork", "wecom.exe", "wecom"}:
             channel = "IM附件/企业微信"
@@ -288,6 +310,17 @@ def destination_channel_for_raw(
     if method == "copyout":
         return "外设拷贝", target_text
     if method == "send":
+        process = first_nonempty(obj, ["process_name"])
+        recipients, relation = classify_recipients(
+            topic,
+            targets,
+            domains,
+            internal_domains,
+            recipient_map or {},
+            trust_wecom_directory=is_wecom_process_name(process),
+        )
+        if relation in {"internal", "group"}:
+            return "", "; ".join((recipients or targets)[:8]) or target_text
         return "IM附件", target_text
     if method == "upload_to_site":
         if any(text_matches_hints(value, CLOUD_DEST_HINTS) for value in domains + targets):
@@ -305,6 +338,7 @@ def destination_match_for_rename(
     row: dict[str, Any],
     internal_domains: set[str],
     tz: timezone,
+    recipient_map: dict[tuple[str, str], RecipientEntry] | None = None,
 ) -> tuple[str, str, str, str] | None:
     obj = raw_json_from_clickhouse_row(row)
     if not obj:
@@ -340,7 +374,9 @@ def destination_match_for_rename(
 
     if not confidence:
         return None
-    channel, target = destination_channel_for_raw(topic, obj, internal_domains)
+    channel, target = destination_channel_for_raw(topic, obj, internal_domains, recipient_map)
+    if not channel:
+        return None
     return channel, target, confidence, basis
 
 
@@ -349,6 +385,7 @@ def update_three_d_rename_destination(
     destination_rows: list[dict[str, Any]],
     internal_domains: set[str],
     tz: timezone,
+    recipient_map: dict[tuple[str, str], RecipientEntry] | None = None,
 ) -> None:
     for finding in findings:
         best: tuple[datetime, dict[str, Any], tuple[str, str, str, str]] | None = None
@@ -356,7 +393,7 @@ def update_three_d_rename_destination(
             ts = parse_clickhouse_ts(row.get("ts"), tz)
             if not ts or (finding.rename_ts and ts <= finding.rename_ts):
                 continue
-            matched = destination_match_for_rename(finding, row, internal_domains, tz)
+            matched = destination_match_for_rename(finding, row, internal_domains, tz, recipient_map)
             if not matched:
                 continue
             if best is None or ts > best[0]:
@@ -464,7 +501,7 @@ def load_three_d_rename_findings(
     except Exception as exc:
         debug_timing(f"three_d_rename destination query failed {type(exc).__name__}: {exc}")
 
-    update_three_d_rename_destination(findings, destination_rows, internal_domains, tz)
+    update_three_d_rename_destination(findings, destination_rows, internal_domains, tz, getattr(args, "recipient_map_loaded", {}) or {})
     for finding in findings:
         finding.destination_in_report_period = in_period(finding.destination_ts, start, end, tz)
     active = [

@@ -429,7 +429,11 @@ def build_tianqing_outbound_module_result(
         int(channel_matrix_result.object_totals.get(label, 0) or 0)
         for label in ("结构标准方案", "电气标准方案")
     )
-    critical_large_archive_count = sum(1 for event in events if builders.is_large_archive_event(event))
+    critical_large_archive_count = sum(
+        1
+        for event in events
+        if builders.is_tianqing_level_one_event(event) and builders.is_large_archive_event(event)
+    )
     tianqing_level_one_count = sum(1 for event in events if builders.is_tianqing_level_one_event(event))
     return ReportModuleResult(
         home_module=home_module,

@@ -65,6 +65,8 @@ def build_tianqing_channel_matrix_result(
     channel_matrix_event_map: dict[tuple[str, str], list[AuditEvent]] = defaultdict(list)
     matrix_object_event_map: dict[str, list[AuditEvent]] = defaultdict(list)
     for event in events:
+        if not is_leadership_focus_event(event, internal_domains):
+            continue
         matrix_channel = audit_channel_group(event, internal_domains)
         if not matrix_channel:
             continue

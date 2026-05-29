@@ -102,7 +102,10 @@ def trend_matrix_events(events: list[AuditEvent], internal_domains: set[str]) ->
     return [
         event
         for event in events
-        if event.ts and audit_channel_group(event, internal_domains) and audit_matrix_bucket(event)
+        if event.ts
+        and is_leadership_focus_event(event, internal_domains)
+        and audit_channel_group(event, internal_domains)
+        and audit_matrix_bucket(event)
     ]
 
 

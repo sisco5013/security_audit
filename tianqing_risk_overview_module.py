@@ -437,17 +437,18 @@ def build_rule_risk_overview_html(
         )
     else:
         overall_sentence = "本期暂无进入通道×对象矩阵的重点事件，首页保留组织和趋势入口用于复核。"
+    matrix_events = list(current_counts.get("events") or [])
     structure_critical = sum(
-        1 for event in events if CRITICAL_STRUCTURE_LABEL in critical_design_labels_for_event(event)
+        1 for event in matrix_events if CRITICAL_STRUCTURE_LABEL in critical_design_labels_for_event(event)
     )
     electrical_critical = sum(
         1
-        for event in events
+        for event in matrix_events
         if CRITICAL_ELECTRICAL_LABEL in critical_design_labels_for_event(event)
         and CRITICAL_STRUCTURE_LABEL not in critical_design_labels_for_event(event)
     )
     standard_critical = structure_critical + electrical_critical
-    large_archive_critical = sum(1 for event in events if is_large_archive_event(event))
+    large_archive_critical = sum(1 for event in matrix_events if is_large_archive_event(event))
     level_one_sentence = (
         f"一级风险对象：标准图纸外发/拷贝 {standard_critical} 条"
         f"（结构 {structure_critical} 条、电气 {electrical_critical} 条），"

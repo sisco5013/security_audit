@@ -38,6 +38,7 @@ def build_tianqing_evidence_detail_result(
     report_period: str,
     source_label: str,
 ) -> TianqingEvidenceDetailResult:
+    events = [event for event in events if is_leadership_focus_event(event, internal_domains)]
     sidecar_pages: dict[str, str] = {}
     kpi_pages = {
         "focus": sidecar_page_filename(args, "kpi", "focus"),

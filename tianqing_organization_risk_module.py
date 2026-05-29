@@ -37,8 +37,9 @@ def build_tianqing_organization_risk_result(
     org_company_department_page = sidecar_page_filename(args, "org", "company-department")
     identity_gap_page = sidecar_page_filename(args, "org", "identity-gap")
 
+    focus_events = [event for event in events if is_leadership_focus_event(event, internal_domains)]
     terminal_risk_findings = build_terminal_risk_findings(
-        events,
+        focus_events,
         getattr(args, "terminal_identity_history", {}),
         asset_analysis.asset_by_terminal,
     )

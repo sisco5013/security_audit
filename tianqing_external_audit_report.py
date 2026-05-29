@@ -2856,9 +2856,9 @@ def is_trusted_internal_flow_event(event: AuditEvent) -> bool:
     return False
 
 
-def is_leadership_focus_event(event: AuditEvent, internal_domains: set[str] | None = None) -> bool:
+def is_report_flow_event(event: AuditEvent, internal_domains: set[str] | None = None) -> bool:
     internal_domains = internal_domains or DEFAULT_INTERNAL_DOMAINS
-    if is_normal_procurement_inquiry_event(event):
+    if event.topic == "firewall":
         return False
     if is_file_rename_event(event):
         return False
@@ -2867,6 +2867,15 @@ def is_leadership_focus_event(event: AuditEvent, internal_domains: set[str] | No
     if is_upload_noise_event(event, set(internal_domains)):
         return False
     if is_trusted_internal_flow_event(event) and not is_peripheral_copy_event(event):
+        return False
+    return True
+
+
+def is_leadership_focus_event(event: AuditEvent, internal_domains: set[str] | None = None) -> bool:
+    internal_domains = internal_domains or DEFAULT_INTERNAL_DOMAINS
+    if not is_report_flow_event(event, internal_domains):
+        return False
+    if is_normal_procurement_inquiry_event(event):
         return False
 
     names = non_image_file_names(event.file_names)
@@ -2879,6 +2888,8 @@ def is_leadership_focus_event(event: AuditEvent, internal_domains: set[str] | No
     if is_external_sender_mailbox(event):
         return True
     if procurement_inquiry_keyword_context(event) and has_procurement_hard_keep_signal(event):
+        return True
+    if is_peripheral_copy_event(event):
         return True
 
     # High-confidence external signals always stay in the leadership view.
@@ -2977,7 +2988,9 @@ def is_large_archive_event(event: AuditEvent) -> bool:
     return is_archive_event(event) and int(event.file_size or 0) > LARGE_ARCHIVE_RISK_BYTES
 
 
-def is_tianqing_level_one_event(event: AuditEvent) -> bool:
+def is_tianqing_level_one_event(event: AuditEvent, internal_domains: set[str] | None = None) -> bool:
+    if not is_leadership_focus_event(event, internal_domains or DEFAULT_INTERNAL_DOMAINS):
+        return False
     return is_critical_design_event(event) or is_large_archive_event(event)
 
 
@@ -3013,7 +3026,7 @@ def is_external_site_upload_event(event: AuditEvent, internal_domains: set[str])
 
 
 def audit_channel_group(event: AuditEvent, internal_domains: set[str]) -> str:
-    if event.topic == "firewall":
+    if not is_report_flow_event(event, internal_domains):
         return ""
     if event.topic == "mail_audit":
         return "邮件外发"
@@ -9243,7 +9256,7 @@ def build_html_report(
         trend_comparison_html=trend_comparison_html,
         build_rule_risk_overview_html=build_rule_risk_overview_html,
         is_large_archive_event=is_large_archive_event,
-        is_tianqing_level_one_event=is_tianqing_level_one_event,
+        is_tianqing_level_one_event=lambda event: is_tianqing_level_one_event(event, internal_domains),
         debug_timing=debug_timing,
     )
     tianqing_module_result = build_tianqing_outbound_module_result(
