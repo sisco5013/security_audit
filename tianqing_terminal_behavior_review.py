@@ -557,6 +557,66 @@ FORMAT JSONEachRow
     return report_gen.build_terminal_identity_history_from_rows(rows, tz, wecom_people_map)
 
 
+def collect_wecom_recipient_accounts(events: list[Any]) -> list[str]:
+    accounts: list[str] = []
+    for event in events:
+        topic = str(getattr(event, "topic", "") or "")
+        if topic not in {"im_audit", "file_audit"}:
+            continue
+        if not report_gen.is_wecom_process_name(getattr(event, "process_name", "")):
+            continue
+        values: list[str] = []
+        for items in (
+            getattr(event, "recipients", []) or [],
+            getattr(event, "targets", []) or [],
+            getattr(event, "target_domains", []) or [],
+        ):
+            values.extend(str(item or "").strip() for item in items if str(item or "").strip())
+        for value in values:
+            _nickname, account = report_gen.split_im_target(value)
+            if re.fullmatch(r"[A-Za-z0-9_-]{5,64}", account or ""):
+                accounts.append(account)
+    return list(dict.fromkeys(accounts))[:300]
+
+
+def fetch_wecom_recipient_context_events(
+    config: Any,
+    accounts: list[str],
+    start: datetime,
+    end: datetime,
+    tz: Any,
+) -> list[Any]:
+    if not accounts:
+        return []
+    filters = []
+    for account in accounts:
+        quoted = ch_quote(account)
+        filters.append(
+            f"(arrayExists(x -> position(x, {quoted}) > 0, recipients) "
+            f"OR arrayExists(x -> position(x, {quoted}) > 0, targets) "
+            f"OR arrayExists(x -> position(x, {quoted}) > 0, target_domains))"
+        )
+    query = f"""
+SELECT {report_gen.CLICKHOUSE_AUDIT_EVENT_SELECT}
+FROM audit_events
+WHERE ts >= parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
+  AND ts < parseDateTime64BestEffort({ch_quote(end.isoformat())}, 3)
+  AND topic = 'im_audit'
+  AND lowerUTF8(process_name) IN ('wxwork.exe','wxwork','wecom.exe','wecom')
+  AND ({' OR '.join(filters)})
+FORMAT JSONEachRow
+"""
+    try:
+        text = clickhouse_query(config, query)
+    except Exception:
+        return []
+    return [
+        report_gen.audit_event_from_clickhouse_row(json.loads(line), tz)
+        for line in text.splitlines()
+        if line.strip()
+    ]
+
+
 def fetch_report_detail_events(config: Any, start: datetime, end: datetime, policy_doc: dict[str, Any]) -> list[dict[str, Any]]:
     args, internal_domains = configure_report_policy_context(config, policy_doc)
     tz = report_gen.get_tz(getattr(config, "timezone", "Asia/Shanghai"))
@@ -601,6 +661,18 @@ FORMAT JSONEachRow
         terminal_identity_history=terminal_identity_history,
         terminal_identity_max_age_days=getattr(args, "terminal_identity_max_age_days", 30),
     )
+    context_events = fetch_wecom_recipient_context_events(
+        config,
+        collect_wecom_recipient_accounts(audit_events),
+        start,
+        end,
+        tz,
+    )
+    if context_events:
+        report_gen.repair_wecom_recipients_from_event_context(
+            audit_events + context_events,
+            getattr(args, "wecom_people_map_loaded", {}) or {},
+        )
     report_gen.apply_terminal_majority_identity(audit_events, terminal_identity_history)
     detail_events, _false_positive_reasons = report_gen.report_focus_events(audit_events, internal_domains)
     rows = [report_detail_row(event, internal_domains) for event in detail_events]

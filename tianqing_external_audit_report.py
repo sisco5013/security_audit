@@ -3924,6 +3924,24 @@ def im_recipient_labels_need_wecom_repair(values: Iterable[str]) -> bool:
     return all(looks_like_im_recipient_token(label) for label in labels)
 
 
+def wecom_event_recipient_values(event: AuditEvent) -> list[str]:
+    values: list[str] = []
+    for items in (event.recipients, event.targets, event.target_domains):
+        values.extend(str(item or "").strip() for item in items if str(item or "").strip())
+    return list(dict.fromkeys(values))
+
+
+def readable_internal_recipient_labels(event: AuditEvent) -> list[str]:
+    if event.recipient_relation != "internal":
+        return []
+    labels: list[str] = []
+    for value in event.recipients:
+        text = str(value or "").strip()
+        if text and not looks_like_im_recipient_token(text):
+            labels.append(text)
+    return list(dict.fromkeys(labels))
+
+
 def repair_wecom_internal_recipient_relations(
     events: list[AuditEvent],
     wecom_people_map: dict[tuple[str, str], PeopleEntry],
@@ -3967,6 +3985,125 @@ def repair_wecom_internal_recipient_relations(
         event.reasons = [reason for reason in event.reasons if reason != "IM收件人关系待判定"]
         if "企业微信内部接收方" not in event.reasons:
             event.reasons.append("企业微信内部接收方")
+
+
+def repair_wecom_recipients_from_event_context(
+    events: list[AuditEvent],
+    wecom_people_map: dict[tuple[str, str], PeopleEntry],
+) -> None:
+    internal_labels_by_account: dict[str, list[str]] = defaultdict(list)
+    display_labels_by_account: dict[str, list[str]] = defaultdict(list)
+    for event in events:
+        if event.topic == "im_audit":
+            if not is_wecom_process_name(event.process_name):
+                continue
+        elif is_im_file_audit_event(event):
+            if not is_wecom_process_name(event.process_name):
+                continue
+        else:
+            continue
+        readable_internal = readable_internal_recipient_labels(event)
+        for raw_target in wecom_event_recipient_values(event):
+            nickname, account = split_im_target(raw_target)
+            if not re.fullmatch(r"[A-Za-z0-9_-]{5,64}", account or ""):
+                continue
+            normalized_account = normalize_key(account)
+            entry = wecom_internal_entry_for_recipient_label(raw_target, wecom_people_map)
+            if entry:
+                internal_labels_by_account[normalized_account].append(wecom_internal_recipient_label(entry))
+                continue
+            if readable_internal:
+                internal_labels_by_account[normalized_account].extend(readable_internal)
+                continue
+            if nickname and normalize_key(nickname) != normalize_key(account):
+                display_labels_by_account[normalized_account].append(raw_target)
+
+    if not internal_labels_by_account and not display_labels_by_account:
+        return
+
+    for event in events:
+        if event.topic == "im_audit":
+            if not is_wecom_process_name(event.process_name):
+                continue
+        elif is_im_file_audit_event(event):
+            if not is_wecom_process_name(event.process_name):
+                continue
+        else:
+            continue
+        raw_targets = wecom_event_recipient_values(event)
+        if not raw_targets:
+            continue
+        labels: list[str] = []
+        account_count = 0
+        internal_count = 0
+        changed = False
+        for raw_target in raw_targets:
+            nickname, account = split_im_target(raw_target)
+            if not re.fullmatch(r"[A-Za-z0-9_-]{5,64}", account or ""):
+                labels.append(raw_target)
+                continue
+            account_count += 1
+            normalized_account = normalize_key(account)
+            internal_labels = list(dict.fromkeys(internal_labels_by_account.get(normalized_account, [])))
+            if internal_labels:
+                labels.extend(internal_labels)
+                internal_count += 1
+                changed = True
+                continue
+            display_labels = list(dict.fromkeys(display_labels_by_account.get(normalized_account, [])))
+            if display_labels:
+                labels.extend(display_labels)
+                changed = True
+                continue
+            labels.append(raw_target)
+        labels = list(dict.fromkeys(label for label in labels if label))
+        if not labels or not changed:
+            continue
+        event.recipients = labels
+        event.targets = labels
+        event.target_domains = []
+        if account_count and internal_count == account_count:
+            event.recipient_relation = "internal"
+            event.reasons = [reason for reason in event.reasons if reason != "IM收件人关系待判定"]
+            if "企业微信内部接收方" not in event.reasons:
+                event.reasons.append("企业微信内部接收方")
+        elif event.recipient_relation == "unknown" and "企业微信接收方名称补全" not in event.reasons:
+            event.reasons.append("企业微信接收方名称补全")
+
+
+def repair_wecom_self_recipient_relations(events: list[AuditEvent]) -> None:
+    for event in events:
+        if event.topic == "im_audit":
+            if not is_wecom_process_name(event.process_name):
+                continue
+        elif is_im_file_audit_event(event):
+            if not is_wecom_process_name(event.process_name):
+                continue
+        else:
+            continue
+        account = normalize_key(event.account)
+        if not account:
+            continue
+        target_accounts: set[str] = set()
+        for raw_target in wecom_event_recipient_values(event):
+            _nickname, target_account = split_im_target(raw_target)
+            if re.fullmatch(r"[A-Za-z0-9_-]{5,64}", target_account or ""):
+                target_accounts.add(normalize_key(target_account))
+        if account not in target_accounts:
+            continue
+        label_name = event.resolved_person or event.person or event.account
+        label = f"{label_name}(本人/文件助手)" if label_name else "本人/文件助手"
+        event.recipient_relation = "internal"
+        event.recipients = [label]
+        event.targets = [label]
+        event.target_domains = []
+        event.reasons = [
+            reason
+            for reason in event.reasons
+            if reason not in {"IM收件人关系待判定", "企业微信接收方名称补全"}
+        ]
+        if "企业微信本人/文件助手" not in event.reasons:
+            event.reasons.append("企业微信本人/文件助手")
 
 
 def classify_recipients(
@@ -4163,6 +4300,8 @@ def enrich_events(
     repair_wecom_internal_recipient_relations(events, wecom_people_map)
     enrich_file_audit_im_recipients(events)
     repair_wecom_internal_recipient_relations(events, wecom_people_map)
+    repair_wecom_recipients_from_event_context(events, wecom_people_map)
+    repair_wecom_self_recipient_relations(events)
     for event in events:
         event.resolved_person = event.resolved_person or event.person
         event.resolved_company = event.resolved_company or ""
