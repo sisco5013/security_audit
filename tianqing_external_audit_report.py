@@ -3606,6 +3606,7 @@ FORMAT JSONEachRow
 def build_wecom_people_map(items: list[dict[str, Any]]) -> dict[tuple[str, str], PeopleEntry]:
     mapping: dict[tuple[str, str], PeopleEntry] = {}
     name_counts = Counter(str(item.get("name") or "").strip() for item in items if str(item.get("name") or "").strip())
+    first_active_by_name: dict[str, PeopleEntry] = {}
     for item in items:
         name = str(item.get("name") or "").strip()
         userid = str(item.get("userid") or "").strip()
@@ -3630,6 +3631,26 @@ def build_wecom_people_map(items: list[dict[str, Any]]) -> dict[tuple[str, str],
         if name and name_counts[name] == 1:
             for match_type in ["im_nickname", "person", "identity_hint"]:
                 mapping.setdefault((match_type, normalize_key(name)), entry)
+        if name and status == "1":
+            first_active_by_name.setdefault(normalize_key(name), entry)
+    for name_key, entry in first_active_by_name.items():
+        duplicate_count = name_counts.get(entry.person_name, 0)
+        if duplicate_count <= 1:
+            mapping.setdefault(("im_nickname_any", name_key), entry)
+            continue
+        mapping.setdefault(
+            ("im_nickname_any", name_key),
+            PeopleEntry(
+                match_type="wecom_directory_name",
+                match_value=entry.person_name,
+                person_name=entry.person_name,
+                company="企业微信内部",
+                department=f"同名{duplicate_count}人待确认",
+                position="",
+                status="1",
+                note="wecom_directory_duplicate_name",
+            ),
+        )
     return mapping
 
 
@@ -3907,7 +3928,11 @@ def wecom_internal_entry_for_recipient_label(
             return entry
     if not nickname:
         return None
-    return active_wecom_people_entry(wecom_people_map.get(("im_nickname", normalize_key(nickname))))
+    nickname_key = normalize_key(nickname)
+    return active_wecom_people_entry(
+        wecom_people_map.get(("im_nickname", nickname_key))
+        or wecom_people_map.get(("im_nickname_any", nickname_key))
+    )
 
 
 def wecom_internal_recipient_label(entry: PeopleEntry) -> str:
