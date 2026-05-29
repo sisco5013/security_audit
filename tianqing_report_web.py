@@ -1267,19 +1267,27 @@ def _live_tianqing_management_metrics(config: AppConfig, start: datetime, end: d
     try:
         args, _tz, _internal_domains = live_decrypt_policy_context(config)
         event_where = report_gen.clickhouse_event_filter(start, end)
-        structure_cond = _tianqing_array_pattern_condition(report_gen.CRITICAL_STRUCTURE_LABEL)
-        electrical_cond = _tianqing_array_pattern_condition(report_gen.CRITICAL_ELECTRICAL_LABEL)
-        standard_cond = f"(({structure_cond}) OR ((NOT ({structure_cond})) AND ({electrical_cond})))"
-        large_archive_cond = f"(({_tianqing_archive_condition()}) AND ifNull(file_size, 0) > {report_gen.LARGE_ARCHIVE_RISK_BYTES})"
+        object_expr, channel_expr, focus_expr = report_gen.clickhouse_matrix_classification_exprs(_internal_domains)
+        critical_labels = report_gen.clickhouse_array_literal(list(report_gen.CRITICAL_DESIGN_LABELS))
+        large_archive_bytes = int(report_gen.LARGE_ARCHIVE_RISK_BYTES)
         query = f"""
 SELECT
-  countIf({standard_cond}) AS critical_design,
-  countIf({structure_cond}) AS critical_structure,
-  countIf((NOT ({structure_cond})) AND ({electrical_cond})) AS critical_electrical,
-  countIf({large_archive_cond}) AS critical_large_archive,
-  countIf(({standard_cond}) OR ({large_archive_cond})) AS level_one
-FROM audit_events
-WHERE {event_where}
+  countIf(object IN {critical_labels}) AS critical_design,
+  countIf(object = {report_gen.clickhouse_literal(report_gen.CRITICAL_STRUCTURE_LABEL)}) AS critical_structure,
+  countIf(object = {report_gen.clickhouse_literal(report_gen.CRITICAL_ELECTRICAL_LABEL)}) AS critical_electrical,
+  countIf(object = '压缩包' AND ifNull(file_size, 0) > {large_archive_bytes}) AS critical_large_archive,
+  countIf(object IN {critical_labels} OR (object = '压缩包' AND ifNull(file_size, 0) > {large_archive_bytes})) AS level_one
+FROM
+(
+  SELECT
+    file_size,
+    {object_expr} AS object,
+    {channel_expr} AS channel_group,
+    {focus_expr} AS focus_signal
+  FROM audit_events
+  WHERE {event_where}
+)
+WHERE focus_signal AND channel_group != ''
 FORMAT JSONEachRow
 """
         text = report_gen.clickhouse_query(args, query)

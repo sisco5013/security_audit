@@ -292,6 +292,32 @@ def insert_rows(args: argparse.Namespace, table: str, rows: list[dict[str, Any]]
     clickhouse_request(args, f"INSERT INTO {table} FORMAT JSONEachRow", json_each_row(rows))
 
 
+def safe_clickhouse_identifier(name: str) -> str:
+    text = str(name or "").strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", text):
+        raise ValueError(f"unsafe ClickHouse identifier: {name!r}")
+    return text
+
+
+def event_table_sql_for(table_name: str) -> str:
+    table = safe_clickhouse_identifier(table_name)
+    return EVENT_TABLE_SQL.replace("CREATE TABLE IF NOT EXISTS audit_events", f"CREATE TABLE IF NOT EXISTS {table}", 1)
+
+
+def create_event_rebuild_table(args: argparse.Namespace) -> str:
+    table = safe_clickhouse_identifier(f"audit_events_rebuild_{int(time.time())}_{os.getpid()}")
+    clickhouse_request(args, f"DROP TABLE IF EXISTS {table}")
+    clickhouse_request(args, event_table_sql_for(table))
+    return table
+
+
+def replace_event_table(args: argparse.Namespace, rebuild_table: str) -> None:
+    staging = safe_clickhouse_identifier(rebuild_table)
+    backup = safe_clickhouse_identifier(f"audit_events_backup_{int(time.time())}_{os.getpid()}")
+    clickhouse_request(args, f"RENAME TABLE audit_events TO {backup}, {staging} TO audit_events")
+    clickhouse_request(args, f"DROP TABLE IF EXISTS {backup}")
+
+
 def clickhouse_stream_rows(args: argparse.Namespace, query: str) -> Iterable[dict[str, Any]]:
     params = {"database": args.clickhouse_database, "query": query}
     url = args.clickhouse_url.rstrip("/") + "/?" + urllib.parse.urlencode(params)
@@ -656,8 +682,11 @@ def rebuild_events_from_raw(
     if context is None:
         context = load_context(args)
     exclusion_rules, people_map, wecom_people_map, recipient_map, disposition_by_event_id, disposition_by_search_id = context
+    target_table = "audit_events"
+    rebuild_table = ""
     if reset_event_table:
-        clickhouse_request(args, "TRUNCATE TABLE audit_events")
+        rebuild_table = create_event_rebuild_table(args)
+        target_table = rebuild_table
     internal_domains = set(report.DEFAULT_INTERNAL_DOMAINS)
     ingest_time = ch_dt(datetime.now(timezone.utc))
     pending_events: list[report.AuditEvent] = []
@@ -672,35 +701,45 @@ def rebuild_events_from_raw(
         report.apply_report_policies(pending_events, {}, internal_domains)
         report.enrich_events(pending_events, people_map, wecom_people_map, disposition_by_event_id, disposition_by_search_id)
         rows = [event_row(event, digest, ingest_time) for event, digest in zip(pending_events, pending_hashes)]
-        insert_rows(args, "audit_events", rows)
+        insert_rows(args, target_table, rows)
         event_count += len(rows)
         pending_events.clear()
         pending_hashes.clear()
 
-    query = "SELECT ts, raw_hash, raw_json FROM raw_syslog FORMAT JSONEachRow"
-    for row in clickhouse_stream_rows(args, query):
-        scanned += 1
-        try:
-            obj = json.loads(str(row.get("raw_json") or ""))
-        except json.JSONDecodeError:
-            continue
-        record = report.RawRecord(ts=parse_clickhouse_datetime(row.get("ts")), obj=obj)
-        event = report.build_event(
-            record,
-            internal_domains,
-            recipient_map,
-            exclusion_rules=exclusion_rules,
-            include_firewall=True,
-            include_unknown_im=True,
-            include_untargeted_file=True,
-            wecom_directory_authoritative=False,
-        )
-        if event:
-            pending_events.append(event)
-            pending_hashes.append(str(row.get("raw_hash") or ""))
-        if len(pending_events) >= args.batch_size:
-            flush_events()
-    flush_events()
+    try:
+        query = "SELECT ts, raw_hash, raw_json FROM raw_syslog FORMAT JSONEachRow"
+        for row in clickhouse_stream_rows(args, query):
+            scanned += 1
+            try:
+                obj = json.loads(str(row.get("raw_json") or ""))
+            except json.JSONDecodeError:
+                continue
+            record = report.RawRecord(ts=parse_clickhouse_datetime(row.get("ts")), obj=obj)
+            event = report.build_event(
+                record,
+                internal_domains,
+                recipient_map,
+                exclusion_rules=exclusion_rules,
+                include_firewall=True,
+                include_unknown_im=True,
+                include_untargeted_file=True,
+                wecom_directory_authoritative=False,
+            )
+            if event:
+                pending_events.append(event)
+                pending_hashes.append(str(row.get("raw_hash") or ""))
+            if len(pending_events) >= args.batch_size:
+                flush_events()
+        flush_events()
+        if rebuild_table:
+            replace_event_table(args, rebuild_table)
+    except Exception:
+        if rebuild_table:
+            try:
+                clickhouse_request(args, f"DROP TABLE IF EXISTS {safe_clickhouse_identifier(rebuild_table)}")
+            except Exception:
+                pass
+        raise
     args.rebuild_scanned = scanned
     return event_count
 
