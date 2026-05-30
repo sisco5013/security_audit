@@ -275,7 +275,7 @@ def build_tianqing_evidence_detail_result(
         </div>
         <span class="section-count">共 {len(detail_events)} 条</span>
       </div>
-      {event_detail_table_html(detail_events, tz, keyword=keyword, page_size=10, asset_by_terminal=getattr(args, "asset_by_terminal", {}))}
+      {event_detail_table_html(detail_events, tz, keyword=keyword, page_size=10, asset_by_terminal=getattr(args, "asset_by_terminal", {}), recipient_map=getattr(args, "recipient_map_loaded", {}) or {})}
     </section>
 """
         sidecar_pages[keyword_links[keyword]] = html_detail_document(f"敏感命中详情：{keyword}", detail_body)

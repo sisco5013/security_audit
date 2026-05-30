@@ -43,7 +43,6 @@ APP_FILES=(
   tianqing_trend_module.py
   generate_tianqing_period_report.sh
   backfill_tianqing_archives.sh
-  people_mapping.csv
   recipient_mapping.csv
   audit_dispositions.csv
   wecom_directory_cache.json
@@ -149,7 +148,6 @@ python3 tianqing_external_audit_report.py \
   --format html \
   --wecom-directory-authoritative \
   --public-base-url "$PUBLIC_BASE_URL" \
-  --people-map people_mapping.csv \
   --recipient-map recipient_mapping.csv \
   --disposition-file audit_dispositions.csv \
   --sensitive-keywords-file "$KEYWORDS_FILE" \

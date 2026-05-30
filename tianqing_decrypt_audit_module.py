@@ -115,7 +115,7 @@ def decrypt_rule_risk_overview_html(
     department_counts = decrypt_counter_for(standard_records, decrypt_department_label)
     top_company, top_company_count = risk_overview_top_label(company_counts)
     top_department, top_department_count = risk_overview_top_label(department_counts)
-    followup_counts = Counter(record.followup_channel or "未发现后续外发/拷贝线索" for record in linked_records)
+    followup_counts = Counter(record.followup_channel or "未发现同名文件疑似后续线索" for record in linked_records)
     top_followup, top_followup_count = risk_overview_top_label(followup_counts)
 
     if analysis.error and not records:
@@ -135,7 +135,7 @@ def decrypt_rule_risk_overview_html(
                 f"未完成组织映射 {unmatched_count} 条，不参与公司解密风险矩阵比较。"
             ),
             (
-                f"标准图纸解密后 30 天内发现同名文件后续流转线索 {standard_linked_count} 条；全部解密记录后续流转线索 {linked_count} 条，"
+                f"标准图纸解密后 30 天内发现同名文件疑似后续流转线索 {standard_linked_count} 条；全部解密记录同名疑似线索 {linked_count} 条，"
                 f"主要后续通道为 {top_followup} {top_followup_count} 条；该线索为疑似关联，需结合审批单和天擎附件复核。"
             ),
         ]
@@ -152,7 +152,7 @@ def decrypt_rule_risk_overview_html(
         <div>
           <span class="section-eyebrow">Rule Overview</span>
           <h2>加密软件解密规则风险概览</h2>
-          <p>基于解密记录、标准图纸识别、组织别名映射和同名文件后续流转线索生成管理结论；不使用 AI 推断。</p>
+          <p>基于解密记录、标准图纸识别、组织别名映射和同名文件疑似后续流转线索生成管理结论；不使用 AI 推断，不表述为确认最终去向。</p>
         </div>
       </div>
       <div class="risk-overview-hero">
@@ -475,7 +475,7 @@ def decrypt_risk_home_html(
         decrypt_card_html("电气", len(electrical), "电气标准方案解密记录", links.get("electrical"), "amber"),
         decrypt_card_html("三维模型", len(three_d), "PRT/ASM/SLDASM/SLDPRT/STEP 解密记录", links.get("three_d"), "blue"),
         decrypt_card_html("DWG图纸", len(dwg), "DWG 图纸解密记录", links.get("dwg"), "slate"),
-        decrypt_card_html("发现后续流转", len(linked), "解密后30天内按同名文件发现邮件/IM/上传/外设线索", links.get("linked"), "red"),
+        decrypt_card_html("同名疑似线索", len(linked), "解密后30天内按同名文件发现邮件/IM/上传/外设线索", links.get("linked"), "red"),
     ]
     error_html = f'<p class="rename-empty">解密记录追踪暂不可用：{esc(analysis.error)}</p>' if analysis.error else ""
     overview_html = decrypt_rule_risk_overview_html(analysis, links)
@@ -518,7 +518,7 @@ def decrypt_record_department_cell(record: DecryptRiskRecord) -> HtmlCell:
 
 def decrypt_flow_chain_cell(record: DecryptRiskRecord, tz: timezone) -> HtmlCell:
     if not record.followup_chain:
-        return tooltip_cell("未发现", "申请后30天内未从天擎审计底稿发现同名文件外发、上传或外设拷贝线索。")
+        return tooltip_cell("未发现", "申请后30天内未从天擎审计底稿发现同名文件疑似外发、上传或外设拷贝线索。")
     segments: list[str] = []
     title_lines: list[str] = []
     for idx, item in enumerate(record.followup_chain, 1):
@@ -537,7 +537,7 @@ def decrypt_flow_chain_cell(record: DecryptRiskRecord, tz: timezone) -> HtmlCell
 
 def decrypt_final_destination_cell(record: DecryptRiskRecord) -> HtmlCell:
     if not record.followup_confidence:
-        return tooltip_cell("未发现后续流转", "未发现同名文件后续外发、上传或外设拷贝线索。")
+        return tooltip_cell("未发现同名线索", "未发现同名文件疑似后续外发、上传或外设拷贝线索。")
     title = " / ".join(
         value
         for value in [
@@ -548,7 +548,7 @@ def decrypt_final_destination_cell(record: DecryptRiskRecord) -> HtmlCell:
         ]
         if value
     )
-    return tooltip_cell(record.followup_channel or "疑似后续流转", title)
+    return tooltip_cell(record.followup_channel or "同名疑似后续流转", title)
 
 
 def decrypt_detail_rows(records: list[DecryptRiskRecord], tz: timezone) -> list[list[Any]]:
@@ -595,7 +595,7 @@ def build_decrypt_risk_detail_page(
         [
             ("记录数", len(records), "当前筛选下的解密记录数"),
             ("标准图纸", len(decrypt_standard_records(records)), "结构/电气标准图纸解密记录"),
-            ("发现后续流转", linked, "申请后30天内同名文件关联到后续事件"),
+            ("同名疑似线索", linked, "申请后30天内同名文件关联到后续事件，不代表确认最终去向"),
             ("组织映射待完善", unmatched, "未命中组织别名关联表"),
         ]
     )
@@ -611,7 +611,7 @@ def build_decrypt_risk_detail_page(
         <span class="section-count">共 {len(records)} 条</span>
       </div>
       {html_table(["申请时间", "公司", "部门", "申请人", "申请人账号", "文件名", "资料类型", "文件大小", "申请原因", "接受单位", "审批人", "审批时间", "状态", "最终可观测去向", "最终时间", "匹配可信度", "最终目标", "流转链路"], decrypt_detail_rows(records, tz), "events decrypt-records", page_size=50)}
-      <p class="note">流转链路按同名文件、人员和组织线索关联；最终可观测去向取申请后30天内可信/组织匹配的最后一次后续事件，只有低可信记录时标记待人工复核。未发现后续线索不代表文件没有其他未记录流转。</p>
+      <p class="note">后续流转仅按同名文件、人员和组织线索做疑似关联；页面展示的是申请后30天内可信/组织匹配的最后一次可观测线索，不代表确认最终去向。未发现后续线索不代表文件没有其他未记录流转。</p>
     </section>
 """
     return html_detail_document(title, body)
@@ -698,7 +698,7 @@ def build_decrypt_audit_module_result(
             tz,
             report_period,
             source_label,
-            "解密申请后30天内，同名文件在天擎邮件、IM、上传或外设拷贝底稿中出现的流转链路线索。",
+            "解密申请后30天内，同名文件在天擎邮件、IM、上传或外设拷贝底稿中出现的疑似后续线索，不作为确认最终去向。",
         ),
         page_names["unmatched"]: build_decrypt_risk_detail_page(
             "组织映射待完善明细",

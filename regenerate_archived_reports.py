@@ -80,8 +80,6 @@ def generator_command(item: dict[str, str], output_path: Path, env_values: dict[
         "--wecom-directory-authoritative",
         "--public-base-url",
         PUBLIC_BASE_URL,
-        "--people-map",
-        str(APP_DIR / "people_mapping.csv"),
         "--recipient-map",
         str(APP_DIR / "recipient_mapping.csv"),
         "--disposition-file",

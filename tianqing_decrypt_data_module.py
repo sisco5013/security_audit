@@ -213,7 +213,7 @@ def decrypt_standard_rename_followup_event(
     if report_file_name_key(record.file_name) != report_file_name_key(finding.old_name):
         return None
     confidence = decrypt_rename_followup_confidence(record, finding)
-    channel = finding.destination_channel or "疑似后续外发/拷贝"
+    channel = finding.destination_channel or "同名疑似后续外发/拷贝"
     if not channel.startswith("标准图纸更名外发"):
         channel = f"标准图纸更名外发/{channel}"
     target_parts = [
@@ -270,7 +270,7 @@ def enrich_decrypt_standard_rename_followups(
         record.followup_chain = chain
         reliable_chain = [item for item in chain if decrypt_followup_rank(item.confidence) >= 2]
         final = max(reliable_chain or chain, key=lambda item: item.ts or datetime.min.replace(tzinfo=timezone.utc))
-        record.followup_channel = final.channel or "疑似后续外发/拷贝"
+        record.followup_channel = final.channel or "同名疑似后续外发/拷贝"
         record.followup_time = final.ts
         record.followup_target = final.target
         record.followup_confidence = final.confidence
@@ -322,7 +322,7 @@ def enrich_decrypt_followups(
         record.followup_chain = chain
         reliable_chain = [item for item in chain if decrypt_followup_rank(item.confidence) >= 2]
         final = max(reliable_chain or chain, key=lambda item: item.ts or datetime.min.replace(tzinfo=timezone.utc))
-        record.followup_channel = final.channel or "疑似后续外发/拷贝"
+        record.followup_channel = final.channel or "同名疑似后续外发/拷贝"
         record.followup_time = final.ts
         record.followup_target = final.target
         record.followup_confidence = final.confidence

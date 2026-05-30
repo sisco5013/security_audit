@@ -114,8 +114,8 @@ DEFAULT_PLM_CONSTRAINED_DEPARTMENTS = ["技术部", "研发部", "工艺部"]
 DEFAULT_PLM_TERMINAL_MATCH_FIELDS = ["ip_address", "computer_name"]
 ENCRYPTION_TERMINAL_TRUST_DAYS = 7
 TOP_RISK_DEFINITION_TEXT = (
-    "一级风险定义：标准图纸解密；天擎标准图纸外发/拷贝；"
-    "天擎大于100MB压缩包外发/上传/外设拷贝；PLM技术、研发、工艺账号池外登录。"
+    "一级风险定义：标准图纸解密；天擎标准图纸流转；"
+    "技术、工艺、研发部门大于100MB压缩包流转（排除内部系统上传）；PLM技术、研发、工艺账号池外登录。"
 )
 TOP_RISK_EVIDENCE_TEXT = "一级风险进入顶部汇总管理结论，矩阵、趋势和明细用于定位组织、终端与证据链。"
 
@@ -447,6 +447,7 @@ def normalize_login_next(next_path: str) -> str:
         "/settings/decrypt-records/": "/settings/decrypt-records",
         "/settings/organization-aliases/": "/settings/organization-aliases",
         "/settings/organization-tree/": "/settings/organization-tree",
+        "/settings/identity-bindings/": "/settings/identity-bindings",
         "/settings/auth/": "/settings/auth",
         "/settings/exclusions/": "/settings/exclusions",
     }
@@ -1267,27 +1268,83 @@ def _live_tianqing_management_metrics(config: AppConfig, start: datetime, end: d
     try:
         args, _tz, _internal_domains = live_decrypt_policy_context(config)
         event_where = report_gen.clickhouse_event_filter(start, end)
-        object_expr, channel_expr, focus_expr = report_gen.clickhouse_matrix_classification_exprs(_internal_domains)
+        object_expr, _channel_expr, _focus_expr = report_gen.clickhouse_matrix_classification_exprs(_internal_domains)
         critical_labels = report_gen.clickhouse_array_literal(list(report_gen.CRITICAL_DESIGN_LABELS))
         large_archive_bytes = int(report_gen.LARGE_ARCHIVE_RISK_BYTES)
+        large_archive_scope_expr = report_gen.clickhouse_large_archive_scope_expr("department")
         query = f"""
 SELECT
-  countIf(object IN {critical_labels}) AS critical_design,
-  countIf(object = {report_gen.clickhouse_literal(report_gen.CRITICAL_STRUCTURE_LABEL)}) AS critical_structure,
-  countIf(object = {report_gen.clickhouse_literal(report_gen.CRITICAL_ELECTRICAL_LABEL)}) AS critical_electrical,
-  countIf(object = '压缩包' AND ifNull(file_size, 0) > {large_archive_bytes}) AS critical_large_archive,
-  countIf(object IN {critical_labels} OR (object = '压缩包' AND ifNull(file_size, 0) > {large_archive_bytes})) AS level_one
+  sumIf(flow_count, level_one_object IN {critical_labels}) AS critical_design,
+  sumIf(flow_count, level_one_object = {report_gen.clickhouse_literal(report_gen.CRITICAL_STRUCTURE_LABEL)}) AS critical_structure,
+  sumIf(flow_count, level_one_object = {report_gen.clickhouse_literal(report_gen.CRITICAL_ELECTRICAL_LABEL)}) AS critical_electrical,
+  sumIf(flow_count, level_one_object = '压缩包') AS critical_large_archive,
+  sum(flow_count) AS level_one,
+  sumIf(raw_count, level_one_object IN {critical_labels}) AS critical_design_raw_events,
+  sumIf(raw_count, level_one_object = {report_gen.clickhouse_literal(report_gen.CRITICAL_STRUCTURE_LABEL)}) AS critical_structure_raw_events,
+  sumIf(raw_count, level_one_object = {report_gen.clickhouse_literal(report_gen.CRITICAL_ELECTRICAL_LABEL)}) AS critical_electrical_raw_events,
+  sumIf(raw_count, level_one_object = '压缩包') AS critical_large_archive_raw_events,
+  sum(raw_count) AS level_one_raw_events
 FROM
 (
   SELECT
-    file_size,
-    {object_expr} AS object,
-    {channel_expr} AS channel_group,
-    {focus_expr} AS focus_signal
-  FROM audit_events
-  WHERE {event_where}
+    level_one_object,
+    count() AS raw_count,
+    uniqExact(dedup_key) AS flow_count
+  FROM
+  (
+    SELECT
+      level_one_object,
+      concat(
+        toString(toStartOfMinute(ts)), '|',
+        client_name, '|',
+        client_ip, '|',
+        arrayStringConcat(arraySort(file_names), ';'), '|',
+        arrayStringConcat(arraySort(arrayConcat(recipients, targets, target_domains)), ';'), '|',
+        level_one_object
+      ) AS dedup_key
+    FROM
+    (
+      SELECT
+        ts,
+        client_name,
+        client_ip,
+        file_names,
+        recipients,
+        targets,
+        target_domains,
+        multiIf(
+          object IN {critical_labels}, object,
+          object = '压缩包' AND ifNull(file_size, 0) > {large_archive_bytes} AND ({large_archive_scope_expr}), '压缩包',
+          ''
+        ) AS level_one_object
+      FROM
+      (
+        SELECT
+          ts,
+          client_name,
+          client_ip,
+          file_names,
+          recipients,
+          targets,
+          target_domains,
+          file_size,
+          topic,
+          channel,
+          reasons,
+          department,
+          {object_expr} AS object
+        FROM audit_events
+        WHERE {event_where}
+      )
+      WHERE topic IN ('mail_audit','im_audit','file_audit')
+        AND object != ''
+        AND NOT (topic = 'file_audit' AND (channel = '文件重命名' OR has(reasons, '文件重命名')))
+        AND NOT (topic = 'file_audit' AND (channel = '内部系统上传' OR has(reasons, '内部系统上传')))
+    )
+    WHERE level_one_object != ''
+  )
+  GROUP BY level_one_object
 )
-WHERE focus_signal AND channel_group != ''
 FORMAT JSONEachRow
 """
         text = report_gen.clickhouse_query(args, query)
@@ -1300,6 +1357,11 @@ FORMAT JSONEachRow
         "critical_electrical": int(row.get("critical_electrical") or 0),
         "critical_large_archive": int(row.get("critical_large_archive") or 0),
         "level_one": int(row.get("level_one") or 0),
+        "critical_design_raw_events": int(row.get("critical_design_raw_events") or 0),
+        "critical_structure_raw_events": int(row.get("critical_structure_raw_events") or 0),
+        "critical_electrical_raw_events": int(row.get("critical_electrical_raw_events") or 0),
+        "critical_large_archive_raw_events": int(row.get("critical_large_archive_raw_events") or 0),
+        "level_one_raw_events": int(row.get("level_one_raw_events") or 0),
     }
 
 
@@ -1427,6 +1489,10 @@ def inject_global_management_summary(data: bytes, config: AppConfig | None = Non
         if live_metrics:
             decrypt_metrics = live_metrics
     tianqing_metrics = _fallback_tianqing_management_metrics(text)
+    if config is not None and period:
+        live_metrics = _live_tianqing_management_metrics(config, period[0], period[1])
+        if live_metrics:
+            tianqing_metrics = live_metrics
     review_metrics = (
         _terminal_review_management_metrics(config, period[0], period[1])
         if config is not None and period
@@ -2018,8 +2084,6 @@ def command_for_job(config: AppConfig, job: Job, output_path: Path) -> list[str]
         "--format",
         "html",
         "--wecom-directory-authoritative",
-        "--people-map",
-        str(config.app_dir / "people_mapping.csv"),
         "--recipient-map",
         str(config.app_dir / "recipient_mapping.csv"),
         "--disposition-file",
@@ -4039,6 +4103,584 @@ def wecom_org_options(config: AppConfig) -> tuple[list[str], list[str]]:
     return sorted(companies), sorted(departments)
 
 
+def clickhouse_report_args(config: AppConfig) -> argparse.Namespace:
+    return argparse.Namespace(
+        use_clickhouse=True,
+        clickhouse_url=config.clickhouse_url,
+        clickhouse_database=config.clickhouse_database,
+        clickhouse_user=config.clickhouse_user,
+        clickhouse_password=config.clickhouse_password,
+        clickhouse_timeout=config.clickhouse_timeout,
+    )
+
+
+def wecom_duplicate_name_candidates(config: AppConfig) -> dict[str, list[dict[str, Any]]]:
+    cache = load_wecom_user_cache(config)
+    by_name: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in cache.values():
+        name = str(item.get("name") or "").strip()
+        userid = str(item.get("userid") or "").strip()
+        if name and userid:
+            by_name[name].append(item)
+    return {name: items for name, items in by_name.items() if len(items) > 1}
+
+
+def load_manual_identity_map_for_web(config: AppConfig) -> dict[tuple[str, str], report_gen.PeopleEntry]:
+    return report_gen.load_manual_identity_bindings(clickhouse_report_args(config))
+
+
+def observed_duplicate_wecom_accounts(config: AppConfig, days: int = 90, limit: int = 800) -> list[dict[str, Any]]:
+    duplicates = wecom_duplicate_name_candidates(config)
+    if not duplicates:
+        return []
+    names = sorted(duplicates)
+    name_list = "[" + ",".join(terminal_review.ch_quote(name) for name in names) + "]"
+    query = f"""
+SELECT
+  local_account,
+  local_nickname,
+  count() AS rows,
+  max(ts) AS last_seen,
+  groupUniqArray(8)(JSONExtractString(raw_json, 'client_ip')) AS client_ips,
+  groupUniqArray(6)(sample_terminal) AS terminal_samples
+FROM
+(
+  SELECT
+    ts,
+    JSONExtractString(raw_json, 'local_account') AS local_account,
+    JSONExtractString(raw_json, 'local_nickname') AS local_nickname,
+    concat(
+      JSONExtractString(raw_json, 'client_name'),
+      ' / ',
+      JSONExtractString(raw_json, 'client_ip'),
+      ' / ',
+      JSONExtractString(raw_json, 'client_login_account')
+    ) AS sample_terminal
+  FROM raw_syslog
+  WHERE ts >= now() - INTERVAL {max(1, int(days))} DAY
+    AND topic = 'im_audit'
+    AND lower(JSONExtractString(raw_json, 'process_name')) = 'wxwork.exe'
+    AND length(JSONExtractString(raw_json, 'local_account')) > 0
+    AND JSONExtractString(raw_json, 'local_nickname') IN {name_list}
+)
+GROUP BY local_account, local_nickname
+ORDER BY last_seen DESC, rows DESC
+LIMIT {max(1, int(limit))}
+FORMAT JSONEachRow
+"""
+    try:
+        rows = [json.loads(line) for line in terminal_review.clickhouse_query_body(config, query).splitlines() if line.strip()]
+    except Exception:
+        return []
+    rows.sort(key=identity_binding_row_sort_key)
+    return rows
+
+
+def identity_binding_option_label(item: dict[str, Any]) -> str:
+    company, department = wecom_item_org_fields(item)
+    parts = [
+        str(item.get("name") or "").strip(),
+        company,
+        department,
+        str(item.get("userid") or "").strip(),
+    ]
+    return " / ".join(part for part in parts if part)
+
+
+def identity_ip_sort_value(value: Any) -> tuple[int, int, str]:
+    text = str(value or "").strip()
+    if not text:
+        return (1, 0, "")
+    try:
+        ip = ipaddress.ip_address(text)
+        return (0, int(ip), text)
+    except ValueError:
+        return (1, 0, text)
+
+
+def identity_first_ip(row: dict[str, Any]) -> str:
+    values = row.get("client_ips") or row.get("ip_samples") or []
+    if isinstance(values, list):
+        candidates = [str(item or "").strip() for item in values if str(item or "").strip()]
+    else:
+        candidates = [str(values or "").strip()] if str(values or "").strip() else []
+    candidates.sort(key=identity_ip_sort_value)
+    return candidates[0] if candidates else ""
+
+
+def identity_binding_row_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        identity_ip_sort_value(identity_first_ip(row)),
+        str(row.get("local_nickname") or row.get("remote_nickname") or ""),
+        str(row.get("local_account") or row.get("remote_account") or ""),
+    )
+
+
+def observed_remote_wecom_recipient_accounts(config: AppConfig, days: int = 90, limit: int = 1200) -> list[dict[str, Any]]:
+    cache = load_wecom_user_cache(config)
+    by_name: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in cache.values():
+        name = str(item.get("name") or "").strip()
+        userid = str(item.get("userid") or "").strip()
+        if name and userid:
+            by_name[name].append(item)
+    unique_by_name = {name: items[0] for name, items in by_name.items() if len(items) == 1}
+    if not unique_by_name:
+        return []
+    query = f"""
+SELECT
+  r.remote_nickname AS remote_nickname,
+  r.remote_account AS remote_account,
+  r.rows AS rows,
+  r.last_seen AS last_seen,
+  r.client_ips AS client_ips,
+  r.terminal_samples AS terminal_samples,
+  l.local_nickname AS confirmed_local_nickname,
+  l.local_last_seen AS confirmed_local_last_seen,
+  l.local_rows AS confirmed_local_rows
+FROM
+(
+SELECT
+  replaceRegexpOne(recipient, '\\\\s*<[^<>]+>\\\\s*$', '') AS remote_nickname,
+  extract(recipient, '<([^<>]+)>\\\\s*$') AS remote_account,
+  count() AS rows,
+  max(ts) AS last_seen,
+  groupUniqArray(8)(client_ip) AS client_ips,
+  groupUniqArray(8)(
+    concat(
+      client_name,
+      ' / ',
+      client_ip,
+      ' / ',
+      person,
+      '<',
+      account,
+      '>'
+    )
+  ) AS terminal_samples
+FROM
+(
+  SELECT
+    ts,
+    person,
+    account,
+    client_name,
+    client_ip,
+    arrayJoin(recipients) AS recipient
+  FROM audit_events
+  WHERE ts >= now() - INTERVAL {max(1, int(days))} DAY
+    AND topic IN ('im_audit', 'file_audit')
+    AND lowerUTF8(process_name) IN ('wxwork.exe','wxwork','wecom.exe','wecom')
+    AND length(file_names) > 0
+    AND length(recipients) > 0
+    AND recipient_relation != 'internal'
+)
+WHERE match(recipient, '<[^<>]+>\\\\s*$')
+GROUP BY remote_account, remote_nickname
+) AS r
+ANY INNER JOIN
+(
+  SELECT
+    JSONExtractString(raw_json, 'local_account') AS local_account,
+    any(JSONExtractString(raw_json, 'local_nickname')) AS local_nickname,
+    max(ts) AS local_last_seen,
+    count() AS local_rows
+  FROM raw_syslog
+  WHERE topic = 'im_audit'
+    AND lowerUTF8(JSONExtractString(raw_json, 'process_name')) IN ('wxwork.exe','wxwork','wecom.exe','wecom')
+    AND length(JSONExtractString(raw_json, 'local_account')) > 0
+    AND length(JSONExtractString(raw_json, 'local_nickname')) > 0
+  GROUP BY local_account
+) AS l
+ON r.remote_account = l.local_account
+WHERE r.remote_nickname = l.local_nickname
+ORDER BY r.last_seen DESC, r.rows DESC
+LIMIT {max(1, int(limit))}
+FORMAT JSONEachRow
+"""
+    try:
+        raw_rows = [json.loads(line) for line in terminal_review.clickhouse_query_body(config, query).splitlines() if line.strip()]
+    except Exception:
+        return []
+    rows: list[dict[str, Any]] = []
+    for row in raw_rows:
+        nickname = str(row.get("remote_nickname") or "").strip()
+        account = str(row.get("remote_account") or "").strip()
+        item = unique_by_name.get(nickname)
+        if not item or not account:
+            continue
+        userid = str(item.get("userid") or "").strip()
+        if userid and report_gen.normalize_key(userid) == report_gen.normalize_key(account):
+            continue
+        row["recommended_userid"] = userid
+        row["recommended_name"] = nickname
+        row["recommended_company"], row["recommended_department"] = wecom_item_org_fields(item)
+        rows.append(row)
+    rows.sort(key=identity_binding_row_sort_key)
+    return rows
+
+
+def uncontrolled_remote_wecom_recipient_accounts(config: AppConfig, days: int = 30, limit: int = 1200) -> list[dict[str, Any]]:
+    cache = load_wecom_user_cache(config)
+    by_name: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in cache.values():
+        name = str(item.get("name") or "").strip()
+        status = str(item.get("status") or "").strip()
+        if name and (not status or status == "1"):
+            by_name[name].append(item)
+    if not by_name:
+        return []
+    design_exts = report_gen.clickhouse_array_literal(sorted(report_gen.DESIGN_EXTS))
+    archive_exts = report_gen.clickhouse_array_literal(sorted(report_gen.ARCHIVE_EXTS))
+    query = f"""
+SELECT
+  remote_nickname,
+  remote_account,
+  count() AS rows,
+  max(ts) AS last_seen,
+  groupUniqArray(8)(client_ip) AS client_ips,
+  groupUniqArray(8)(
+    concat(client_name, ' / ', client_ip, ' / ', person, '<', account, '>')
+  ) AS terminal_samples
+FROM
+(
+  SELECT
+    ts,
+    person,
+    account,
+    client_name,
+    client_ip,
+    extract(recipient, '<([^<>]+)>\\\\s*$') AS remote_account,
+    replaceRegexpOne(recipient, '\\\\s*<[^<>]+>\\\\s*$', '') AS remote_nickname
+  FROM
+  (
+    SELECT
+      ts,
+      person,
+      account,
+      client_name,
+      client_ip,
+      file_exts,
+      reasons,
+      arrayJoin(recipients) AS recipient
+    FROM audit_events
+    WHERE ts >= now() - INTERVAL {max(1, int(days))} DAY
+      AND topic IN ('im_audit', 'file_audit')
+      AND lowerUTF8(process_name) IN ('wxwork.exe','wxwork','wecom.exe','wecom')
+      AND length(recipients) > 0
+      AND recipient_relation != 'group'
+      AND (
+        hasAny(file_exts, {design_exts})
+        OR hasAny(file_exts, {archive_exts})
+        OR arrayExists(reason -> startsWith(reason, '敏感关键词:'), reasons)
+      )
+  )
+  WHERE match(recipient, '<[^<>]+>\\\\s*$')
+    AND replaceRegexpOne(recipient, '\\\\s*<[^<>]+>\\\\s*$', '') != person
+    AND extract(recipient, '<([^<>]+)>\\\\s*$') NOT IN
+    (
+      SELECT DISTINCT JSONExtractString(raw_json, 'local_account')
+      FROM raw_syslog
+      WHERE topic = 'im_audit'
+        AND lowerUTF8(JSONExtractString(raw_json, 'process_name')) IN ('wxwork.exe','wxwork','wecom.exe','wecom')
+        AND length(JSONExtractString(raw_json, 'local_account')) > 0
+    )
+)
+GROUP BY remote_account, remote_nickname
+ORDER BY last_seen DESC, rows DESC
+LIMIT {max(1, int(limit))}
+FORMAT JSONEachRow
+"""
+    try:
+        raw_rows = [json.loads(line) for line in terminal_review.clickhouse_query_body(config, query).splitlines() if line.strip()]
+    except Exception:
+        return []
+    rows: list[dict[str, Any]] = []
+    for row in raw_rows:
+        nickname = str(row.get("remote_nickname") or "").strip()
+        account = str(row.get("remote_account") or "").strip()
+        candidates = by_name.get(nickname) or []
+        if not account or not candidates:
+            continue
+        if len(candidates) == 1:
+            item = candidates[0]
+            row["recommended_userid"] = str(item.get("userid") or "").strip()
+            row["recommended_name"] = nickname
+            row["recommended_company"], row["recommended_department"] = wecom_item_org_fields(item)
+        row["candidate_count"] = len(candidates)
+        rows.append(row)
+    rows.sort(key=identity_binding_row_sort_key)
+    return rows
+
+
+def identity_binding_current_label(existing: report_gen.PeopleEntry | None, manual_existing: report_gen.PeopleEntry | None) -> str:
+    if not existing:
+        return "待绑定"
+    prefix = "人工" if manual_existing else "自动"
+    return f"{prefix}：{existing.person_name} / {existing.company} / {existing.department}"
+
+
+def identity_bindings_page(config: AppConfig, message: str = "", error: str = "") -> bytes:
+    duplicates = wecom_duplicate_name_candidates(config)
+    observed_rows = observed_duplicate_wecom_accounts(config)
+    uncontrolled_remote_rows = uncontrolled_remote_wecom_recipient_accounts(config)
+    manual_map = load_manual_identity_map_for_web(config)
+    cache = load_wecom_user_cache(config)
+    wecom_people_map = report_gen.build_wecom_people_map(list(cache.values()))
+    bound_count = 0
+    pending_rows: list[str] = []
+    bound_rows: list[str] = []
+
+    def render_binding_row(row: dict[str, Any], idx: int, kind: str, candidates: list[dict[str, Any]]) -> tuple[str, bool]:
+        account = str(row.get("local_account") or row.get("remote_account") or "").strip()
+        nickname = str(row.get("local_nickname") or row.get("remote_nickname") or "").strip()
+        manual_existing = manual_map.get(("im_account", report_gen.normalize_key(account)))
+        automatic_existing = wecom_people_map.get(("im_account", report_gen.normalize_key(account)))
+        existing = manual_existing or automatic_existing
+        if manual_existing:
+            nonlocal_bound[0] += 1
+        is_bound = bool(existing)
+        form_id = f"identity-bind-{kind}-{idx}"
+        options = ['<option value="">不修改</option>']
+        for item in candidates:
+            userid = str(item.get("userid") or "").strip()
+            selected = ""
+            if existing and report_gen.normalize_key(existing.person_name) == report_gen.normalize_key(item.get("name")):
+                existing_company, existing_department = existing.company, existing.department
+                item_company, item_department = wecom_item_org_fields(item)
+                if existing_company == item_company and existing_department == item_department:
+                    selected = " selected"
+            elif kind == "remote" and not existing and userid and userid == str(row.get("recommended_userid") or ""):
+                selected = " selected"
+            options.append(f'<option value="{esc(userid)}"{selected}>{esc(identity_binding_option_label(item))}</option>')
+        if manual_existing:
+            options.append('<option value="__disable__">取消当前绑定</option>')
+        ip_values = row.get("client_ips") or []
+        ips = "；".join(str(item) for item in ip_values if str(item or "").strip())
+        current = identity_binding_current_label(existing, manual_existing)
+        kind_label = "远程接收方" if kind == "remote" else "本机重名"
+        kind_class = kind
+        recommend = "-"
+        if candidates:
+            recommend = "；".join(identity_binding_option_label(item) for item in candidates[:3])
+            if len(candidates) > 3:
+                recommend += f"；+{len(candidates) - 3}"
+        row_class = "identity-bound-row" if is_bound else "identity-pending-row"
+        row_anchor = report_gen.identity_binding_anchor_for_account(account)
+        row_id_attr = f' id="{esc(row_anchor)}"' if row_anchor else ""
+        html_row = (
+            f'<tr class="{row_class}"{row_id_attr}>'
+            f'<td><span class="identity-kind {esc(kind_class)}">{esc(kind_label)}</span></td>'
+            f'<td><strong>{esc(nickname)}</strong></td>'
+            f'<td class="mono">{esc(account)}</td>'
+            f'<td title="{esc(ips)}">{esc(ips or "-")}</td>'
+            f"<td>{esc(row.get('rows') or 0)}</td>"
+            f'<td title="{esc(recommend)}">{esc(recommend)}</td>'
+            f'<td title="{esc(current)}"><span class="identity-status {"bound" if is_bound else "pending"}">{esc(current)}</span></td>'
+            f'<td><form class="identity-inline-form" id="{form_id}" method="post" action="/settings/identity-bindings/save">'
+            f'<input type="hidden" name="local_account" value="{esc(account)}">'
+            f'<input type="hidden" name="local_nickname" value="{esc(nickname)}">'
+            f'<input type="hidden" name="binding_kind" value="{esc(kind)}">'
+            f'<select name="userid">{"".join(options)}</select>'
+            f'</form><button class="identity-save-button" form="{form_id}" type="submit">保存</button></td>'
+            "</tr>"
+        )
+        return html_row, is_bound
+
+    nonlocal_bound = [0]
+    row_index = 0
+    for row in observed_rows:
+        nickname = str(row.get("local_nickname") or "").strip()
+        html_row, is_bound = render_binding_row(row, row_index, "duplicate", duplicates.get(nickname) or [])
+        row_index += 1
+        (bound_rows if is_bound else pending_rows).append(html_row)
+    for row in uncontrolled_remote_rows:
+        account = str(row.get("remote_account") or "").strip()
+        if not account:
+            continue
+        nickname = str(row.get("remote_nickname") or "").strip()
+        candidates = [item for item in (duplicates.get(nickname) or [])]
+        if not candidates:
+            userid = str(row.get("recommended_userid") or "").strip()
+            item = cache.get(userid)
+            candidates = [item] if item else []
+        if not candidates:
+            continue
+        html_row, is_bound = render_binding_row(row, row_index, "remote", candidates)
+        row_index += 1
+        (bound_rows if is_bound else pending_rows).append(html_row)
+    bound_count = nonlocal_bound[0]
+    pending_html = "".join(pending_rows) or '<tr><td colspan="8" class="muted">暂无待绑定账号。</td></tr>'
+    bound_html = "".join(bound_rows) or '<tr><td colspan="8" class="muted">暂无已绑定或自动识别账号。</td></tr>'
+    table_head = "<thead><tr><th>类型</th><th>姓名/昵称</th><th>天擎账号</th><th>观测IP</th><th>次数</th><th>推荐绑定</th><th>当前状态</th><th>操作</th></tr></thead>"
+    msg = f'<p class="muted">{esc(message)}</p>' if message else ""
+    error_html = f'<p class="error">{esc(error)}</p>' if error else ""
+    body = f"""
+    <style>
+      .identity-hero-note {{ max-width: 920px; }}
+      .identity-table-wrap {{ overflow-x: auto; }}
+      .identity-table {{ min-width: 980px; font-size: 12.5px; }}
+      .identity-table th {{ white-space: nowrap; text-align: center; }}
+      .identity-table td {{ vertical-align: middle; }}
+      .identity-table td:nth-child(2), .identity-table td:nth-child(6), .identity-table td:nth-child(7) {{
+        max-width: 220px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }}
+      .identity-table .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }}
+      .identity-kind, .identity-status {{
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 24px;
+        border-radius: 999px;
+        padding: 3px 9px;
+        font-size: 12px;
+        font-weight: 850;
+        white-space: nowrap;
+      }}
+      .identity-kind.remote {{ background: #eef4ff; color: #175cd3; }}
+      .identity-kind.duplicate {{ background: #fff7ed; color: #c2410c; }}
+      .identity-status.pending {{ background: #fff1f3; color: #b42318; }}
+      .identity-status.bound {{ background: #ecfdf3; color: #067647; }}
+      .identity-bound-row td {{ color: #667085; background: #fbfcfe; }}
+      .identity-table tr:target td {{
+        background: #fff7e6 !important;
+        box-shadow: inset 0 1px 0 #f79009, inset 0 -1px 0 #f79009;
+      }}
+      .identity-inline-form {{
+        display: inline-grid;
+        grid-template-columns: minmax(180px, 1fr);
+        gap: 6px;
+        margin: 0;
+      }}
+      .identity-inline-form select {{ min-height: 32px; padding: 5px 8px; font-size: 12.5px; }}
+      .identity-save-button {{ min-height: 32px; margin-top: 6px; padding: 5px 11px; }}
+      .identity-section-head {{
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 16px;
+      }}
+      .identity-section-head h2 {{ margin-bottom: 4px; }}
+    </style>
+    <header>
+      <div>
+        <h1>企业微信账号绑定</h1>
+        <div class="muted identity-hero-note">用于补齐本机发送人和远程接收方身份。远程接收方绑定只补充姓名、公司、部门展示，不改变“未命中本机 local_account 即按外发”的风险口径。</div>
+      </div>
+      <div class="actions">
+        <a class="button" href="/settings">策略中心</a>
+        <a class="button" href="/settings/organization-tree">组织结构映射</a>
+        <a class="button" href="/">当前报告首页</a>
+      </div>
+    </header>
+    {msg}
+    {error_html}
+    <section class="settings-grid">
+      <div class="settings-card">
+        <h3>重名本机账号</h3>
+        <p class="metric">{len(observed_rows)} 个</p>
+        <p class="muted">本机登录昵称在通讯录中存在重名，需要人工绑定。</p>
+      </div>
+      <div class="settings-card">
+        <h3>远程身份待补充</h3>
+        <p class="metric">{len(uncontrolled_remote_rows)} 个</p>
+        <p class="muted">近 30 天重点对象相关、未命中本机 local_account、但昵称可在通讯录中找到的接收方。</p>
+      </div>
+      <div class="settings-card">
+        <h3>已人工绑定</h3>
+        <p class="metric">{bound_count} 个</p>
+        <p class="muted">数据库 `identity_manual_bindings` 中启用的 im_account 绑定。</p>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="identity-section-head">
+        <div>
+          <h2>待绑定账号</h2>
+          <p class="muted">远程接收方绑定只用于展示接收方公司部门；绑定后仍按不可控外发统计。</p>
+        </div>
+        <span class="identity-status pending">{len(pending_rows)} 个待处理</span>
+      </div>
+      <div class="table-wrap identity-table-wrap"><table class="identity-table">{table_head}<tbody>{pending_html}</tbody></table></div>
+    </section>
+    <section class="panel">
+      <div class="identity-section-head">
+        <div>
+          <h2>已绑定 / 已自动识别</h2>
+          <p class="muted">已处理账号放在下面；自动识别表示该账号曾作为本机 local_account 出现。</p>
+        </div>
+        <span class="identity-status bound">{len(bound_rows)} 个已识别</span>
+      </div>
+      <div class="table-wrap identity-table-wrap"><table class="identity-table">{table_head}<tbody>{bound_html}</tbody></table></div>
+    </section>
+"""
+    return page_shell("企业微信账号绑定", body)
+
+
+def save_identity_binding(config: AppConfig, form: dict[str, str], session: AuthSession) -> tuple[bool, str]:
+    local_account = str(form.get("local_account") or "").strip()
+    local_nickname = str(form.get("local_nickname") or "").strip()
+    binding_kind = str(form.get("binding_kind") or "duplicate").strip()
+    userid = str(form.get("userid") or "").strip()
+    if not local_account:
+        return False, "天擎账号不能为空。"
+    if not userid:
+        return False, "请选择要绑定的企业微信人员。"
+    args = clickhouse_report_args(config)
+    report_gen.ensure_manual_identity_bindings_table(args)
+    now_text = datetime.now().isoformat(sep=" ", timespec="milliseconds")
+    source = "wecom_remote_recipient_manual" if binding_kind == "remote" else "wecom_duplicate_manual"
+    source_label = "远程接收方账号人工绑定" if binding_kind == "remote" else "企业微信重名人工绑定"
+    row: dict[str, Any]
+    if userid == "__disable__":
+        row = {
+            "match_type": "im_account",
+            "match_value": local_account,
+            "person_name": "",
+            "company": "",
+            "department": "",
+            "position": "",
+            "sensitive_role": "",
+            "status": "disabled",
+            "note": "人工取消绑定",
+            "source": source,
+            "updated_by": f"{session.userid}:{session.name}",
+            "updated_at": now_text,
+            "enabled": 0,
+        }
+        payload = (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
+        terminal_review.clickhouse_query(config, "INSERT INTO identity_manual_bindings FORMAT JSONEachRow", data=payload)
+        terminal_check_clear_cache()
+        return True, f"已取消 {local_account} 的人工绑定。"
+    cache = load_wecom_user_cache(config)
+    item = cache.get(userid)
+    if not item:
+        return False, f"企业微信 userid 不存在或缓存未同步：{userid}"
+    company, department = wecom_item_org_fields(item)
+    person_name = str(item.get("name") or userid).strip()
+    row = {
+        "match_type": "im_account",
+        "match_value": local_account,
+        "person_name": person_name,
+        "company": company,
+        "department": department,
+        "position": str(item.get("position") or "").strip(),
+        "sensitive_role": "",
+        "status": str(item.get("status") or "").strip() or "active",
+        "note": f"{source_label}，观测名称={local_nickname}",
+        "source": source,
+        "updated_by": f"{session.userid}:{session.name}",
+        "updated_at": now_text,
+        "enabled": 1,
+    }
+    payload = (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
+    terminal_review.clickhouse_query(config, "INSERT INTO identity_manual_bindings FORMAT JSONEachRow", data=payload)
+    terminal_check_clear_cache()
+    return True, f"已绑定 {local_account} -> {person_name} / {company} / {department}。"
+
+
 def wecom_item_department_paths(item: dict[str, Any]) -> list[list[str]]:
     path_text = normalize_alias_text(item.get("department_path"))
     paths: list[list[str]] = []
@@ -5022,7 +5664,7 @@ def live_decrypt_summary_fragment(config: AppConfig, start: datetime, end: datet
         card("电气", electrical, "电气标准方案解密记录", links.get("electrical"), "amber"),
         card("三维模型", three_d, "PRT/ASM/SLDASM/SLDPRT/STEP 解密记录", links.get("three_d"), "blue"),
         card("DWG图纸", dwg, "DWG 图纸解密记录", links.get("dwg"), "slate"),
-        card("发现后续流转", "打开即预热", "首页打开后同步预热解密记录与天擎审计事件的后续流转链路", links.get("linked"), "red"),
+        card("同名疑似线索", "打开即预热", "首页打开后同步预热解密记录与天擎审计事件的同名疑似后续线索", links.get("linked"), "red"),
     ]
     return (overview + f'<div class="decrypt-card-grid">{"".join(cards)}</div>' + trend_html + company_matrix_html).encode("utf-8")
 
@@ -5939,6 +6581,7 @@ def settings_page(config: AppConfig) -> bytes:
     exclusions = [rule for rule in exclusion_doc.get("rules", []) if isinstance(rule, dict)]
     auth = auth_policy(config)
     wecom_companies, _wecom_departments = wecom_org_options(config)
+    duplicate_names = wecom_duplicate_name_candidates(config)
     recent_decrypt_batches = decrypt_import_batches(config, 1)
     decrypt_metric = "未导入"
     if recent_decrypt_batches:
@@ -6049,7 +6692,7 @@ def settings_page(config: AppConfig) -> bytes:
       <div class="settings-card">
         <h3>风险终端复核策略</h3>
         <p class="metric">{'启用' if terminal_review.normalized_review_policy(policy_doc).get('enabled', True) else '关闭'}</p>
-        <p class="muted">候选只保留标准图纸、大于100MB压缩包、普通图纸高频和敏感文件高频，人工确认后才进报告。</p>
+        <p class="muted">候选只保留能定位到终端/IP的一级风险对象，人工确认后才进报告。</p>
         <div class="actions"><a class="button primary" href="/settings/terminal-behavior-review">维护核查阈值</a></div>
       </div>
         </div>
@@ -6075,6 +6718,12 @@ def settings_page(config: AppConfig) -> bytes:
         <p class="metric">{len(wecom_companies)} 个公司</p>
         <p class="muted">树状查看企业微信路径会被解析到哪个标准公司/部门。</p>
         <div class="actions"><a class="button primary" href="/settings/organization-tree">查看映射树</a></div>
+      </div>
+      <div class="settings-card">
+        <h3>企业微信账号绑定</h3>
+        <p class="metric">{len(duplicate_names)} 个重名</p>
+        <p class="muted">维护重名本机账号和远程接收方账号绑定，确认后写入数据库长期生效。</p>
+        <div class="actions"><a class="button primary" href="/settings/identity-bindings">维护身份绑定</a></div>
       </div>
         </div>
       </div>
@@ -6168,8 +6817,124 @@ def terminal_check_payload(
     }
 
 
+def decrypt_group_candidate_id(import_batch: str, applicant_key: str, records: list[report_gen.DecryptRiskRecord]) -> str:
+    batch_key = import_batch or (records[0].source_file if records else "")
+    if not batch_key:
+        batch_key = ";".join(str(record.business_fingerprint or record.row_number or "") for record in records[:12])
+    fingerprint = "|".join(["decrypt", batch_key, applicant_key])
+    return "decrypt_" + hashlib.sha256(fingerprint.encode("utf-8", errors="replace")).hexdigest()[:24]
+
+
+def decrypt_record_review_row(record: report_gen.DecryptRiskRecord) -> dict[str, Any]:
+    apply_time = record.apply_time
+    approve_time = record.approve_time
+    return {
+        "apply_time": apply_time.isoformat() if apply_time else "",
+        "approve_time": approve_time.isoformat() if approve_time else "",
+        "company": record.company or record.raw_company or "未匹配公司",
+        "department": record.department or record.raw_department or "未匹配部门",
+        "applicant_name": record.applicant_name or "",
+        "applicant_account": record.applicant_account or "",
+        "file_name": record.file_name or "",
+        "object_bucket": record.object_bucket or "标准图纸",
+        "file_size": record.file_size,
+        "request_reason": record.request_reason or "",
+        "request_level": record.request_level or "",
+        "recipient_unit": record.recipient_unit or "",
+        "status": record.status or "",
+        "approver": record.approver_name or record.approver or "",
+        "import_batch": record.import_batch or "",
+        "source_file": record.source_file or "",
+        "row_number": record.row_number,
+        "business_fingerprint": record.business_fingerprint or "",
+    }
+
+
+def decrypt_review_candidates(config: AppConfig, start: datetime, end: datetime) -> list[terminal_review.TerminalBehaviorCandidate]:
+    try:
+        payload = live_decrypt_cached_payload(config, start, end, wait_seconds=0, build_if_missing=True)
+    except Exception:
+        payload = None
+    if not payload:
+        return []
+    analysis = payload.get("analysis")
+    if analysis is None:
+        return []
+    records = report_gen.decrypt_standard_records(getattr(analysis, "records", []) or [])
+    groups: dict[tuple[str, str], list[report_gen.DecryptRiskRecord]] = defaultdict(list)
+    for record in records:
+        applicant_key = report_gen.normalize_key(record.applicant_account) or report_gen.normalize_key(record.applicant_name) or "unknown"
+        groups[(record.import_batch or record.source_file or "", applicant_key)].append(record)
+    result: list[terminal_review.TerminalBehaviorCandidate] = []
+    for (import_batch, applicant_key), group in sorted(
+        groups.items(),
+        key=lambda item: min((record.apply_time or datetime.min for record in item[1]), default=datetime.min),
+    ):
+        ordered = sorted(group, key=lambda item: item.apply_time or datetime.min)
+        first = ordered[0]
+        apply_start = ordered[0].apply_time or start
+        apply_end = ordered[-1].apply_time or apply_start
+        if getattr(apply_start, "tzinfo", None) is not None:
+            start_naive = apply_start.replace(tzinfo=None)
+        else:
+            start_naive = apply_start
+        if getattr(apply_end, "tzinfo", None) is not None:
+            end_naive = apply_end.replace(tzinfo=None)
+        else:
+            end_naive = apply_end
+        structure_count = sum(1 for record in ordered if record.object_bucket == "结构")
+        electrical_count = sum(1 for record in ordered if record.object_bucket == "电气")
+        matrix_counts: dict[str, int] = {}
+        if structure_count:
+            matrix_counts["加密软件解密\u241f结构"] = structure_count
+        if electrical_count:
+            matrix_counts["加密软件解密\u241f电气"] = electrical_count
+        request_reasons = list(dict.fromkeys(record.request_reason for record in ordered if record.request_reason))
+        statuses = Counter(record.status or "未知状态" for record in ordered)
+        approvers = list(dict.fromkeys((record.approver_name or record.approver) for record in ordered if (record.approver_name or record.approver)))
+        recipient_units = list(dict.fromkeys(record.recipient_unit for record in ordered if record.recipient_unit))
+        sample_files = list(dict.fromkeys(record.file_name for record in ordered if record.file_name))[:8]
+        company = Counter((record.company or record.raw_company or "未匹配公司") for record in ordered).most_common(1)[0][0]
+        department = Counter((record.department or record.raw_department or "未匹配部门") for record in ordered).most_common(1)[0][0]
+        person = first.applicant_name or first.applicant_account or "未匹配申请人"
+        basis_parts = [
+            f"批次：{import_batch or '-'}",
+            f"申请原因：{'；'.join(request_reasons[:3]) if request_reasons else '-'}",
+            f"状态：{'，'.join(f'{name}{count}' for name, count in statuses.most_common(4))}",
+            f"审批人：{'，'.join(approvers[:4]) if approvers else '-'}",
+        ]
+        candidate = terminal_review.TerminalBehaviorCandidate(
+            candidate_id=decrypt_group_candidate_id(import_batch, applicant_key, ordered),
+            event_date=start_naive.date(),
+            event_start=start_naive,
+            event_end=end_naive,
+            anomaly_type="一级风险：标准图纸解密",
+            company=company,
+            department=department,
+            person=person,
+            client_name="加密软件解密记录",
+            client_ip="-",
+            client_mac="-",
+            event_count=len(ordered),
+            structure_count=structure_count,
+            electrical_count=electrical_count,
+            three_d_count=0,
+            dwg_count=0,
+            archive_count=0,
+            channels=["加密软件解密"],
+            targets=recipient_units[:12],
+            sample_files=sample_files,
+            event_ids=[f"decrypt:{record.business_fingerprint or record.row_number}" for record in ordered],
+            matrix_counts=matrix_counts,
+            evidence_events=[decrypt_record_review_row(record) for record in ordered],
+            basis="；".join(basis_parts),
+        )
+        result.append(candidate)
+    return result
+
+
 def terminal_check_build_payload(config: AppConfig, policy_doc: dict[str, Any], start: datetime, end: datetime) -> dict[str, Any]:
-    candidates = terminal_review.generate_candidates(config, policy_doc, start, end)
+    candidates = decrypt_review_candidates(config, start, end) + terminal_review.generate_candidates(config, policy_doc, start, end)
     reviews = terminal_review.fetch_reviews(config, start, end, include_all_status=True)
     return terminal_check_payload(candidates, reviews)
 
@@ -6729,11 +7494,14 @@ def terminal_check_css() -> str:
 def terminal_check_metrics_html(candidates: list[terminal_review.TerminalBehaviorCandidate], reviews: list[terminal_review.TerminalBehaviorReview]) -> str:
     type_counts = Counter(candidate.anomaly_type for candidate in candidates)
     report_reviews = [review for review in reviews if review.include_in_report]
+    decrypt_total = sum(candidate.event_count for candidate in candidates if terminal_check_candidate_module(candidate) == "decrypt")
+    tianqing_total = sum(candidate.event_count for candidate in candidates if terminal_check_candidate_module(candidate) == "tianqing")
+    plm_total = sum(candidate.event_count for candidate in candidates if terminal_check_candidate_module(candidate) == "plm")
     chips = [
-        ("候选异常终端", len(candidates)),
-        ("已人工确认", len(reviews)),
-        ("进入报告", len(report_reviews)),
-        ("最高频类型", type_counts.most_common(1)[0][0] if type_counts else "-"),
+        ("一级风险复核对象", sum(candidate.event_count for candidate in candidates)),
+        ("解密审计", decrypt_total),
+        ("天擎流转", tianqing_total),
+        ("人工确认/进入报告", f"{len(reviews)} / {len(report_reviews)}"),
     ]
     return '<div class="terminal-check-grid">' + "".join(
         f'<div class="terminal-check-chip"><span>{esc(label)}</span><strong>{esc(value)}</strong></div>' for label, value in chips
@@ -6741,7 +7509,7 @@ def terminal_check_metrics_html(candidates: list[terminal_review.TerminalBehavio
 
 
 def terminal_check_loading_metrics_html() -> str:
-    labels = ["候选异常终端", "已人工确认", "进入报告", "最高频类型"]
+    labels = ["待复核风险终端", "已人工确认", "进入报告", "主要风险类型"]
     return '<div class="terminal-check-grid">' + "".join(
         f'<div class="terminal-check-chip"><span data-loading-label="{esc(label)}">{esc(label)}</span><strong>...</strong></div>'
         for label in labels
@@ -6751,6 +7519,15 @@ def terminal_check_loading_metrics_html() -> str:
 def terminal_check_short_label(value: str) -> str:
     alias = report_gen.HTML_DISPLAY_LABEL_ALIASES.get(value, value)
     return report_gen.ORG_MATRIX_OBJECT_SHORT_LABELS.get(alias, report_gen.ORG_MATRIX_OBJECT_SHORT_LABELS.get(value, alias))
+
+
+def terminal_check_candidate_module(candidate: terminal_review.TerminalBehaviorCandidate) -> str:
+    candidate_id = str(candidate.candidate_id or "")
+    if candidate_id.startswith("decrypt_"):
+        return "decrypt"
+    if candidate_id.startswith("plm_"):
+        return "plm"
+    return "tianqing"
 
 
 def terminal_check_matrix_count(candidate: terminal_review.TerminalBehaviorCandidate, channel: str, bucket: str) -> int:
@@ -6791,7 +7568,7 @@ def terminal_check_audit_event_from_row(row: dict[str, Any], tz: Any) -> report_
 
 def terminal_candidates_table(candidates: list[terminal_review.TerminalBehaviorCandidate], start: datetime, end: datetime) -> str:
     if not candidates:
-        return '<p class="muted">当前周期暂无候选异常终端。</p>'
+        return '<p class="muted">当前周期暂无天擎一级风险待复核对象。</p>'
     start_value = datetime_input_value(start)
     end_value = datetime_input_value(end)
     base_channels = list(report_gen.CHANNEL_MATRIX_BASE_ROWS)
@@ -6847,7 +7624,7 @@ def terminal_candidates_table(candidates: list[terminal_review.TerminalBehaviorC
   <td class="identity-cell" title="{esc(candidate.person)}">{esc(candidate.person or "-")}</td>
   <td class="ip-cell" title="{esc(candidate.client_ip)}">{esc(candidate.client_ip or "-")}</td>
   {''.join(matrix_cells)}
-  <td>{report_gen.matrix_number_html(total_count, detail_href, "查看该候选终端明细", total_thresholds, total=True)}</td>
+  <td>{report_gen.matrix_number_html(total_count, detail_href, "查看该终端复核证据", total_thresholds, total=True)}</td>
   <td class="review-action-cell">
     <input class="terminal-check-selected terminal-check-hidden" type="hidden" name="candidate__{esc(candidate.candidate_id)}" value="1"{selected_disabled}>
     <input class="terminal-check-hidden" data-review-field="status" type="hidden" name="status__{esc(candidate.candidate_id)}" value="{esc(status)}">
@@ -6883,6 +7660,90 @@ def terminal_candidates_table(candidates: list[terminal_review.TerminalBehaviorC
 """
 
 
+def candidate_evidence_values(candidate: terminal_review.TerminalBehaviorCandidate, field: str, limit: int = 4) -> list[str]:
+    values: list[str] = []
+    for row in candidate.evidence_events or []:
+        value = str(row.get(field) or "").strip() if isinstance(row, dict) else ""
+        if value and value not in values:
+            values.append(value)
+        if len(values) >= limit:
+            break
+    return values
+
+
+def compact_values(values: list[str], width: int = 34) -> str:
+    if not values:
+        return "-"
+    text = "；".join(values)
+    return report_gen.compact_id(text, width)
+
+
+def decrypt_candidate_object_text(candidate: terminal_review.TerminalBehaviorCandidate) -> str:
+    parts: list[str] = []
+    if candidate.structure_count:
+        parts.append(f"结构 {candidate.structure_count}")
+    if candidate.electrical_count:
+        parts.append(f"电气 {candidate.electrical_count}")
+    return " / ".join(parts) if parts else "标准图纸"
+
+
+def decrypt_candidates_table(candidates: list[terminal_review.TerminalBehaviorCandidate], start: datetime, end: datetime) -> str:
+    if not candidates:
+        return '<p class="muted">当前周期暂无标准图纸解密待复核记录。</p>'
+    start_value = datetime_input_value(start)
+    end_value = datetime_input_value(end)
+    detail_base = f"/terminal-check/events?preset=custom&start={quote(start_value)}&end={quote(end_value)}"
+    rows: list[str] = []
+    for idx, candidate in enumerate(candidates, 1):
+        selected_disabled = "" if candidate.existing_status else " disabled"
+        status = candidate.existing_status or "待核查"
+        status_class = " status-reviewed" if status != "待核查" else ""
+        result_class = " has-value" if candidate.existing_conclusion else ""
+        detail_href = f"{detail_base}&candidate_id={quote(candidate.candidate_id)}"
+        batch_values = candidate_evidence_values(candidate, "import_batch", 2)
+        batch_text = batch_values[0] if batch_values else "-"
+        object_text = decrypt_candidate_object_text(candidate)
+        reason_values = candidate_evidence_values(candidate, "request_reason", 3)
+        reason_text = "；".join(reason_values) if reason_values else "-"
+        target_text = "；".join(candidate.targets[:3]) if candidate.targets else "-"
+        status_values = candidate_evidence_values(candidate, "status", 4)
+        approver_values = candidate_evidence_values(candidate, "approver", 3)
+        status_text = " / ".join(value for value in ["；".join(status_values), "审批：" + "，".join(approver_values) if approver_values else ""] if value) or "-"
+        file_title = "\n".join(candidate.sample_files) if candidate.sample_files else "-"
+        rows.append(
+            f"""
+<tr>
+  <td class="rank-cell">{idx}</td>
+  <td class="identity-cell" title="{esc(candidate.company)}">{esc(candidate.company or "-")}</td>
+  <td class="identity-cell" title="{esc(candidate.department)}">{esc(candidate.department or "-")}</td>
+  <td class="identity-cell" title="{esc(candidate.person)}">{esc(candidate.person or "-")}</td>
+  <td class="compact" title="{esc(batch_text)}">{esc(report_gen.compact_id(batch_text, 24))}</td>
+  <td class="compact" title="{esc(file_title)}"><a class="table-link" href="{esc(detail_href)}">{esc(candidate.event_count)} 个文件</a></td>
+  <td>{esc(object_text)}</td>
+  <td class="compact" title="{esc(reason_text)}">{esc(report_gen.compact_id(reason_text, 36))}</td>
+  <td class="compact" title="{esc(target_text)}">{esc(report_gen.compact_id(target_text, 28))}</td>
+  <td class="compact" title="{esc(status_text)}">{esc(report_gen.compact_id(status_text, 30))}</td>
+  <td class="review-action-cell">
+    <input class="terminal-check-selected terminal-check-hidden" type="hidden" name="candidate__{esc(candidate.candidate_id)}" value="1"{selected_disabled}>
+    <input class="terminal-check-hidden" data-review-field="status" type="hidden" name="status__{esc(candidate.candidate_id)}" value="{esc(status)}">
+    <button class="terminal-check-action terminal-status-button{status_class}" type="button">{esc(status)}</button>
+  </td>
+  <td class="review-action-cell">
+    <input class="terminal-check-hidden" data-review-field="conclusion" type="hidden" name="conclusion__{esc(candidate.candidate_id)}" value="{esc(candidate.existing_conclusion)}">
+    <button class="terminal-check-action terminal-result-button{result_class}" type="button" title="{esc(candidate.existing_conclusion or '点击填写核查结果')}">{esc('已填写' if candidate.existing_conclusion else '填写')}</button>
+  </td>
+</tr>"""
+        )
+    return f"""
+<div class="table-wrap">
+  <table class="terminal-check-table">
+    <thead><tr><th>#</th><th>公司</th><th>部门</th><th>申请人</th><th>批次</th><th>文件数</th><th>对象</th><th>申请原因</th><th>接受单位</th><th>状态/审批</th><th>核查状态</th><th>核查结果</th></tr></thead>
+    <tbody>{''.join(rows)}</tbody>
+  </table>
+</div>
+"""
+
+
 def terminal_check_matrix_colgroup(channels: list[str], columns: list[str]) -> str:
     return (
         '<colgroup>'
@@ -6891,6 +7752,52 @@ def terminal_check_matrix_colgroup(channels: list[str], columns: list[str]) -> s
         + '<col class="total-col"><col class="action-col"><col class="action-col">'
         '</colgroup>'
     )
+
+
+def decrypt_review_time_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "-"
+    return text.replace("T", " ")[:19]
+
+
+def decrypt_review_detail_table(candidate: terminal_review.TerminalBehaviorCandidate) -> str:
+    rows: list[str] = []
+    for idx, row in enumerate(candidate.evidence_events or [], 1):
+        if not isinstance(row, dict):
+            continue
+        file_name = str(row.get("file_name") or "-")
+        reason = str(row.get("request_reason") or "-")
+        recipient = str(row.get("recipient_unit") or "-")
+        rows.append(
+            f"""
+<tr>
+  <td>{idx}</td>
+  <td>{esc(decrypt_review_time_text(row.get('apply_time')))}</td>
+  <td>{esc(str(row.get('company') or '-'))}</td>
+  <td>{esc(str(row.get('department') or '-'))}</td>
+  <td>{esc(str(row.get('applicant_name') or '-'))}<br><span class="muted">{esc(str(row.get('applicant_account') or '-'))}</span></td>
+  <td class="compact" title="{esc(file_name)}">{esc(report_gen.compact_id(file_name, 42))}</td>
+  <td>{esc(str(row.get('object_bucket') or '-'))}</td>
+  <td>{esc(report_gen.size_label(row.get('file_size')))}</td>
+  <td class="compact" title="{esc(reason)}">{esc(report_gen.compact_id(reason, 44))}</td>
+  <td class="compact" title="{esc(recipient)}">{esc(report_gen.compact_id(recipient, 34))}</td>
+  <td>{esc(str(row.get('request_level') or '-'))}</td>
+  <td>{esc(str(row.get('status') or '-'))}</td>
+  <td>{esc(str(row.get('approver') or '-'))}<br><span class="muted">{esc(decrypt_review_time_text(row.get('approve_time')))}</span></td>
+  <td class="compact" title="{esc(str(row.get('import_batch') or '-'))}">{esc(report_gen.compact_id(str(row.get('import_batch') or '-'), 24))}</td>
+</tr>"""
+        )
+    if not rows:
+        return '<p class="muted">未找到解密复核证据，可能统计周期已变化。</p>'
+    return f"""
+<div class="table-wrap">
+  <table class="terminal-check-table">
+    <thead><tr><th>#</th><th>申请时间</th><th>公司</th><th>部门</th><th>申请人</th><th>文件名</th><th>对象</th><th>大小</th><th>申请原因</th><th>接受单位</th><th>等级</th><th>状态</th><th>审批人/时间</th><th>批次</th></tr></thead>
+    <tbody>{''.join(rows)}</tbody>
+  </table>
+</div>
+"""
 
 
 def terminal_check_matrix_headers(channels: list[str], columns: list[str]) -> tuple[str, str]:
@@ -7018,6 +7925,9 @@ def terminal_check_work_area_html(
     end: datetime,
     summary_only: bool = False,
 ) -> str:
+    decrypt_candidates = [candidate for candidate in candidates if terminal_check_candidate_module(candidate) == "decrypt"]
+    tianqing_candidates = [candidate for candidate in candidates if terminal_check_candidate_module(candidate) == "tianqing"]
+    plm_candidates = [candidate for candidate in candidates if terminal_check_candidate_module(candidate) == "plm"]
     wrapper_attr = ' data-terminal-check-summary="1"' if summary_only else ' data-terminal-check-ready="1"'
     save_button = (
         '<button class="primary" type="button" disabled title="证据明细正在后台补齐，完成后可保存复核结果">证据补齐后可保存</button>'
@@ -7025,11 +7935,12 @@ def terminal_check_work_area_html(
         else '<button class="primary" type="submit">保存核查结果</button>'
     )
     note = (
-        "矩阵数字已按 ClickHouse 聚合快速刷新；证据明细和保存能力正在后台补齐。"
+        "一级风险数字已按模块刷新；证据明细和保存能力正在后台补齐。"
         if summary_only
-        else "矩阵口径与报告首页终端风险保持一致；点击“核查状态”切换状态，点击“核查结果”填写结论。"
+        else "复核池按三大模块拆分展示；点击“核查状态”切换状态，点击“核查结果”填写结论。"
     )
-    saved_note = "已保存记录已刷新；候选证据补齐完成后可下钻查看。" if summary_only else "周报按事件发生时间自动汇总本周期已进入报告的核查记录。"
+    saved_note = "已保存记录已刷新；复核证据补齐完成后可下钻查看。" if summary_only else "周报按事件发生时间自动汇总本周期已进入报告的核查记录。"
+    plm_block = '<p class="muted">PLM 登录审计尚未接入正式复核池。</p>' if not plm_candidates else terminal_candidates_table(plm_candidates, start, end)
     return f"""
 <div{wrapper_attr}>
   {terminal_check_metrics_html(candidates, reviews)}
@@ -7039,12 +7950,32 @@ def terminal_check_work_area_html(
     <section class="terminal-check-section">
       <div class="terminal-check-section-head">
         <div>
-          <h2>候选异常终端</h2>
+          <h2>加密软件解密审计</h2>
+          <p class="muted">{esc(note)} 标准图纸解密原则上不应发生，按单条解密记录进入复核。</p>
+        </div>
+        <div class="actions">{save_button}</div>
+      </div>
+      {decrypt_candidates_table(decrypt_candidates, start, end)}
+    </section>
+    <section class="terminal-check-section">
+      <div class="terminal-check-section-head">
+        <div>
+          <h2>天擎外发/流转审计</h2>
+          <p class="muted">仅展示天擎一级风险：标准图纸流转、技术/工艺/研发大于100MB压缩包流转；按终端聚合，数字为去重后的一级风险笔数。</p>
+        </div>
+        <div class="actions">{save_button}</div>
+      </div>
+      {terminal_candidates_table(tianqing_candidates, start, end)}
+    </section>
+    <section class="terminal-check-section">
+      <div class="terminal-check-section-head">
+        <div>
+          <h2>PLM登录审计</h2>
           <p class="muted">{esc(note)}</p>
         </div>
         <div class="actions">{save_button}</div>
       </div>
-      {terminal_candidates_table(candidates, start, end)}
+      {plm_block}
     </section>
   </form>
   <section>
@@ -7059,7 +7990,7 @@ def terminal_check_work_area_html(
 def terminal_check_loading_html(start: datetime, end: datetime) -> str:
     return f"""
 <div class="terminal-check-live" data-terminal-check-loading="1">
-  <p class="terminal-check-live-status">风险终端候选正在计算，矩阵结构已就绪，数字和候选行稍后自动刷新</p>
+  <p class="terminal-check-live-status">待复核风险终端正在计算，矩阵结构已就绪，数字和行数据稍后自动刷新</p>
   {terminal_check_loading_metrics_html()}
   <form class="terminal-check-review-form" method="post" action="/terminal-check/review" aria-busy="true">
     <input type="hidden" name="start" value="{esc(datetime_input_value(start))}">
@@ -7067,8 +7998,8 @@ def terminal_check_loading_html(start: datetime, end: datetime) -> str:
     <section class="terminal-check-section">
       <div class="terminal-check-section-head">
         <div>
-          <h2>候选异常终端</h2>
-          <p class="muted">候选按当前报告周期后台聚合；完成后可点击矩阵数字查看证据并保存核查结果。</p>
+          <h2>待复核风险终端</h2>
+          <p class="muted">按当前报告周期后台聚合；完成后可点击矩阵数字查看证据并保存核查结果。</p>
         </div>
         <div class="actions"><button class="primary" type="button" disabled>保存核查结果</button></div>
       </div>
@@ -7077,7 +8008,7 @@ def terminal_check_loading_html(start: datetime, end: datetime) -> str:
   </form>
   <section>
     <h2>已保存核查记录</h2>
-    <p class="muted">已保存记录会随候选计算一起刷新。</p>
+    <p class="muted">已保存记录会随复核数据一起刷新。</p>
     {terminal_reviews_loading_table()}
   </section>
 </div>
@@ -7087,7 +8018,7 @@ def terminal_check_loading_html(start: datetime, end: datetime) -> str:
 def terminal_check_error_html(message: str) -> str:
     return f"""
 <div class="terminal-check-loading">
-  <strong>风险终端候选生成失败</strong>
+  <strong>待复核风险终端生成失败</strong>
   <div class="badge off danger">{esc(message)}</div>
   <p class="muted">请刷新页面重试；如果仍失败，需要检查 ClickHouse 或审计底稿查询。</p>
 </div>
@@ -7124,7 +8055,7 @@ def terminal_check_loader_script(start: datetime, end: datetime) -> str:
     var url = {fragment_url_json};
     var timer = null;
     function renderError(message) {{
-      target.innerHTML = '<div class="terminal-check-loading"><strong>风险终端候选加载失败</strong><div class="badge off danger">' +
+      target.innerHTML = '<div class="terminal-check-loading"><strong>待复核风险终端加载失败</strong><div class="badge off danger">' +
         message.replace(/[&<>"']/g, function (ch) {{ return ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}})[ch]; }}) +
         '</div><p class="muted">请刷新页面重试。</p></div>';
     }}
@@ -7167,7 +8098,7 @@ def terminal_check_page(config: AppConfig, session: AuthSession, params: dict[st
     <header>
       <div>
         <h1>风险终端复核</h1>
-        <div class="muted">按当前报告周期提取一级风险与终端高频明细候选，人工确认后进入日报/周报核查记录。</div>
+        <div class="muted">三大模块一级风险包含解密、天擎流转和 PLM 登录；本页用于处理可定位到终端/IP的复核候选，人工确认后进入日报/周报核查记录。</div>
       </div>
       <div class="actions">
         <a class="button" href="/">当前报告首页</a>
@@ -7177,12 +8108,12 @@ def terminal_check_page(config: AppConfig, session: AuthSession, params: dict[st
     {terminal_check_css()}
     <section class="terminal-check-hero">
       <div>
-        <h2 style="margin:0;font-size:19px;">核查候选概览</h2>
-        <p class="muted">当前页面不提供独立周期选择，默认跟随报表入口传入的统计周期。</p>
+        <h2 style="margin:0;font-size:19px;">复核概览</h2>
+        <p class="muted">当前页面默认跟随报表入口传入的统计周期；解密记录缺少终端/IP时仍在解密审计模块复核，不强行并入终端候选。</p>
       </div>
       <div class="terminal-check-scope">
         <span class="muted">当前周期：{esc(start.strftime('%Y-%m-%d %H:%M'))} 至 {esc(end.strftime('%Y-%m-%d %H:%M'))}</span>
-        <span class="muted">点击矩阵数字查看对应候选终端证据。</span>
+        <span class="muted">点击矩阵数字查看对应终端复核证据。</span>
       </div>
       {f'<p class="badge on">{esc(message)}</p>' if message else ''}
       {f'<p class="badge off danger">{esc(error)}</p>' if error else ''}
@@ -7197,19 +8128,28 @@ def terminal_check_events_page(config: AppConfig, params: dict[str, list[str]]) 
     start, end, _preset = terminal_check_period_from_params(config, params)
     candidate_id = (params.get("candidate_id") or [""])[-1]
     detail_events: list[report_gen.AuditEvent] = []
-    title = "异常终端候选证据"
+    title = "风险终端复核证据"
     if candidate_id:
         cached_data = terminal_check_cached_data(config, load_policy_doc(config), start, end, wait_seconds=90)
         candidate = (cached_data or {}).get("by_id", {}).get(candidate_id)
         if candidate:
-            title = f"{candidate.anomaly_type} / {candidate.client_ip}"
-            tz = local_tz(config.timezone)
-            detail_events = [terminal_check_audit_event_from_row(row, tz) for row in candidate.evidence_events]
-    table_html = (
-        '<p class="muted">未找到候选证据，可能候选周期已变化。</p>'
-        if not detail_events
-        else report_gen.event_detail_table_html(detail_events, local_tz(config.timezone), page_size=50)
-    )
+            title = f"{candidate.anomaly_type} / {candidate.person}" if terminal_check_candidate_module(candidate) == "decrypt" else f"{candidate.anomaly_type} / {candidate.client_ip}"
+            if terminal_check_candidate_module(candidate) == "decrypt":
+                table_html = decrypt_review_detail_table(candidate)
+            else:
+                tz = local_tz(config.timezone)
+                detail_events = [terminal_check_audit_event_from_row(row, tz) for row in candidate.evidence_events]
+    if "table_html" not in locals():
+        table_html = (
+            '<p class="muted">未找到复核证据，可能统计周期已变化。</p>'
+            if not detail_events
+            else report_gen.event_detail_table_html(
+                detail_events,
+                local_tz(config.timezone),
+                page_size=50,
+                recipient_map=getattr(terminal_review.configure_report_policy_context(config, load_policy_doc(config))[0], "recipient_map_loaded", {}) or {},
+            )
+        )
     body = f"""
     <header>
       <div><h1>{esc(title)}</h1><div class="muted">本页直接复用报表重点明细事件与报表同款清单渲染，不再单独查询 ClickHouse 拼接简表。</div></div>
@@ -7224,8 +8164,6 @@ def terminal_behavior_policy_page(config: AppConfig, message: str = "", error: s
     doc = load_policy_doc(config)
     policy = terminal_review.normalized_review_policy(doc)
     field_labels = [
-        ("other_drawing_min_events", "普通图纸流转阈值"),
-        ("sensitive_name_min_events", "敏感文件流转阈值"),
         ("candidate_limit", "候选列表上限"),
     ]
     inputs = "".join(
@@ -7234,7 +8172,7 @@ def terminal_behavior_policy_page(config: AppConfig, message: str = "", error: s
     )
     body = f"""
     <header>
-      <div><h1>风险终端复核策略</h1><div class="muted">候选只取标准图纸流转、大于100MB压缩包流转、普通图纸超过阈值、敏感文件超过阈值四类；同一终端同一周期只生成一条候选。</div></div>
+      <div><h1>风险终端复核策略</h1><div class="muted">候选只取能定位到终端/IP的一级风险对象；同一终端同一周期只生成一条候选。</div></div>
       <div class="actions"><a class="button" href="/settings">策略中心</a><a class="button" href="/terminal-check">复核工作台</a></div>
     </header>
     {f'<p class="badge on">{esc(message)}</p>' if message else ''}
@@ -7247,7 +8185,7 @@ def terminal_behavior_policy_page(config: AppConfig, message: str = "", error: s
         </select>
       </label>
       {inputs}
-      <p class="muted full">当前口径：标准图纸和大于100MB压缩包经邮件、IM、外部站点上传或外设拷贝等通道流转即入候选；普通三维/DWG 图纸默认超过 100 条入候选；敏感名称文件默认超过 1000 条入候选。</p>
+      <p class="muted full">当前口径：天擎标准图纸经邮件、IM、外部站点上传或外设拷贝等通道流转即入候选；大于100MB压缩包仅在技术部、工艺部、研发部命中时入候选；PLM 登录审计接入后，技术、研发、工艺账号池外登录也进入复核。敏感词和普通图纸高频不进入风险终端复核候选。</p>
       <div class="actions"><button class="primary" type="submit">保存复核策略</button></div>
     </form>
 """
@@ -8355,6 +9293,11 @@ class ReportHandler(BaseHTTPRequestHandler):
                 return
             self.send_html(organization_tree_page(self.config))
             return
+        if parsed.path == "/settings/identity-bindings":
+            if not self.require_admin(session):
+                return
+            self.send_html(identity_bindings_page(self.config))
+            return
         if parsed.path == "/settings/auth":
             if not self.require_admin(session):
                 return
@@ -8509,6 +9452,11 @@ class ReportHandler(BaseHTTPRequestHandler):
             if not self.require_admin(session):
                 return
             self.handle_organization_alias_post(parsed.path, form)
+            return
+        if parsed.path.startswith("/settings/identity-bindings/"):
+            if not self.require_admin(session):
+                return
+            self.handle_identity_bindings_post(parsed.path, form, session)
             return
         if parsed.path.startswith("/settings/auth/"):
             if not self.require_admin(session):
@@ -8967,7 +9915,7 @@ class ReportHandler(BaseHTTPRequestHandler):
         unique_terminal_keys = sum(summary.unique_terminal_keys for summary in summaries)
         missing_ip_rows = sum(summary.missing_ip_rows for summary in summaries)
         detail = "；".join(
-            f"{summary.source_file}: 新增 {summary.inserted_rows}, 终端键 {summary.unique_terminal_keys}, IP {summary.unique_ips}, 重复 {summary.duplicate_rows}"
+            f"{summary.source_file}: 入库 {summary.inserted_rows}, 终端键 {summary.unique_terminal_keys}, IP {summary.unique_ips}, 同文件重复 {summary.duplicate_rows}"
             for summary in summaries[:6]
         )
         if len(summaries) > 6:
@@ -8975,7 +9923,7 @@ class ReportHandler(BaseHTTPRequestHandler):
         failure_text = f"；失败 {len(failures)} 个：{'；'.join(failures[:4])}" if failures else ""
         message = (
             f"终端列表导入完成：成功 {len(summaries)} 个文件{failure_text}；"
-            f"总行数 {total_rows}，新增 {inserted_rows}，重复 {duplicate_rows}；"
+            f"总行数 {total_rows}，入库 {inserted_rows}，同文件重复 {duplicate_rows}；"
             f"有效IP行 {valid_ip_rows}，合规终端键合计 {unique_terminal_keys}，唯一IP合计 {unique_ips}，缺IP行 {missing_ip_rows}。"
             f" 明细：{detail}"
         )
@@ -9016,6 +9964,16 @@ class ReportHandler(BaseHTTPRequestHandler):
             doc["organization_aliases"] = aliases
             write_rule_doc(policy_path(self.config), doc, self.config)
         self.redirect("/settings/organization-aliases")
+
+    def handle_identity_bindings_post(self, path: str, form: dict[str, str], session: AuthSession) -> None:
+        if not path.endswith("/save"):
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        ok, message = save_identity_binding(self.config, form, session)
+        if not ok:
+            self.send_html(identity_bindings_page(self.config, error=message), HTTPStatus.BAD_REQUEST)
+            return
+        self.send_html(identity_bindings_page(self.config, message=message))
 
     def handle_auth_policy_post(self, path: str, form: dict[str, str]) -> None:
         with RULES_LOCK:

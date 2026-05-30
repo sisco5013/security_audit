@@ -247,6 +247,7 @@ def init_db(args: argparse.Namespace) -> None:
     clickhouse_request(args, decrypt_records.DECRYPT_TABLE_SQL)
     clickhouse_request(args, encryption_terminals.TERMINAL_TABLE_SQL)
     clickhouse_request(args, terminal_behavior_review.TERMINAL_BEHAVIOR_REVIEW_TABLE_SQL)
+    clickhouse_request(args, report.MANUAL_IDENTITY_BINDINGS_TABLE_SQL)
 
 
 def open_log(path: Path):
@@ -526,11 +527,13 @@ def asset_row(record: report.RawRecord, raw_record_hash: str, ingest_time: str) 
 
 
 def load_context(args: argparse.Namespace):
+    if not hasattr(args, "use_clickhouse"):
+        args.use_clickhouse = True
     report.configure_audit_policy(report.load_audit_policy(args.audit_policy_file))
     keyword_rules = report.load_sensitive_keyword_rules(args.sensitive_keywords_file)
     report.configure_sensitive_keyword_rules(keyword_rules)
     exclusion_rules = report.load_exclusion_rules(args.exclusion_file)
-    people_map = report.load_people_map(args.people_map)
+    people_map = report.load_manual_identity_bindings(args)
     wecom_items: list[dict[str, Any]] = []
     try:
         cached = json.loads(Path(args.wecom_directory_cache).read_text(encoding="utf-8"))
@@ -543,6 +546,8 @@ def load_context(args: argparse.Namespace):
     recipient_map = report.build_wecom_recipient_map(wecom_items)
     recipient_map.update(report.load_observed_wecom_account_recipient_map(args, wecom_people_map))
     recipient_map.update(report.load_recipient_map(args.recipient_map))
+    report.merge_manual_identity_recipient_display_map(recipient_map, people_map)
+    report.configure_wecom_internal_recipient_accounts(recipient_map, people_map)
     disposition_by_event_id, disposition_by_search_id = report.load_dispositions(args.disposition_file)
     return exclusion_rules, people_map, wecom_people_map, recipient_map, disposition_by_event_id, disposition_by_search_id
 
@@ -610,7 +615,15 @@ def ingest(args: argparse.Namespace) -> tuple[int, int]:
     def flush() -> None:
         nonlocal raw_count, event_count, asset_count
         report.apply_report_policies(pending_events, {}, internal_domains)
-        report.enrich_events(pending_events, people_map, wecom_people_map, disposition_by_event_id, disposition_by_search_id)
+        report.enrich_events(
+            pending_events,
+            people_map,
+            wecom_people_map,
+            disposition_by_event_id,
+            disposition_by_search_id,
+            recipient_map=recipient_map,
+        )
+        report.refresh_event_priorities_after_recipient_repair(pending_events, internal_domains)
         event_rows.extend(event_row(event, digest, ingest_time) for event, digest in zip(pending_events, pending_hashes))
         insert_rows(args, "raw_syslog", raw_rows)
         insert_rows(args, "audit_events", event_rows)
@@ -699,7 +712,15 @@ def rebuild_events_from_raw(
         if not pending_events:
             return
         report.apply_report_policies(pending_events, {}, internal_domains)
-        report.enrich_events(pending_events, people_map, wecom_people_map, disposition_by_event_id, disposition_by_search_id)
+        report.enrich_events(
+            pending_events,
+            people_map,
+            wecom_people_map,
+            disposition_by_event_id,
+            disposition_by_search_id,
+            recipient_map=recipient_map,
+        )
+        report.refresh_event_priorities_after_recipient_repair(pending_events, internal_domains)
         rows = [event_row(event, digest, ingest_time) for event, digest in zip(pending_events, pending_hashes)]
         insert_rows(args, target_table, rows)
         event_count += len(rows)
@@ -804,7 +825,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clickhouse-database", default=os.getenv("CLICKHOUSE_DB", DEFAULT_CH_DATABASE))
     parser.add_argument("--clickhouse-user", default=os.getenv("CLICKHOUSE_USER", ""))
     parser.add_argument("--clickhouse-password", default=os.getenv("CLICKHOUSE_PASSWORD", ""))
-    parser.add_argument("--people-map", default=str(app_dir / "people_mapping.csv"))
     parser.add_argument("--recipient-map", default=str(app_dir / "recipient_mapping.csv"))
     parser.add_argument("--disposition-file", default=str(app_dir / "audit_dispositions.csv"))
     parser.add_argument("--sensitive-keywords-file", default=os.getenv("TIANQING_SENSITIVE_KEYWORDS_FILE", str(app_dir / "sensitive_keywords.json")))

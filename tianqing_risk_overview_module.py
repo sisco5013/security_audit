@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import Any, Iterable
 
 
 def bind_runtime_dependencies(namespace: dict[str, Any]) -> None:
@@ -34,6 +34,59 @@ def pct_text(part: int, total: int) -> str:
     if total <= 0:
         return "0%"
     return f"{part / total * 100:.0f}%"
+
+
+def level_one_flow_dedup_key(event: AuditEvent, label: str) -> tuple[str, str, str, str, str, str]:
+    ts = getattr(event, "ts", None)
+    try:
+        minute = ts.strftime("%Y-%m-%d %H:%M") if ts else ""
+    except Exception:
+        minute = str(ts or "")
+    files = ";".join(sorted(str(item).strip() for item in getattr(event, "file_names", []) or [] if str(item).strip()))
+    targets = ";".join(
+        sorted(
+            set(
+                str(item).strip()
+                for item in (
+                    list(getattr(event, "recipients", []) or [])
+                    + list(getattr(event, "targets", []) or [])
+                    + list(getattr(event, "target_domains", []) or [])
+                )
+                if str(item).strip()
+            )
+        )
+    )
+    return (
+        minute,
+        str(getattr(event, "client_name", "") or ""),
+        str(getattr(event, "client_ip", "") or ""),
+        files,
+        targets,
+        label,
+    )
+
+
+def level_one_flow_label(event: AuditEvent) -> str:
+    labels = set(critical_design_labels_for_event(event))
+    if CRITICAL_STRUCTURE_LABEL in labels:
+        return CRITICAL_STRUCTURE_LABEL
+    if CRITICAL_ELECTRICAL_LABEL in labels:
+        return CRITICAL_ELECTRICAL_LABEL
+    if is_large_archive_event(event):
+        return "压缩包"
+    return ""
+
+
+def level_one_flow_counts(events: Iterable[AuditEvent]) -> tuple[Counter, Counter]:
+    raw_counts: Counter = Counter()
+    dedup_keys: dict[str, set[tuple[str, str, str, str, str, str]]] = {}
+    for event in events:
+        label = level_one_flow_label(event)
+        if not label:
+            continue
+        raw_counts[label] += 1
+        dedup_keys.setdefault(label, set()).add(level_one_flow_dedup_key(event, label))
+    return raw_counts, Counter({label: len(keys) for label, keys in dedup_keys.items()})
 
 
 def risk_overview_period_days(
@@ -390,6 +443,7 @@ def build_rule_risk_overview_html(
     organization_analysis: OrganizationRiskAnalysis,
     org_links: dict[tuple[str, str, str], str],
     object_links: dict[str, str],
+    level_one_flow_events: list[AuditEvent] | None = None,
 ) -> str:
     current_counts = risk_overview_pack_counts(events, internal_domains)
     total_count = int(current_counts.get("total") or 0)
@@ -438,21 +492,24 @@ def build_rule_risk_overview_html(
     else:
         overall_sentence = "本期暂无进入通道×对象矩阵的重点事件，首页保留组织和趋势入口用于复核。"
     matrix_events = list(current_counts.get("events") or [])
-    structure_critical = sum(
-        1 for event in matrix_events if CRITICAL_STRUCTURE_LABEL in critical_design_labels_for_event(event)
-    )
-    electrical_critical = sum(
-        1
-        for event in matrix_events
-        if CRITICAL_ELECTRICAL_LABEL in critical_design_labels_for_event(event)
-        and CRITICAL_STRUCTURE_LABEL not in critical_design_labels_for_event(event)
-    )
+    level_one_events = list(level_one_flow_events if level_one_flow_events is not None else matrix_events)
+    raw_level_one_counts, dedup_level_one_counts = level_one_flow_counts(level_one_events)
+    structure_critical = int(dedup_level_one_counts.get(CRITICAL_STRUCTURE_LABEL, 0) or 0)
+    electrical_critical = int(dedup_level_one_counts.get(CRITICAL_ELECTRICAL_LABEL, 0) or 0)
     standard_critical = structure_critical + electrical_critical
-    large_archive_critical = sum(1 for event in matrix_events if is_large_archive_event(event))
+    large_archive_critical = int(dedup_level_one_counts.get("压缩包", 0) or 0)
+    raw_level_one_total = sum(raw_level_one_counts.values())
+    dedup_level_one_total = sum(dedup_level_one_counts.values())
+    evidence_tail = (
+        f"；原始证据日志 {raw_level_one_total} 条"
+        if raw_level_one_total and raw_level_one_total != dedup_level_one_total
+        else ""
+    )
     level_one_sentence = (
-        f"一级风险对象：标准图纸外发/拷贝 {standard_critical} 条"
-        f"（结构 {structure_critical} 条、电气 {electrical_critical} 条），"
-        f"大于100MB压缩包 {large_archive_critical} 条；顶部汇总只展示分项，不再合并成一个总数。"
+        f"一级风险对象：标准图纸流转 {standard_critical} 笔"
+        f"（结构 {structure_critical} 笔、电气 {electrical_critical} 笔），"
+        f"技术/工艺/研发大于100MB压缩包流转 {large_archive_critical} 笔{evidence_tail}；"
+        "管理数字按同一分钟、同终端、同文件、同目标去重，已排除内部系统上传。"
     )
     three_d_sentence = (
         f"三维模型作为最高关注对象，本期 {three_d_item.get('current', 0)} 条，"

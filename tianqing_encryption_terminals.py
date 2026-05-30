@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS encryption_terminal_inventory
 )
 ENGINE = ReplacingMergeTree(import_time)
 PARTITION BY toYYYYMM(event_date)
-ORDER BY terminal_fingerprint
+ORDER BY (import_batch, terminal_fingerprint)
 TTL event_date + INTERVAL 3 YEAR
 SETTINGS index_granularity = 8192
 """
@@ -203,22 +203,33 @@ def terminal_fingerprint(record: dict[str, Any]) -> str:
 def ensure_terminal_table(args: argparse.Namespace) -> None:
     xlsx.clickhouse_request(args, f"CREATE DATABASE IF NOT EXISTS {args.clickhouse_database}")
     xlsx.clickhouse_request(args, TERMINAL_TABLE_SQL)
+    migrate_terminal_table_order_key(args)
 
 
-def existing_terminal_fingerprints(args: argparse.Namespace, fingerprints: list[str], chunk_size: int = 500) -> set[str]:
-    found: set[str] = set()
-    for start in range(0, len(fingerprints), chunk_size):
-        chunk = fingerprints[start : start + chunk_size]
-        if not chunk:
-            continue
-        query = (
-            "SELECT terminal_fingerprint FROM encryption_terminal_inventory FINAL "
-            f"WHERE terminal_fingerprint IN ({','.join(xlsx.clickhouse_quote(item) for item in chunk)}) "
-            "FORMAT TabSeparated"
-        )
-        text = xlsx.clickhouse_request(args, query).decode("utf-8", errors="replace")
-        found.update(line.strip() for line in text.splitlines() if line.strip())
-    return found
+def terminal_table_sorting_key(args: argparse.Namespace) -> str:
+    query = (
+        "SELECT sorting_key FROM system.tables "
+        f"WHERE database = {xlsx.clickhouse_quote(args.clickhouse_database)} "
+        "AND name = 'encryption_terminal_inventory' "
+        "FORMAT TabSeparated"
+    )
+    return xlsx.clickhouse_request(args, query).decode("utf-8", errors="replace").strip()
+
+
+def migrate_terminal_table_order_key(args: argparse.Namespace) -> None:
+    """Preserve each import as a full snapshot instead of deduping across batches."""
+    sorting_key = terminal_table_sorting_key(args)
+    if sorting_key != "terminal_fingerprint":
+        return
+    suffix = datetime.now().strftime("%Y%m%d%H%M%S")
+    next_table = f"encryption_terminal_inventory_next_{suffix}"
+    legacy_table = f"encryption_terminal_inventory_legacy_{suffix}"
+    xlsx.clickhouse_request(args, TERMINAL_TABLE_SQL.replace("encryption_terminal_inventory", next_table, 1))
+    xlsx.clickhouse_request(args, f"INSERT INTO {next_table} SELECT * FROM encryption_terminal_inventory")
+    xlsx.clickhouse_request(
+        args,
+        f"RENAME TABLE encryption_terminal_inventory TO {legacy_table}, {next_table} TO encryption_terminal_inventory",
+    )
 
 
 def insert_terminal_rows(args: argparse.Namespace, rows: list[dict[str, Any]]) -> None:
@@ -238,7 +249,6 @@ def import_terminal_workbook(
     import_time = xlsx.ch_dt(now) or now.strftime("%Y-%m-%d %H:%M:%S.000")
     summary = TerminalImportSummary(batch_id=batch_id, source_file=original_filename, total_rows=len(parsed_rows))
     fingerprints = [terminal_fingerprint(row) for row in parsed_rows]
-    existing = existing_terminal_fingerprints(args, fingerprints)
     seen_in_file: set[str] = set()
     unique_ips: set[str] = set()
     unique_terminal_keys: set[tuple[str, str]] = set()
@@ -253,7 +263,7 @@ def import_terminal_workbook(
                 unique_terminal_keys.add((ip, computer_name))
         else:
             summary.missing_ip_rows += 1
-        if fingerprint in existing or fingerprint in seen_in_file:
+        if fingerprint in seen_in_file:
             summary.duplicate_rows += 1
             continue
         seen_in_file.add(fingerprint)

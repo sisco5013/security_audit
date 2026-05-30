@@ -9,6 +9,7 @@ to what kind of destination, and which events need attachment review.
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import hashlib
 import html as html_lib
@@ -128,7 +129,6 @@ VOLUME_BURST_MIN_BYTES = 100 * 1024 * 1024
 SPLIT_TRANSFER_WINDOW_MINUTES = 120
 BEHAVIOR_MAX_GROUP_EVENTS = 220
 BEHAVIOR_MAX_GROUPS = 450
-DEFAULT_PEOPLE_MAP = "people_mapping.csv"
 DEFAULT_DISPOSITION_FILE = "audit_dispositions.csv"
 DEFAULT_RECIPIENT_MAP = "recipient_mapping.csv"
 DEFAULT_WECOM_DIRECTORY_HOST = "root@172.88.49.60"
@@ -137,6 +137,28 @@ DEFAULT_WECOM_DIRECTORY_CACHE = "wecom_directory_cache.json"
 DEFAULT_SENSITIVE_KEYWORDS_FILE = os.getenv("TIANQING_SENSITIVE_KEYWORDS_FILE", "sensitive_keywords.json")
 DEFAULT_EXCLUSION_FILE = os.getenv("TIANQING_AUDIT_EXCLUSION_FILE", "audit_exclusions.json")
 DEFAULT_AUDIT_POLICY_FILE = os.getenv("TIANQING_AUDIT_POLICY_FILE", "audit_policy.json")
+MANUAL_IDENTITY_BINDINGS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS identity_manual_bindings
+(
+    match_type LowCardinality(String),
+    match_value String,
+    person_name String,
+    company String,
+    department String,
+    position String,
+    sensitive_role String,
+    status LowCardinality(String),
+    note String,
+    source LowCardinality(String),
+    updated_by String,
+    updated_at DateTime64(3, 'Asia/Shanghai'),
+    enabled UInt8
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (match_type, match_value)
+TTL updated_at + INTERVAL 5 YEAR
+SETTINGS index_granularity = 8192
+"""
 EXTERNAL_RELATIONS = {"external", "partner", "customer", "supplier"}
 RELATION_LABELS = {
     "external": "外部",
@@ -148,6 +170,7 @@ RELATION_LABELS = {
     "group": "群聊忽略",
 }
 WECOM_GROUP_TARGET_HINTS = ("群", "团队", "项目组", "工作组", "交流群", "沟通组", "沟通群", "对接群", "访客预约")
+WECOM_INTERNAL_RECIPIENT_ACCOUNTS: set[str] = set()
 PRIORITY_ACTION = "action"
 PRIORITY_REVIEW = "review"
 PRIORITY_GENERAL = "general"
@@ -383,6 +406,7 @@ REASON_DISPLAY_PRIORITY = [
 HIDDEN_LEADERSHIP_REASONS = {"二维/三维设计图纸", "设计图纸后缀"}
 DESIGN_CATEGORY_DISPLAY_ORDER = CRITICAL_DESIGN_LABELS + ["三维模型", "DWG二维图纸", "设计资料"]
 LARGE_ARCHIVE_RISK_BYTES = 100 * 1024 * 1024
+LARGE_ARCHIVE_CONTROLLED_DEPARTMENTS = ("技术部", "工艺部", "研发部")
 
 
 @dataclass
@@ -525,6 +549,14 @@ class RecipientEntry:
     recipient_name: str = ""
     organization: str = ""
     note: str = ""
+
+
+@dataclass
+class RecipientIdentity:
+    name: str = ""
+    account: str = ""
+    company: str = ""
+    department: str = ""
 
 
 @dataclass
@@ -762,7 +794,7 @@ class DecryptRiskRecord:
     mail_fail_reason: str = ""
     object_bucket: str = "其他"
     critical_labels: list[str] = field(default_factory=list)
-    followup_channel: str = "未发现后续外发/拷贝线索"
+    followup_channel: str = "未发现同名文件疑似后续线索"
     followup_time: datetime | None = None
     followup_target: str = ""
     followup_confidence: str = ""
@@ -862,13 +894,66 @@ def clickhouse_headers(args: argparse.Namespace) -> dict[str, str]:
 def clickhouse_query(args: argparse.Namespace, query: str, database: str | None = None) -> str:
     base_url = str(getattr(args, "clickhouse_url", "") or DEFAULT_CLICKHOUSE_URL).rstrip("/")
     db = database if database is not None else str(getattr(args, "clickhouse_database", "") or "tianqing")
-    params = {"query": query}
+    params = {}
     if db:
         params["database"] = db
-    url = base_url + "/?" + urllib.parse.urlencode(params)
-    request = urllib.request.Request(url, headers=clickhouse_headers(args), method="POST")
+    url = base_url + ("/?" + urllib.parse.urlencode(params) if params else "/")
+    request = urllib.request.Request(url, data=query.encode("utf-8"), headers=clickhouse_headers(args), method="POST")
     with urllib.request.urlopen(request, timeout=int(getattr(args, "clickhouse_timeout", 120))) as response:
         return response.read().decode("utf-8", errors="replace")
+
+
+def ensure_manual_identity_bindings_table(args: argparse.Namespace) -> None:
+    if not getattr(args, "use_clickhouse", False):
+        return
+    clickhouse_query(args, MANUAL_IDENTITY_BINDINGS_TABLE_SQL)
+
+
+def load_manual_identity_bindings(args: argparse.Namespace) -> dict[tuple[str, str], "PeopleEntry"]:
+    if not getattr(args, "use_clickhouse", False):
+        return {}
+    try:
+        ensure_manual_identity_bindings_table(args)
+        rows_text = clickhouse_query(
+            args,
+            """
+SELECT match_type, match_value, person_name, company, department, position, sensitive_role, status, note
+FROM identity_manual_bindings FINAL
+WHERE enabled = 1
+  AND length(match_type) > 0
+  AND length(match_value) > 0
+  AND length(person_name) > 0
+FORMAT JSONEachRow
+""",
+        )
+    except Exception as exc:
+        debug_timing(f"load manual identity bindings failed: {type(exc).__name__}: {exc}")
+        return {}
+    mapping: dict[tuple[str, str], PeopleEntry] = {}
+    for line in rows_text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        match_type = normalize_key(row.get("match_type"))
+        match_value = normalize_key(row.get("match_value"))
+        person_name = str(row.get("person_name") or "").strip()
+        if not match_type or not match_value or not person_name:
+            continue
+        mapping[(match_type, match_value)] = PeopleEntry(
+            match_type=match_type,
+            match_value=match_value,
+            person_name=person_name,
+            company=str(row.get("company") or "").strip(),
+            department=str(row.get("department") or "").strip(),
+            position=str(row.get("position") or "").strip(),
+            sensitive_role=str(row.get("sensitive_role") or "").strip(),
+            status=str(row.get("status") or "").strip(),
+            note=str(row.get("note") or "").strip(),
+        )
+    return mapping
 
 
 def clickhouse_literal(value: str) -> str:
@@ -886,6 +971,17 @@ def clickhouse_time_filter(start: datetime | None, end: datetime | None) -> str:
 
 def clickhouse_array_literal(values: Iterable[str]) -> str:
     return "[" + ",".join(clickhouse_literal(value) for value in values) + "]"
+
+
+def clickhouse_large_archive_scope_expr(department_expr: str = "department") -> str:
+    departments = clickhouse_array_literal(LARGE_ARCHIVE_CONTROLLED_DEPARTMENTS)
+    text = f"ifNull({department_expr}, '')"
+    return (
+        f"{text} != '' "
+        f"AND lowerUTF8({text}) != 'unknown' "
+        f"AND NOT startsWith({text}, {clickhouse_literal(UNMATCHED_DEPARTMENT_LABEL)}) "
+        f"AND arrayExists(scope_department -> positionUTF8({text}, scope_department) > 0, {departments})"
+    )
 
 
 def clickhouse_event_filter(start: datetime | None, end: datetime | None) -> str:
@@ -916,12 +1012,85 @@ def parse_clickhouse_ts(value: Any, tz: timezone) -> datetime | None:
     return parsed
 
 
-CLICKHOUSE_AUDIT_EVENT_SELECT = (
-    "event_id, raw_hash, ts, topic, channel, person, account, client_name, client_ip, "
-    "department AS resolved_department, process_name, mail_subject, sender_mailbox, "
-    "targets, target_domains, recipients, recipient_relation, file_names, file_exts, file_size, lookup_keys, search_id, "
-    "score, level, reasons, resolved_person, company, disposition_status"
+CLICKHOUSE_AUDIT_EVENT_FIELDS = (
+    ("event_id", "event_id", "string"),
+    ("raw_hash", "raw_hash", "string"),
+    ("ts", "ts", "string"),
+    ("topic", "topic", "string"),
+    ("channel", "channel", "string"),
+    ("person", "person", "string"),
+    ("account", "account", "string"),
+    ("client_name", "client_name", "string"),
+    ("client_ip", "client_ip", "string"),
+    ("resolved_department", "department", "string"),
+    ("process_name", "process_name", "string"),
+    ("mail_subject", "mail_subject", "string"),
+    ("sender_mailbox", "sender_mailbox", "string"),
+    ("targets", "targets", "array"),
+    ("target_domains", "target_domains", "array"),
+    ("recipients", "recipients", "array"),
+    ("recipient_relation", "recipient_relation", "string"),
+    ("file_names", "file_names", "array"),
+    ("file_exts", "file_exts", "array"),
+    ("file_size", "file_size", "nullable_int"),
+    ("lookup_keys", "lookup_keys", "array"),
+    ("search_id", "search_id", "string"),
+    ("score", "score", "int"),
+    ("level", "level", "string"),
+    ("reasons", "reasons", "array"),
+    ("resolved_person", "resolved_person", "string"),
+    ("company", "company", "string"),
+    ("disposition_status", "disposition_status", "string"),
 )
+CLICKHOUSE_AUDIT_EVENT_SELECT = ", ".join(
+    f"{expr} AS {name}" if expr != name else expr
+    for name, expr, _kind in CLICKHOUSE_AUDIT_EVENT_FIELDS
+)
+
+
+def clickhouse_audit_event_safe_select() -> str:
+    columns: list[str] = []
+    for _name, expr, kind in CLICKHOUSE_AUDIT_EVENT_FIELDS:
+        if kind == "array":
+            columns.append(f"base64Encode(toJSONString({expr}))")
+        elif kind == "int":
+            columns.append(f"toString({expr})")
+        elif kind == "nullable_int":
+            columns.append(f"ifNull(toString({expr}), '')")
+        else:
+            columns.append(f"base64Encode(toString({expr}))")
+    return ", ".join(columns)
+
+
+def decode_clickhouse_b64_text(value: str) -> str:
+    if not value:
+        return ""
+    return base64.b64decode(value, validate=True).decode("utf-8", errors="replace")
+
+
+def parse_clickhouse_audit_event_tsv(text: str, tz: timezone) -> list["AuditEvent"]:
+    events: list[AuditEvent] = []
+    expected_columns = len(CLICKHOUSE_AUDIT_EVENT_FIELDS)
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        values = line.split("\t")
+        if len(values) != expected_columns:
+            raise RuntimeError(
+                f"ClickHouse audit_events TSV column mismatch at line {line_no}: "
+                f"expected {expected_columns}, got {len(values)}"
+            )
+        row: dict[str, Any] = {}
+        for value, (name, _expr, kind) in zip(values, CLICKHOUSE_AUDIT_EVENT_FIELDS):
+            if kind == "array":
+                decoded = decode_clickhouse_b64_text(value)
+                row[name] = json.loads(decoded) if decoded else []
+            elif kind in {"int", "nullable_int"}:
+                row[name] = int(value) if value else None
+            else:
+                row[name] = decode_clickhouse_b64_text(value)
+        events.append(audit_event_from_clickhouse_row(row, tz))
+    return events
 
 
 def audit_event_from_clickhouse_row(row: dict[str, Any], tz: timezone) -> "AuditEvent":
@@ -966,14 +1135,9 @@ def audit_events_from_clickhouse_period(
     tz: timezone,
 ) -> list["AuditEvent"]:
     event_where = clickhouse_event_filter(start, end)
-    query = f"SELECT {CLICKHOUSE_AUDIT_EVENT_SELECT} FROM audit_events WHERE {event_where} FORMAT JSONEachRow"
+    query = f"SELECT {clickhouse_audit_event_safe_select()} FROM audit_events WHERE {event_where} FORMAT TabSeparated"
     text = clickhouse_query(args, query)
-    events: list[AuditEvent] = []
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        events.append(audit_event_from_clickhouse_row(json.loads(line), tz))
-    return events
+    return parse_clickhouse_audit_event_tsv(text, tz)
 
 
 def normalized_audit_events_from_clickhouse_period(
@@ -1003,6 +1167,7 @@ def normalized_audit_events_from_clickhouse_period(
         terminal_identity_max_age_days=getattr(args, "terminal_identity_max_age_days", 30),
     )
     apply_terminal_majority_identity(events, terminal_identity_history)
+    refresh_event_priorities_after_recipient_repair(events, internal_domains)
     return events
 
 
@@ -1014,26 +1179,37 @@ def raw_file_audit_map_from_clickhouse(
     raw_where = clickhouse_time_filter(start, end)
     event_where = clickhouse_event_filter(start, end)
     raw_map_query = (
-        "SELECT raw_hash, raw_json "
+        "SELECT raw_hash, base64Encode(raw_json) AS raw_json_b64 "
         f"FROM raw_syslog WHERE {raw_where} AND topic = 'file_audit' "
         "AND raw_hash IN ("
         f"SELECT raw_hash FROM audit_events WHERE {event_where} AND topic = 'file_audit'"
-        ") FORMAT JSONEachRow"
+        ") FORMAT TabSeparated"
     )
-    raw_map_text = clickhouse_query(args, raw_map_query)
     raw_file_audit_map: dict[str, dict[str, Any]] = {}
+    skipped_payloads = 0
+    try:
+        raw_map_text = clickhouse_query(args, raw_map_query)
+    except Exception as exc:
+        setattr(args, "file_audit_raw_map_error", str(exc))
+        return raw_file_audit_map
     for line in raw_map_text.splitlines():
         if not line.strip():
             continue
-        row = json.loads(line)
-        raw_hash = str(row.get("raw_hash") or "")
-        raw_json = str(row.get("raw_json") or "")
-        if not raw_hash or not raw_json:
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            skipped_payloads += 1
+            continue
+        raw_hash, raw_json_b64 = (part.strip() for part in parts)
+        if not raw_hash or not raw_json_b64:
             continue
         try:
+            raw_json = base64.b64decode(raw_json_b64, validate=True).decode("utf-8", errors="replace")
             raw_file_audit_map[raw_hash] = json.loads(raw_json)
-        except json.JSONDecodeError:
+        except (ValueError, json.JSONDecodeError):
+            skipped_payloads += 1
             continue
+    if skipped_payloads:
+        setattr(args, "file_audit_raw_map_skipped_payloads", skipped_payloads)
     return raw_file_audit_map
 
 
@@ -1060,18 +1236,14 @@ def records_and_events_from_clickhouse(
         row = json.loads(line)
         topic_counts[str(row.get("topic") or "unknown")] = int(row.get("count") or 0)
     args.topic_counts_override = topic_counts
-    query = f"SELECT {CLICKHOUSE_AUDIT_EVENT_SELECT} FROM audit_events WHERE {event_where} FORMAT JSONEachRow"
+    query = f"SELECT {clickhouse_audit_event_safe_select()} FROM audit_events WHERE {event_where} FORMAT TabSeparated"
     debug_timing("clickhouse event query")
     event_text = clickhouse_query(args, query)
     debug_timing("clickhouse raw file_audit query")
     raw_file_audit_map = raw_file_audit_map_from_clickhouse(args, start, end)
     args.file_audit_raw_map = raw_file_audit_map
     debug_timing("clickhouse event parse start")
-    events: list[AuditEvent] = []
-    for line in event_text.splitlines():
-        if not line.strip():
-            continue
-        events.append(audit_event_from_clickhouse_row(json.loads(line), tz))
+    events = parse_clickhouse_audit_event_tsv(event_text, tz)
     debug_timing(f"clickhouse event parse complete events={len(events)}")
     args.source_label_override = f"ClickHouse:{getattr(args, 'clickhouse_database', 'tianqing')}.audit_events"
     return [], events
@@ -1999,9 +2171,11 @@ def apply_report_policies(
         apply_design_control_policy(event)
         apply_sensitive_keyword_policy(event)
         normalize_untrusted_internal_im_relation(event)
+        normalize_unconfirmed_wecom_external_relation(event)
     enrich_file_audit_im_recipients(events)
     for event in events:
         normalize_untrusted_internal_im_relation(event)
+        normalize_unconfirmed_wecom_external_relation(event)
         assign_event_priority(event, internal_domains)
 
 
@@ -2021,6 +2195,13 @@ def normalize_untrusted_internal_im_relation(event: AuditEvent) -> None:
             event.recipient_relation = "unknown"
             if "接收端IP未确认" not in event.reasons:
                 event.reasons.append("接收端IP未确认")
+
+
+def normalize_unconfirmed_wecom_external_relation(event: AuditEvent) -> None:
+    # Final audit policy: WeCom recipient tokens that cannot be tied back to a
+    # controlled endpoint local_account are treated as outbound risk, even when
+    # the nickname happens to exist in the corporate directory.
+    return
 
 
 def is_im_file_audit_event(event: AuditEvent) -> bool:
@@ -2251,6 +2432,7 @@ def identity_hints_for(obj: dict[str, Any], topic: str) -> list[str]:
     hints.extend(split_multi(obj.get("user_group_names")))
     hints.extend(split_multi(obj.get("login_user")))
     hints.extend(split_multi(obj.get("staff_name")))
+    hints.extend(split_multi(obj.get("local_account")))
     hints.extend(split_multi(obj.get("local_nickname")))
     hints.extend(split_multi(obj.get("client_login_account")))
     if topic == "mail_audit":
@@ -2984,12 +3166,57 @@ def is_archive_event(event: AuditEvent) -> bool:
     return any(extension(name) in ARCHIVE_EXTS for name in event.file_names)
 
 
-def is_large_archive_event(event: AuditEvent) -> bool:
+def department_matches_large_archive_scope(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text or text == "unknown" or text.startswith("未匹配"):
+        return False
+    return any(department in text for department in LARGE_ARCHIVE_CONTROLLED_DEPARTMENTS)
+
+
+def is_large_archive_scope_event(event: AuditEvent) -> bool:
+    return any(
+        department_matches_large_archive_scope(value)
+        for value in (event.resolved_department, event.department, event.org_path)
+    )
+
+
+def is_oversize_archive_event(event: AuditEvent) -> bool:
     return is_archive_event(event) and int(event.file_size or 0) > LARGE_ARCHIVE_RISK_BYTES
+
+
+def is_large_archive_event(event: AuditEvent) -> bool:
+    return is_oversize_archive_event(event) and is_large_archive_scope_event(event)
 
 
 def is_tianqing_level_one_event(event: AuditEvent, internal_domains: set[str] | None = None) -> bool:
     if not is_leadership_focus_event(event, internal_domains or DEFAULT_INTERNAL_DOMAINS):
+        return False
+    return is_critical_design_event(event) or is_large_archive_event(event)
+
+
+def is_internal_system_upload_event(event: AuditEvent, internal_domains: set[str] | None = None) -> bool:
+    if event.topic != "file_audit":
+        return False
+    if event.channel == "内部系统上传" or "内部系统上传" in event.reasons:
+        return True
+    domains = set(internal_domains or DEFAULT_INTERNAL_DOMAINS)
+    return bool(
+        event.target_domains
+        and any(reason in event.reasons for reason in {"外部站点上传", "外部上传/下载地址"})
+        and any(domain_is_internal(domain, domains) for domain in event.target_domains)
+    )
+
+
+def is_tianqing_level_one_flow_event(event: AuditEvent, internal_domains: set[str] | None = None) -> bool:
+    if event.topic not in {"mail_audit", "im_audit", "file_audit"}:
+        return False
+    if not event.file_names:
+        return False
+    if event.topic == "firewall":
+        return False
+    if is_file_rename_event(event):
+        return False
+    if is_internal_system_upload_event(event, internal_domains):
         return False
     return is_critical_design_event(event) or is_large_archive_event(event)
 
@@ -3086,7 +3313,39 @@ def path_match_key(value: Any) -> str:
 
 
 def has_file_assistant_target(event: AuditEvent) -> bool:
-    return any(str(value or "").strip().upper() == "FILEASSIST" for value in event.recipients + event.targets + event.target_domains)
+    if any(str(value or "").strip().upper() == "FILEASSIST" for value in event.recipients + event.targets + event.target_domains):
+        return True
+    return is_wecom_self_named_file_assistant_event(event)
+
+
+def is_wecom_self_named_file_assistant_event(event: AuditEvent) -> bool:
+    if not is_wecom_audit_event(event):
+        return False
+    sender_names = {
+        normalize_key(value)
+        for value in [event.resolved_person, event.person]
+        if str(value or "").strip()
+        and normalize_key(value) not in {"unknown", "lenovo", "administrator", "admin", "daqo"}
+    }
+    if not sender_names:
+        return False
+    values = wecom_event_recipient_values(event)
+    if not values:
+        return False
+    matched = False
+    for value in values:
+        nickname, account = split_im_target(value)
+        nickname_key = normalize_key(nickname)
+        account_key = normalize_key(account)
+        if not account_key or not re.fullmatch(r"[A-Za-z0-9_-]{5,64}", account_key):
+            continue
+        if account_key == normalize_key(event.account):
+            matched = True
+            continue
+        if nickname_key in sender_names and account_key not in WECOM_INTERNAL_RECIPIENT_ACCOUNTS:
+            matched = True
+            continue
+    return matched
 
 
 def is_app_send_without_recipient(event: AuditEvent) -> bool:
@@ -3250,33 +3509,6 @@ def normalize_org_fields(company: str, department: str) -> tuple[str, str]:
     return company, department
 
 
-def load_people_map(path: str | None) -> dict[tuple[str, str], PeopleEntry]:
-    if not path or not Path(path).exists():
-        return {}
-    mapping: dict[tuple[str, str], PeopleEntry] = {}
-    with open(path, newline="", encoding="utf-8-sig", errors="replace") as handle:
-        for row in csv.DictReader(handle):
-            match_type = normalize_key(row.get("match_type", ""))
-            match_value = normalize_key(row.get("match_value", ""))
-            person_name = (row.get("person_name") or "").strip()
-            if match_type.startswith("#"):
-                continue
-            if not match_type or not match_value or not person_name:
-                continue
-            mapping[(match_type, match_value)] = PeopleEntry(
-                match_type=match_type,
-                match_value=match_value,
-                person_name=person_name,
-                company=(row.get("company") or "").strip(),
-                department=(row.get("department") or "").strip(),
-                position=(row.get("position") or "").strip(),
-                sensitive_role=(row.get("sensitive_role") or "").strip(),
-                status=(row.get("status") or "").strip(),
-                note=(row.get("note") or "").strip(),
-            )
-    return mapping
-
-
 def load_dispositions(path: str | None) -> tuple[dict[str, DispositionEntry], dict[str, DispositionEntry]]:
     by_event_id: dict[str, DispositionEntry] = {}
     by_search_id: dict[str, DispositionEntry] = {}
@@ -3327,6 +3559,40 @@ def load_recipient_map(path: str | None) -> dict[tuple[str, str], RecipientEntry
                 note=(row.get("note") or "").strip(),
             )
     return mapping
+
+
+def manual_identity_recipient_display_map(
+    people_map: dict[tuple[str, str], PeopleEntry] | None,
+) -> dict[tuple[str, str], RecipientEntry]:
+    mapping: dict[tuple[str, str], RecipientEntry] = {}
+    for (match_type, match_value), entry in (people_map or {}).items():
+        if match_type != "im_account":
+            continue
+        account = im_recipient_account_token(match_value)
+        if not account:
+            continue
+        org_label = " / ".join([value for value in [entry.company, entry.department] if value])
+        recipient = RecipientEntry(
+            match_type="im_account",
+            match_value=account,
+            relation="external",
+            recipient_name=entry.person_name,
+            organization=org_label,
+            note="manual_identity_recipient_display",
+        )
+        mapping.setdefault(("im_account", normalize_key(account)), recipient)
+        mapping.setdefault(("recipient", normalize_key(account)), recipient)
+    return mapping
+
+
+def merge_manual_identity_recipient_display_map(
+    recipient_map: dict[tuple[str, str], RecipientEntry],
+    people_map: dict[tuple[str, str], PeopleEntry] | None,
+) -> None:
+    for key, entry in manual_identity_recipient_display_map(people_map).items():
+        existing = recipient_map.get(key)
+        if not existing or existing.note == "wecom_directory":
+            recipient_map[key] = entry
 
 
 def _wecom_directory_remote_script() -> str:
@@ -3679,9 +3945,10 @@ def resolve_terminal_wecom_identity(
     wecom_people_map: dict[tuple[str, str], PeopleEntry],
 ) -> tuple[PeopleEntry | None, str]:
     candidates = [
-        ("login_account", str(row.get("login_account") or "").strip()),
+        ("im_account", str(row.get("local_account") or "").strip()),
         ("im_nickname", str(row.get("local_nickname") or "").strip()),
         ("person", str(row.get("local_nickname") or "").strip()),
+        ("login_account", str(row.get("login_account") or "").strip()),
     ]
     for match_type, value in candidates:
         if not value:
@@ -3766,6 +4033,11 @@ def load_terminal_identity_history(
     wecom_people_map: dict[tuple[str, str], PeopleEntry],
 ) -> dict[tuple[str, str], list[TerminalIdentityObservation]]:
     if not wecom_people_map:
+        wecom_people_map = {}
+    people_map = getattr(args, "people_map_loaded", {}) or {}
+    identity_people_map = dict(wecom_people_map)
+    identity_people_map.update(people_map)
+    if not identity_people_map:
         return {}
     if getattr(args, "use_clickhouse", False):
         identity_start = start
@@ -3784,6 +4056,7 @@ def load_terminal_identity_history(
             f"FROM raw_syslog WHERE {where} AND topic = 'im_audit' "
             "AND lower(JSONExtractString(raw_json, 'process_name')) = 'wxwork.exe' "
             "AND (length(JSONExtractString(raw_json, 'client_login_account')) > 0 "
+            "OR length(JSONExtractString(raw_json, 'local_account')) > 0 "
             "OR length(JSONExtractString(raw_json, 'local_nickname')) > 0) "
             "FORMAT JSONEachRow"
         )
@@ -3792,7 +4065,7 @@ def load_terminal_identity_history(
             for line in clickhouse_query(args, query).splitlines()
             if line.strip()
         )
-        return build_terminal_identity_history_from_rows(rows, tz, wecom_people_map)
+        return build_terminal_identity_history_from_rows(rows, tz, identity_people_map)
 
     rows: list[dict[str, Any]] = []
     for record in records:
@@ -3810,7 +4083,7 @@ def load_terminal_identity_history(
                 "local_nickname": obj.get("local_nickname"),
             }
         )
-    return build_terminal_identity_history_from_rows(rows, tz, wecom_people_map)
+    return build_terminal_identity_history_from_rows(rows, tz, identity_people_map)
 
 
 def recipient_entry_for(
@@ -3825,9 +4098,14 @@ def recipient_entry_for(
 
 def display_recipient(raw: str, entry: RecipientEntry | None = None) -> str:
     if entry and entry.recipient_name:
+        account = im_recipient_account_token(raw) or im_recipient_account_token(entry.match_value)
         if entry.organization:
-            return f"{entry.recipient_name}({entry.organization})"
-        return entry.recipient_name
+            label = f"{entry.recipient_name}({entry.organization})"
+        else:
+            label = entry.recipient_name
+        if account and f"<{account}>" not in label:
+            return f"{label}<{account}>"
+        return label
     return raw
 
 
@@ -3868,16 +4146,46 @@ def looks_like_im_recipient_token(value: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9_-]{5,64}", text))
 
 
+def im_recipient_account_token(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    nickname, account = split_im_target(text)
+    account = str(account or "").strip()
+    if normalize_key(account) == normalize_key(nickname) and not looks_like_im_recipient_token(account):
+        return ""
+    if re.fullmatch(r"[A-Za-z0-9_-]{5,64}", account):
+        return normalize_key(account)
+    return ""
+
+
+def configure_wecom_internal_recipient_accounts(
+    recipient_map: dict[tuple[str, str], RecipientEntry] | None = None,
+    people_map: dict[tuple[str, str], PeopleEntry] | None = None,
+) -> None:
+    accounts: set[str] = set()
+    for (match_type, match_value), entry in (recipient_map or {}).items():
+        if match_type not in {"im_account", "recipient"}:
+            continue
+        if entry.relation != "internal":
+            continue
+        if entry.note != "wecom_observed_account":
+            continue
+        account = im_recipient_account_token(match_value)
+        if account:
+            accounts.add(account)
+    WECOM_INTERNAL_RECIPIENT_ACCOUNTS.clear()
+    WECOM_INTERNAL_RECIPIENT_ACCOUNTS.update(accounts)
+
+
 def is_wecom_process_name(process_name: Any) -> bool:
     return normalize_key(process_name) in WECOM_PROCESS_NAMES
 
 
 def recipient_entry_trusted_for_im(entry: RecipientEntry, trust_wecom_directory: bool) -> bool:
-    if trust_wecom_directory:
-        return True
-    if entry.note in {"wecom_directory", "wecom_observed_account"}:
-        return False
     if entry.relation == "internal":
+        return entry.note == "wecom_observed_account"
+    if entry.note == "wecom_directory":
         return False
     return True
 
@@ -3933,14 +4241,8 @@ def wecom_internal_entry_for_recipient_label(
 ) -> PeopleEntry | None:
     nickname, account = split_im_target(target)
     if account:
-        entry = active_wecom_people_entry(wecom_people_map.get(("im_account", normalize_key(account))))
-        if entry:
-            return entry
-        if normalize_key(account) != normalize_key(nickname):
-            return None
-    if not nickname:
         return None
-    return active_wecom_people_entry(wecom_people_map.get(("im_nickname", normalize_key(nickname))))
+    return None
 
 
 def wecom_internal_recipient_label(entry: PeopleEntry) -> str:
@@ -3968,7 +4270,34 @@ def manual_internal_recipient_label_for_target(
         candidates.append(("recipient", target))
     for match_type, value in candidates:
         entry = recipient_entry_for(match_type, value, recipient_map)
-        if entry and entry.relation == "internal":
+        if entry and entry.relation == "internal" and entry.note == "wecom_observed_account":
+            return display_recipient(target, entry)
+    return ""
+
+
+def display_recipient_label_for_target(
+    target: str,
+    recipient_map: dict[tuple[str, str], RecipientEntry],
+) -> str:
+    if not recipient_map:
+        return ""
+    nickname, account = split_im_target(target)
+    candidates: list[tuple[str, str]] = []
+    if account:
+        candidates.extend([("im_account", account), ("recipient", target), ("recipient", account)])
+        if normalize_key(account) == normalize_key(nickname):
+            candidates.append(("im_nickname", nickname))
+    else:
+        candidates.extend([("im_nickname", nickname), ("recipient", target)])
+    for match_type, value in candidates:
+        entry = recipient_entry_for(match_type, value, recipient_map)
+        if not entry:
+            continue
+        if entry.note == "wecom_directory":
+            continue
+        if entry.relation == "internal" and entry.note != "wecom_observed_account":
+            continue
+        if entry.recipient_name or entry.organization:
             return display_recipient(target, entry)
     return ""
 
@@ -4018,7 +4347,7 @@ def repair_wecom_internal_recipient_relations(
         raw_targets = [item for item in (event.recipients or event.targets) if str(item or "").strip()]
         if not raw_targets:
             continue
-        needs_repair = event.recipient_relation == "unknown" or (
+        needs_repair = event.recipient_relation in (EXTERNAL_RELATIONS | {"unknown"}) or (
             event.recipient_relation == "internal"
             and im_recipient_labels_need_wecom_repair(raw_targets)
         )
@@ -4081,6 +4410,10 @@ def repair_wecom_recipients_from_event_context(
             manual_label = manual_internal_recipient_label_for_target(raw_target, recipient_map)
             if manual_label:
                 internal_labels_by_account[normalized_account].append(manual_label)
+                continue
+            display_label = display_recipient_label_for_target(raw_target, recipient_map)
+            if display_label:
+                display_labels_by_account[normalized_account].append(display_label)
                 continue
             if readable_internal:
                 internal_labels_by_account[normalized_account].extend(readable_internal)
@@ -4394,10 +4727,12 @@ def enrich_events(
 ) -> None:
     terminal_identity_history = terminal_identity_history or {}
     recipient_map = recipient_map or {}
-    repair_wecom_internal_recipient_relations(events, wecom_people_map, recipient_map)
+    identity_people_map = dict(wecom_people_map)
+    identity_people_map.update(people_map)
+    repair_wecom_internal_recipient_relations(events, identity_people_map, recipient_map)
     enrich_file_audit_im_recipients(events)
-    repair_wecom_internal_recipient_relations(events, wecom_people_map, recipient_map)
-    repair_wecom_recipients_from_event_context(events, wecom_people_map, recipient_map)
+    repair_wecom_internal_recipient_relations(events, identity_people_map, recipient_map)
+    repair_wecom_recipients_from_event_context(events, identity_people_map, recipient_map)
     repair_wecom_self_recipient_relations(events)
     for event in events:
         normalize_untrusted_internal_im_relation(event)
@@ -4411,7 +4746,7 @@ def enrich_events(
             max_age_days=terminal_identity_max_age_days,
         )
         if not matched:
-            for mapping_name, mapping in [("wecom", wecom_people_map), ("people", people_map)]:
+            for mapping_name, mapping in [("manual", people_map), ("wecom", wecom_people_map)]:
                 for match_type, value in people_candidates(event):
                     entry = mapping.get((match_type, normalize_key(value)))
                     if not entry:
@@ -4436,6 +4771,33 @@ def enrich_events(
             event.disposition_result = disposition.conclusion or disposition.notes
         else:
             event.disposition_status = default_disposition(event)
+
+
+def refresh_event_priorities_after_recipient_repair(
+    events: list[AuditEvent],
+    internal_domains: set[str] | None = None,
+) -> None:
+    """Re-score events after late WeCom recipient repair changes flow relation."""
+    internal_domains = internal_domains or DEFAULT_INTERNAL_DOMAINS
+    for event in events:
+        normalize_untrusted_internal_im_relation(event)
+        normalize_unconfirmed_wecom_external_relation(event)
+        if is_trusted_internal_flow_event(event) and not is_peripheral_copy_event(event):
+            event.reasons = [
+                reason
+                for reason in event.reasons
+                if reason
+                not in {
+                    "IM收件人关系待判定",
+                    "企业微信接收方名称补全",
+                    "外部上传/下载地址",
+                    "外部站点上传",
+                    "外部收件域名",
+                }
+            ]
+            if (event.topic == "im_audit" or is_im_file_audit_event(event)) and "企业微信内部接收方" not in event.reasons:
+                event.reasons.append("企业微信内部接收方")
+        assign_event_priority(event, internal_domains)
 
 
 def apply_terminal_majority_identity(
@@ -4708,6 +5070,132 @@ def has_target_value(event: AuditEvent) -> bool:
     return bool(event.recipients or event.target_domains or event.targets)
 
 
+def is_wecom_audit_event(event: AuditEvent) -> bool:
+    if event.topic == "im_audit":
+        return is_wecom_process_name(event.process_name)
+    if is_im_file_audit_event(event):
+        return is_wecom_process_name(event.process_name)
+    return False
+
+
+def identity_binding_anchor_for_account(account: Any) -> str:
+    token = re.sub(r"[^a-z0-9_-]+", "-", normalize_key(account)).strip("-")
+    if not token:
+        return ""
+    return f"identity-account-{token}"
+
+
+def identity_binding_href_for_account(account: Any) -> str:
+    anchor = identity_binding_anchor_for_account(account)
+    if not anchor:
+        return ""
+    return f"/settings/identity-bindings#{anchor}"
+
+
+def recipient_org_parts(organization: str) -> tuple[str, str]:
+    text = str(organization or "").strip()
+    if not text:
+        return "", ""
+    parts = [part.strip() for part in re.split(r"\s*[/／]\s*", text, maxsplit=1) if part.strip()]
+    if len(parts) >= 2:
+        return parts[0], parts[1]
+    return text, ""
+
+
+def recipient_entry_for_wecom_account(
+    account: str,
+    recipient_map: dict[tuple[str, str], RecipientEntry] | None = None,
+) -> RecipientEntry | None:
+    token = normalize_key(account)
+    if not token:
+        return None
+    return (
+        (recipient_map or {}).get(("im_account", token))
+        or (recipient_map or {}).get(("recipient", token))
+    )
+
+
+def parse_wecom_recipient_identity(
+    value: Any,
+    recipient_map: dict[tuple[str, str], RecipientEntry] | None = None,
+) -> RecipientIdentity:
+    text = str(value or "").strip()
+    if not text:
+        return RecipientIdentity()
+    account = im_recipient_account_token(text)
+    nickname, parsed_account = split_im_target(text)
+    if not account and parsed_account and parsed_account != nickname and re.fullmatch(r"[A-Za-z0-9_-]{5,64}", parsed_account):
+        account = normalize_key(parsed_account)
+
+    entry = recipient_entry_for_wecom_account(account, recipient_map)
+    if entry and (entry.recipient_name or entry.organization):
+        company, department = recipient_org_parts(entry.organization)
+        return RecipientIdentity(
+            name=entry.recipient_name,
+            account=account,
+            company=company,
+            department=department,
+        )
+
+    return RecipientIdentity(account=account)
+
+
+def wecom_recipient_identities(
+    event: AuditEvent,
+    recipient_map: dict[tuple[str, str], RecipientEntry] | None = None,
+) -> list[RecipientIdentity]:
+    if not is_wecom_audit_event(event):
+        return []
+    identities: list[RecipientIdentity] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for value in wecom_event_recipient_values(event):
+        identity = parse_wecom_recipient_identity(value, recipient_map)
+        if not any([identity.name, identity.account, identity.company, identity.department]):
+            continue
+        key = (
+            normalize_key(identity.account),
+            normalize_key(identity.name),
+            normalize_key(identity.company),
+            normalize_key(identity.department),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        identities.append(identity)
+    return identities
+
+
+def first_wecom_recipient_account(event: AuditEvent) -> str:
+    for identity in wecom_recipient_identities(event):
+        if identity.account:
+            return identity.account
+    return ""
+
+
+def recipient_identity_field_cell(identities: list[RecipientIdentity], field_name: str, missing_label: str = "-") -> HtmlCell:
+    values = [str(getattr(identity, field_name) or "").strip() for identity in identities]
+    values = list(dict.fromkeys(value for value in values if value))
+    if not values:
+        return tooltip_cell(missing_label, "未通过企业微信数字账号匹配到已确认身份" if missing_label != "-" else "-")
+    display = "; ".join(values[:2])
+    if len(values) > 2:
+        display += f"; +{len(values) - 2}"
+    return tooltip_cell(display, "; ".join(values))
+
+
+def wecom_recipient_identity_cells(
+    event: AuditEvent,
+    recipient_map: dict[tuple[str, str], RecipientEntry] | None = None,
+) -> list[HtmlCell]:
+    identities = wecom_recipient_identities(event, recipient_map)
+    missing_label = "待补充" if is_wecom_audit_event(event) and has_target_value(event) else "-"
+    return [
+        recipient_identity_field_cell(identities, "company", missing_label),
+        recipient_identity_field_cell(identities, "department", missing_label),
+        recipient_identity_field_cell(identities, "name", missing_label),
+    ]
+
+
 def is_confirmed_external_event(event: AuditEvent) -> bool:
     if event.recipient_relation in EXTERNAL_RELATIONS:
         return True
@@ -4739,6 +5227,11 @@ def egress_judgement(event: AuditEvent) -> tuple[str, str]:
 
 def egress_judgement_cell(event: AuditEvent) -> HtmlCell:
     label, detail = egress_judgement(event)
+    account = first_wecom_recipient_account(event)
+    href = identity_binding_href_for_account(account)
+    if href:
+        title = f"{detail}；点击跳转到该企业微信接收方的身份绑定位置。"
+        return HtmlCell(f'<a class="table-link" href="{esc(href)}">{esc(label)}</a>', title, raw=True)
     return tooltip_cell(label, detail)
 
 
@@ -5991,6 +6484,7 @@ def common_event_detail_rows(
     keyword: str | None = None,
     channel_label: str = "通道",
     asset_by_terminal: dict[tuple[str, str], AssetSnapshot] | None = None,
+    recipient_map: dict[tuple[str, str], RecipientEntry] | None = None,
 ) -> tuple[list[str], list[list[Any]], set[int]]:
     rows: list[list[Any]] = []
     for event in detail_events:
@@ -6000,13 +6494,14 @@ def common_event_detail_rows(
                 event_channel_label(event) if channel_label != "IM渠道" else im_channel_label(event),
                 egress_judgement_cell(event),
                 tooltip_cell(summarize_targets(event), full_targets(event)),
+                *wecom_recipient_identity_cells(event, recipient_map),
                 detail_event_names(event, keyword=keyword),
                 event_object_cell(event),
                 size_label(event.file_size),
             ]
         )
     return (
-        ["时间", "公司", "部门", "人员/账号", "IP地址", "MAC地址", channel_label, "外发判定", "接收方/目标", "文件", "资料类型", "大小"],
+        ["时间", "公司", "部门", "人员/账号", "IP地址", "MAC地址", channel_label, "外发判定", "接收方/目标", "接收方公司", "接收方部门", "接收方姓名", "文件", "资料类型", "大小"],
         rows,
         set(),
     )
@@ -6044,6 +6539,7 @@ def event_detail_table_html(
     keyword: str | None = None,
     page_size: int = 20,
     asset_by_terminal: dict[tuple[str, str], AssetSnapshot] | None = None,
+    recipient_map: dict[tuple[str, str], RecipientEntry] | None = None,
 ) -> str:
     mode = event_detail_mode(detail_events)
     if mode == "mail":
@@ -6055,12 +6551,12 @@ def event_detail_table_html(
             page_size=page_size,
         )
     if mode == "im":
-        headers, rows, raw_columns = common_event_detail_rows(detail_events, tz, keyword=keyword, channel_label="IM渠道", asset_by_terminal=asset_by_terminal)
+        headers, rows, raw_columns = common_event_detail_rows(detail_events, tz, keyword=keyword, channel_label="IM渠道", asset_by_terminal=asset_by_terminal, recipient_map=recipient_map)
         return html_table(headers, rows, "events", raw_columns=raw_columns, page_size=page_size)
     if mode == "peripheral":
         headers, rows, raw_columns = peripheral_event_detail_rows(detail_events, tz, keyword=keyword, asset_by_terminal=asset_by_terminal)
         return html_table(headers, rows, "events", raw_columns=raw_columns, page_size=page_size)
-    headers, rows, raw_columns = common_event_detail_rows(detail_events, tz, keyword=keyword, asset_by_terminal=asset_by_terminal)
+    headers, rows, raw_columns = common_event_detail_rows(detail_events, tz, keyword=keyword, asset_by_terminal=asset_by_terminal, recipient_map=recipient_map)
     return html_table(headers, rows, "events", raw_columns=raw_columns, page_size=page_size)
 
 
@@ -6098,7 +6594,7 @@ def build_event_detail_page(
         </div>
         <span class="section-count">共 {len(ordered)} 条</span>
       </div>
-      {event_detail_table_html(ordered, tz, keyword=keyword, page_size=20, asset_by_terminal=getattr(args, "asset_by_terminal", {}))}
+      {event_detail_table_html(ordered, tz, keyword=keyword, page_size=20, asset_by_terminal=getattr(args, "asset_by_terminal", {}), recipient_map=getattr(args, "recipient_map_loaded", {}) or {})}
     </section>
 """
     return html_detail_document(title, body)
@@ -6140,7 +6636,12 @@ def build_false_positive_detail_page(
         detail_events,
         key=lambda ev: (false_positive_reasons.get(ev.event_id, ""), ev.ts or datetime.min.replace(tzinfo=timezone.utc)),
     )
-    base_headers, base_rows, _ = common_event_detail_rows(ordered, tz, asset_by_terminal=getattr(args, "asset_by_terminal", {}))
+    base_headers, base_rows, _ = common_event_detail_rows(
+        ordered,
+        tz,
+        asset_by_terminal=getattr(args, "asset_by_terminal", {}),
+        recipient_map=getattr(args, "recipient_map_loaded", {}) or {},
+    )
     rows = [[tooltip_cell(false_positive_reasons.get(event.event_id, "疑似误判"), false_positive_reasons.get(event.event_id, "疑似误判")), *row] for event, row in zip(ordered, base_rows)]
     reason_counts = Counter(false_positive_reasons.get(event.event_id, "疑似误判") for event in ordered)
     metrics = detail_metric_chips(
@@ -7637,7 +8138,7 @@ def enrich_forbidden_process_findings(
             finding.resolved_department = observation.department
             finding.mapping_source = observation.mapping_source
             continue
-        for mapping_name, mapping in [("wecom", wecom_people_map), ("people", people_map)]:
+        for mapping_name, mapping in [("manual", people_map), ("wecom", wecom_people_map)]:
             matched = False
             for match_type, value in forbidden_people_candidates(finding):
                 entry = mapping.get((match_type, normalize_key(value)))
@@ -9050,7 +9551,7 @@ def build_organization_profile_page(
         </div>
         <span class="section-count">共 {len(finding.events)} 条</span>
       </div>
-      {event_detail_table_html(finding.events, tz, page_size=20, asset_by_terminal=getattr(args, "asset_by_terminal", {}))}
+      {event_detail_table_html(finding.events, tz, page_size=20, asset_by_terminal=getattr(args, "asset_by_terminal", {}), recipient_map=getattr(args, "recipient_map_loaded", {}) or {})}
     </section>
 """
     return html_detail_document(f"{finding.label} 风险画像", body)
@@ -9074,10 +9575,21 @@ def build_html_report(
     bind_report_submodule_dependencies()
     debug_timing(f"build_html_report start audit_events={len(events)} records={len(records)}")
     audit_events = events
-    procurement_muted_events = [event for event in audit_events if is_normal_procurement_inquiry_event(event)]
+    procurement_muted_candidates = [event for event in audit_events if is_normal_procurement_inquiry_event(event)]
     focus_candidates_for_noise = [event for event in audit_events if is_leadership_focus_event(event, internal_domains)]
     events, false_positive_reasons = report_focus_events(audit_events, internal_domains)
+    procurement_false_positive_reasons = report_false_positive_map(procurement_muted_candidates, audit_events)
+    false_positive_reasons.update(procurement_false_positive_reasons)
+    procurement_muted_events = [
+        event for event in procurement_muted_candidates if event.event_id not in procurement_false_positive_reasons
+    ]
     false_positive_events = [event for event in focus_candidates_for_noise if event.event_id in false_positive_reasons]
+    seen_false_positive_ids = {event.event_id for event in false_positive_events}
+    false_positive_events.extend(
+        event
+        for event in procurement_muted_candidates
+        if event.event_id in procurement_false_positive_reasons and event.event_id not in seen_false_positive_ids
+    )
     debug_timing(
         f"leadership_filter focus_events={len(events)} false_positive={len(false_positive_events)} procurement_muted={len(procurement_muted_events)}"
     )
@@ -9255,14 +9767,18 @@ def build_html_report(
         build_trend_summary=build_trend_summary,
         trend_comparison_html=trend_comparison_html,
         build_rule_risk_overview_html=build_rule_risk_overview_html,
+        critical_design_labels_for_event=critical_design_labels_for_event,
         is_large_archive_event=is_large_archive_event,
         is_tianqing_level_one_event=lambda event: is_tianqing_level_one_event(event, internal_domains),
+        is_tianqing_level_one_flow_event=lambda event: is_tianqing_level_one_flow_event(event, internal_domains),
         debug_timing=debug_timing,
     )
+    level_one_flow_events = [event for event in audit_events if is_tianqing_level_one_flow_event(event, internal_domains)]
     tianqing_module_result = build_tianqing_outbound_module_result(
         args,
         events,
         procurement_muted_events,
+        level_one_flow_events,
         false_positive_events,
         false_positive_reasons,
         behavior_rows,
@@ -9292,8 +9808,8 @@ def build_html_report(
         {"enabled": False},
     )
     home_focus_text = (
-        "一级风险定义：标准图纸解密；天擎标准图纸外发/拷贝；"
-        "天擎大于100MB压缩包外发/上传/外设拷贝；PLM技术、研发、工艺账号池外登录。"
+        "一级风险定义：标准图纸解密；天擎标准图纸流转；"
+        "技术、工艺、研发部门大于100MB压缩包流转（排除内部系统上传）；PLM技术、研发、工艺账号池外登录。"
     )
     home_evidence_text = "一级风险进入顶部汇总管理结论，矩阵、趋势和明细用于定位组织、终端与证据链。"
     home_modules = [
@@ -12119,7 +12635,7 @@ def build_report(
             "- 邮件外发优先看发件箱类型、外部域名、个人邮箱、压缩包、图纸、报价/合同/财务关键词；非 daqo.com 发件箱单独重点复核。",
             "- IM/文件审计优先验证 `download_file_key` 是否能在天擎 Web/API 回查到文件或附件。",
             "- 将内部 IM 昵称/账号维护到 `recipient_mapping.csv` 并标记 `internal` 后，内部发送会自动从主队列排除。",
-            "- 公司、部门以企业微信通讯录缓存或显式人员映射为准并分列展示；未匹配时不使用天擎用户分组兜底。",
+            "- 公司、部门以企业微信通讯录缓存或数据库人工身份绑定为准并分列展示；未匹配时不使用天擎用户分组兜底。",
         ]
     )
 
@@ -12147,7 +12663,6 @@ def main() -> int:
     parser.add_argument("--include-unknown-im", action="store_true", default=True, help="Keep IM attachment sends whose recipient is not yet classified.")
     parser.add_argument("--exclude-unknown-im", action="store_false", dest="include_unknown_im", help="Drop IM attachment sends unless the recipient map marks the recipient external/partner/customer/supplier.")
     parser.add_argument("--include-untargeted-file", action="store_true", help="Keep sensitive file_audit events even when no external upload/download target is present.")
-    parser.add_argument("--people-map", default=DEFAULT_PEOPLE_MAP, help="CSV mapping identities to real people.")
     parser.add_argument("--recipient-map", default=DEFAULT_RECIPIENT_MAP, help="CSV mapping recipients to internal/external relation.")
     parser.add_argument("--sensitive-keywords-file", default=DEFAULT_SENSITIVE_KEYWORDS_FILE, help="JSON rule file defining all sensitive filename keywords. No built-in sensitive words are used.")
     parser.add_argument("--audit-policy-file", default=DEFAULT_AUDIT_POLICY_FILE, help="JSON policy file defining controlled 2D/3D design suffixes and report policy knobs.")
@@ -12208,7 +12723,7 @@ def main() -> int:
         "loaded": len(exclusion_rules),
         "enabled": sum(1 for rule in exclusion_rules if rule.enabled),
     }
-    people_map = load_people_map(args.people_map)
+    people_map = load_manual_identity_bindings(args)
     if args.refresh_wecom_directory_cache_only:
         args.wecom_directory_refresh = True
     wecom_items, wecom_meta = load_wecom_directory_items(args)
@@ -12228,6 +12743,8 @@ def main() -> int:
     recipient_map = build_wecom_recipient_map(wecom_items)
     recipient_map.update(load_observed_wecom_account_recipient_map(args, wecom_people_map))
     recipient_map.update(manual_recipient_map)
+    merge_manual_identity_recipient_display_map(recipient_map, people_map)
+    configure_wecom_internal_recipient_accounts(recipient_map, people_map)
     args.people_map_loaded = people_map
     args.wecom_people_map_loaded = wecom_people_map
     args.recipient_map_loaded = recipient_map
@@ -12275,12 +12792,13 @@ def main() -> int:
         wecom_people_map,
         disposition_by_event_id,
         disposition_by_search_id,
-        recipient_map=manual_recipient_map,
+        recipient_map=recipient_map,
         terminal_identity_history=terminal_identity_history,
         terminal_identity_max_age_days=args.terminal_identity_max_age_days,
     )
     debug_timing("enrich complete")
     apply_terminal_majority_identity(events, terminal_identity_history)
+    refresh_event_priorities_after_recipient_repair(events, internal_domains)
     debug_timing("terminal majority identity complete")
 
     output_path = Path(args.output) if args.output else None

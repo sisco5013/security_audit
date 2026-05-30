@@ -232,9 +232,11 @@ def prepare_trend_source_events(
         wecom_people_map,
         {},
         {},
+        recipient_map=getattr(args, "recipient_map_loaded", {}) or {},
         terminal_identity_history=terminal_identity_history,
         terminal_identity_max_age_days=getattr(args, "terminal_identity_max_age_days", 30),
     )
+    refresh_event_priorities_after_recipient_repair(events, internal_domains)
     return events
 
 
@@ -251,6 +253,28 @@ def clickhouse_matrix_classification_exprs(internal_domains: set[str] | None = N
     external_relations = clickhouse_array_literal(sorted(EXTERNAL_RELATIONS))
     external_reasons = clickhouse_array_literal(["个人邮箱域名", "网盘/高风险外联目标", "外部收件域名", "外部上传/下载地址"])
     upload_reasons = clickhouse_array_literal(["外部站点上传", "外部上传/下载地址"])
+    wecom_internal_accounts = [
+        str(account or "").lower().strip()
+        for account in globals().get("WECOM_INTERNAL_RECIPIENT_ACCOUNTS", set())
+        if str(account or "").strip()
+    ]
+    wecom_account_expr = (
+        "lowerUTF8(multiIf("
+        "match(x, '<[^<>]+>\\\\s*$'), extract(x, '<([^<>]+)>\\\\s*$'), "
+        "match(x, '[（(][A-Za-z0-9_-]{5,64}[）)]\\\\s*$'), extract(x, '[（(]([A-Za-z0-9_-]{5,64})[）)]\\\\s*$'), "
+        "match(x, '^[A-Za-z0-9_-]{5,64}$'), x, "
+        "''"
+        "))"
+    )
+    wecom_sql_internal_expr = "0"
+    if wecom_internal_accounts:
+        account_array = clickhouse_array_literal(sorted(set(wecom_internal_accounts)))
+        wecom_sql_internal_expr = (
+            "topic IN ('im_audit','file_audit') "
+            "AND lowerUTF8(process_name) IN ('wxwork.exe','wxwork','wecom.exe','wecom') "
+            "AND length(recipients) > 0 "
+            f"AND arrayAll(x -> ({wecom_account_expr} != '' AND has({account_array}, {wecom_account_expr})), recipients)"
+        )
     internal_domain_array = clickhouse_array_literal(sorted(internal_domains))
     upload_noise_hints = clickhouse_array_literal(sorted(UPLOAD_NOISE_HINTS))
     target_domains_lower = "arrayMap(x -> lowerUTF8(x), target_domains)"
@@ -291,12 +315,15 @@ def clickhouse_matrix_classification_exprs(internal_domains: set[str] | None = N
     focus_expr = (
         "("
         "NOT ("
+        "("
         "recipient_relation = 'internal' "
         "AND ("
         "topic = 'mail_audit' "
         "OR (topic = 'im_audit' AND lowerUTF8(process_name) IN ('wxwork.exe','wxwork','wecom.exe','wecom')) "
         "OR (topic = 'file_audit' AND channel = '应用发送/传输' AND lowerUTF8(process_name) IN ('wxwork.exe','wxwork','wecom.exe','wecom'))"
         ")"
+        ") "
+        f"OR ({wecom_sql_internal_expr})"
         ") "
         "AND recipient_relation != 'group' "
         "AND NOT has(reasons, '企业微信群忽略') "

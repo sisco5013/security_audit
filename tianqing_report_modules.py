@@ -92,8 +92,10 @@ class TianqingOutboundModuleBuilders:
     build_trend_summary: Callable[..., Any]
     trend_comparison_html: Callable[..., str]
     build_rule_risk_overview_html: Callable[..., str]
+    critical_design_labels_for_event: Callable[[Any], Iterable[str]] = lambda _event: []
     is_large_archive_event: Callable[[Any], bool] = lambda _event: False
     is_tianqing_level_one_event: Callable[[Any], bool] = lambda _event: False
+    is_tianqing_level_one_flow_event: Callable[[Any], bool] = lambda _event: False
     debug_timing: Callable[[str], None] = lambda _message: None
 
 
@@ -170,6 +172,79 @@ def _tianqing_level_one_total_from_metrics(metrics: dict[str, Any] | None) -> in
     return _standard_design_total_from_metrics(metrics) + _metric_int(metrics, "critical_large_archive")
 
 
+def _level_one_raw_total_from_metrics(metrics: dict[str, Any] | None) -> int:
+    total = _metric_int(metrics, "level_one_raw_events")
+    if total:
+        return total
+    raw_parts = (
+        _metric_int(metrics, "critical_structure_raw_events")
+        + _metric_int(metrics, "critical_electrical_raw_events")
+        + _metric_int(metrics, "critical_large_archive_raw_events")
+    )
+    return raw_parts or _tianqing_level_one_total_from_metrics(metrics)
+
+
+def _event_attr_values(event: Any, attr: str) -> list[str]:
+    value = getattr(event, attr, None)
+    if isinstance(value, (list, tuple, set)):
+        return sorted(str(item).strip() for item in value if str(item).strip())
+    text = str(value or "").strip()
+    return [text] if text else []
+
+
+def _level_one_event_label(event: Any, builders: TianqingOutboundModuleBuilders) -> str:
+    labels = set(builders.critical_design_labels_for_event(event))
+    if "结构标准方案" in labels:
+        return "结构标准方案"
+    if "电气标准方案" in labels:
+        return "电气标准方案"
+    if builders.is_large_archive_event(event):
+        return "压缩包"
+    return ""
+
+
+def _level_one_event_dedup_key(event: Any, label: str) -> tuple[str, str, str, str, str, str]:
+    ts = getattr(event, "ts", None)
+    try:
+        minute = ts.strftime("%Y-%m-%d %H:%M") if ts else ""
+    except Exception:
+        minute = str(ts or "")
+    files = ";".join(_event_attr_values(event, "file_names"))
+    targets = ";".join(
+        sorted(
+            set(
+                _event_attr_values(event, "recipients")
+                + _event_attr_values(event, "targets")
+                + _event_attr_values(event, "target_domains")
+            )
+        )
+    )
+    return (
+        minute,
+        str(getattr(event, "client_name", "") or ""),
+        str(getattr(event, "client_ip", "") or ""),
+        files,
+        targets,
+        label,
+    )
+
+
+def _level_one_flow_metric_counts(
+    events: Iterable[Any],
+    builders: TianqingOutboundModuleBuilders,
+) -> tuple[Counter, Counter]:
+    raw_counts: Counter = Counter()
+    dedup_keys: dict[str, set[tuple[str, str, str, str, str, str]]] = {}
+    for event in events:
+        label = _level_one_event_label(event, builders)
+        if not label:
+            continue
+        raw_counts[label] += 1
+        dedup_keys.setdefault(label, set()).add(_level_one_event_dedup_key(event, label))
+    dedup_counts = Counter({label: len(keys) for label, keys in dedup_keys.items()})
+    return raw_counts, dedup_counts
+
+
 def build_global_management_summary_html(
     decrypt_metrics: dict[str, Any] | None,
     tianqing_metrics: dict[str, Any] | None,
@@ -216,7 +291,7 @@ def build_global_management_summary_html(
         ),
         row_html(
             "天擎外发审计",
-            f"一级风险对象：标准图纸外发/拷贝 {tianqing_standard} 条（结构 {tianqing_structure} 条、电气 {tianqing_electrical} 条），大于100MB压缩包 {tianqing_large_archive} 条。",
+            f"一级风险对象：标准图纸流转 {tianqing_standard} 笔（结构 {tianqing_structure} 笔、电气 {tianqing_electrical} 笔），技术/工艺/研发大于100MB压缩包流转 {tianqing_large_archive} 笔。",
             "#tianqing-audit",
             "tianqing",
         ),
@@ -228,7 +303,7 @@ def build_global_management_summary_html(
         ),
         row_html(
             "风险终端复核记录",
-            f"本周期人工复核记录 {review_total} 条，待复核 {review_pending} 条，已复核 {review_done} 条。",
+            f"本周期人工复核记录 {review_total} 条，待复核 {review_pending} 条，已复核 {review_done} 条；该行展示复核闭环状态，不代表三大模块一级风险总数。",
             "/terminal-check",
             "review",
         ),
@@ -314,6 +389,7 @@ def build_tianqing_outbound_module_result(
     args: Any,
     events: list[Any],
     procurement_muted_events: list[Any],
+    level_one_flow_events: list[Any] | None,
     false_positive_events: list[Any],
     false_positive_reasons: dict[str, str],
     behavior_rows: dict[str, list[list[Any]]],
@@ -416,6 +492,7 @@ def build_tianqing_outbound_module_result(
         organization_result.organization_analysis,
         organization_result.org_links,
         object_trend_links,
+        level_one_flow_events=level_one_flow_events,
     )
     home_module = build_tianqing_outbound_home_module(
         risk_overview_html,
@@ -425,16 +502,19 @@ def build_tianqing_outbound_module_result(
         channel_matrix_result.block_html,
         organization_result.terminal_risk_block,
     )
-    critical_design_count = sum(
-        int(channel_matrix_result.object_totals.get(label, 0) or 0)
-        for label in ("结构标准方案", "电气标准方案")
-    )
-    critical_large_archive_count = sum(
-        1
-        for event in events
-        if builders.is_tianqing_level_one_event(event) and builders.is_large_archive_event(event)
-    )
-    tianqing_level_one_count = sum(1 for event in events if builders.is_tianqing_level_one_event(event))
+    level_one_metric_events = list(level_one_flow_events or [])
+    if not level_one_metric_events:
+        level_one_metric_events = [event for event in events if builders.is_tianqing_level_one_flow_event(event)]
+    raw_level_one_counts, dedup_level_one_counts = _level_one_flow_metric_counts(level_one_metric_events, builders)
+    critical_structure_count = int(dedup_level_one_counts.get("结构标准方案", 0) or 0)
+    critical_electrical_count = int(dedup_level_one_counts.get("电气标准方案", 0) or 0)
+    critical_design_count = critical_structure_count + critical_electrical_count
+    critical_large_archive_count = int(dedup_level_one_counts.get("压缩包", 0) or 0)
+    tianqing_level_one_count = sum(dedup_level_one_counts.values())
+    raw_structure_count = int(raw_level_one_counts.get("结构标准方案", 0) or 0)
+    raw_electrical_count = int(raw_level_one_counts.get("电气标准方案", 0) or 0)
+    raw_large_archive_count = int(raw_level_one_counts.get("压缩包", 0) or 0)
+    raw_level_one_count = sum(raw_level_one_counts.values())
     return ReportModuleResult(
         home_module=home_module,
         sidecar_pages=sidecar_pages,
@@ -442,10 +522,15 @@ def build_tianqing_outbound_module_result(
             "events": len(events),
             "matrix_events": sum(channel_matrix_result.row_totals.values()),
             "critical_design": critical_design_count,
-            "critical_structure": int(channel_matrix_result.object_totals.get("结构标准方案", 0) or 0),
-            "critical_electrical": int(channel_matrix_result.object_totals.get("电气标准方案", 0) or 0),
+            "critical_structure": critical_structure_count,
+            "critical_electrical": critical_electrical_count,
             "critical_large_archive": critical_large_archive_count,
             "level_one": tianqing_level_one_count,
+            "critical_design_raw_events": raw_structure_count + raw_electrical_count,
+            "critical_structure_raw_events": raw_structure_count,
+            "critical_electrical_raw_events": raw_electrical_count,
+            "critical_large_archive_raw_events": raw_large_archive_count,
+            "level_one_raw_events": raw_level_one_count,
             "top_channel": channel_matrix_result.row_totals.most_common(1)[0][0] if channel_matrix_result.row_totals else "",
             "top_channel_count": channel_matrix_result.row_totals.most_common(1)[0][1] if channel_matrix_result.row_totals else 0,
             "channel_pages": len(channel_matrix_result.sidecar_pages),

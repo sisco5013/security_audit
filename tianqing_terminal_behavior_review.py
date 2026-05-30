@@ -82,13 +82,44 @@ DEFAULT_REVIEW_POLICY: dict[str, Any] = {
     "baseline_days": 90,
     "baseline_multiplier": 5,
     "baseline_min_events": 30,
-    "other_drawing_min_events": 100,
-    "sensitive_name_min_events": 1000,
     "candidate_limit": 300,
 }
 DEFAULT_THREE_D_EXTS = {"prt", "asm", "sldasm", "sldprt", "step"}
 DEFAULT_TWO_D_EXTS = {"dwg"}
 DEFAULT_ARCHIVE_EXTS = {"zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz", "zst", "zipx", "001"}
+REVIEW_SELECT_FIELDS = (
+    ("review_id", "string"),
+    ("candidate_id", "string"),
+    ("event_date", "string"),
+    ("event_start", "string"),
+    ("event_end", "string"),
+    ("anomaly_type", "string"),
+    ("status", "string"),
+    ("include_in_report", "int"),
+    ("reviewer_userid", "string"),
+    ("reviewer_name", "string"),
+    ("review_time", "string"),
+    ("company", "string"),
+    ("department", "string"),
+    ("person", "string"),
+    ("client_name", "string"),
+    ("client_ip", "string"),
+    ("client_mac", "string"),
+    ("event_count", "int"),
+    ("structure_count", "int"),
+    ("electrical_count", "int"),
+    ("three_d_count", "int"),
+    ("dwg_count", "int"),
+    ("archive_count", "int"),
+    ("channels", "array"),
+    ("targets", "array"),
+    ("sample_files", "array"),
+    ("event_ids", "array"),
+    ("conclusion", "string"),
+    ("notes", "string"),
+    ("owner_department", "string"),
+    ("due_date", "nullable_string"),
+)
 
 
 @dataclass
@@ -209,6 +240,36 @@ def clickhouse_query_body(config: Any, query: str) -> str:
     request = urllib.request.Request(url, data=query.encode("utf-8"), headers=clickhouse_headers(config), method="POST")
     with urllib.request.urlopen(request, timeout=int(getattr(config, "clickhouse_timeout", 120) or 120)) as response:
         return response.read().decode("utf-8", errors="replace")
+
+
+def ch_b64(expr: str) -> str:
+    return f"base64Encode(toString({expr}))"
+
+
+def decode_b64_text(value: str) -> str:
+    if not value:
+        return ""
+    import base64
+
+    return base64.b64decode(value, validate=True).decode("utf-8", errors="replace")
+
+
+def decode_b64_json_array(value: str) -> list[str]:
+    text = decode_b64_text(value)
+    if not text:
+        return []
+    parsed = json.loads(text)
+    return [str(item) for item in parsed or []]
+
+
+def clickhouse_audit_event_rows(config: Any, where_sql: str, tz: Any) -> list[Any]:
+    query = f"""
+SELECT {report_gen.clickhouse_audit_event_safe_select()}
+FROM audit_events
+WHERE {where_sql}
+FORMAT TabSeparated
+"""
+    return report_gen.parse_clickhouse_audit_event_tsv(clickhouse_query(config, query), tz)
 
 
 def ensure_review_table(config: Any) -> None:
@@ -343,10 +404,6 @@ def candidate_scope_event(event: dict[str, Any]) -> bool:
         return False
     if channel == "文件重命名" or "文件重命名" in reasons:
         return False
-    if str(event.get("recipient_relation") or "").strip().lower() == "group" or "企业微信群忽略" in reasons:
-        return False
-    if trusted_internal_row(event):
-        return False
     return True
 
 
@@ -398,7 +455,7 @@ def event_matrix_bucket(event: dict[str, Any], three_d: set[str], two_d: set[str
 
 def significant_event(event: dict[str, Any], three_d: set[str], two_d: set[str], archives: set[str], patterns: list[tuple[str, re.Pattern[str]]]) -> bool:
     counts = event_object_counts(event, three_d, two_d, archives, patterns)
-    return bool(counts["structure"] or counts["electrical"] or counts["three_d"] or counts["dwg"] or counts["archive"] or counts["sensitive"])
+    return bool(counts["structure"] or counts["electrical"] or counts["archive"])
 
 
 def primary_risk_event(event: dict[str, Any], three_d: set[str], two_d: set[str], archives: set[str], patterns: list[tuple[str, re.Pattern[str]]]) -> bool:
@@ -410,19 +467,17 @@ def standard_drawing_event(event: dict[str, Any], three_d: set[str], two_d: set[
     return event_matrix_bucket(event, three_d, two_d, archives, patterns) in report_gen.CRITICAL_DESIGN_LABELS
 
 
-def ordinary_drawing_event(event: dict[str, Any], three_d: set[str], two_d: set[str], archives: set[str], patterns: list[tuple[str, re.Pattern[str]]]) -> bool:
-    if standard_drawing_event(event, three_d, two_d, archives, patterns):
-        return False
-    bucket = event_matrix_bucket(event, three_d, two_d, archives, patterns)
-    return bucket in {"三维模型", "DWG二维图纸"}
-
-
-def sensitive_name_event(event: dict[str, Any], three_d: set[str], two_d: set[str], archives: set[str], patterns: list[tuple[str, re.Pattern[str]]]) -> bool:
-    return event_matrix_bucket(event, three_d, two_d, archives, patterns) == "敏感名称"
+def large_archive_scope_event(event: dict[str, Any]) -> bool:
+    return any(
+        report_gen.department_matches_large_archive_scope(value)
+        for value in (event.get("department"), event.get("resolved_department"), event.get("org_path"))
+    )
 
 
 def large_archive_event(event: dict[str, Any], three_d: set[str], two_d: set[str], archives: set[str], patterns: list[tuple[str, re.Pattern[str]]]) -> bool:
     if event_matrix_bucket(event, three_d, two_d, archives, patterns) != "压缩包":
+        return False
+    if not large_archive_scope_event(event):
         return False
     try:
         file_size = int(event.get("file_size") or 0)
@@ -443,7 +498,6 @@ def report_arg_namespace(config: Any) -> SimpleNamespace:
         audit_policy_file=str(getattr(config, "policy_file", app_dir / "audit_policy.json")),
         sensitive_keywords_file=str(getattr(config, "keywords_file", app_dir / "sensitive_keywords.json")),
         exclusion_file=str(getattr(config, "exclusions_file", app_dir / "audit_exclusions.json")),
-        people_map=str(app_dir / "people_mapping.csv"),
         recipient_map=str(app_dir / "recipient_mapping.csv"),
         disable_wecom_directory=False,
         wecom_directory_host=getattr(config, "ai_host", ""),
@@ -477,13 +531,15 @@ def configure_report_policy_context(config: Any, policy_doc: dict[str, Any]) -> 
         report_gen.configure_sensitive_keyword_rules([])
     internal_domains = set(report_gen.DEFAULT_INTERNAL_DOMAINS)
     internal_domains.update(report_gen.policy_internal_domains(policy_doc if isinstance(policy_doc, dict) else {}))
-    people_map = report_gen.load_people_map(args.people_map)
+    people_map = report_gen.load_manual_identity_bindings(args)
     manual_recipient_map = report_gen.load_recipient_map(args.recipient_map)
     wecom_items = load_cached_wecom_items(config)
     wecom_people_map = report_gen.build_wecom_people_map(wecom_items)
     recipient_map = report_gen.build_wecom_recipient_map(wecom_items)
     recipient_map.update(report_gen.load_observed_wecom_account_recipient_map(args, wecom_people_map))
     recipient_map.update(manual_recipient_map)
+    report_gen.merge_manual_identity_recipient_display_map(recipient_map, people_map)
+    report_gen.configure_wecom_internal_recipient_accounts(recipient_map, people_map)
     args.people_map_loaded = people_map
     args.recipient_map_loaded = recipient_map
     args.wecom_people_map_loaded = wecom_people_map
@@ -531,7 +587,10 @@ def limited_terminal_identity_history(
     end: datetime,
 ) -> dict[tuple[str, str], list[Any]]:
     wecom_people_map = getattr(args, "wecom_people_map_loaded", {}) or {}
-    if not wecom_people_map or not events:
+    people_map = getattr(args, "people_map_loaded", {}) or {}
+    identity_people_map = dict(wecom_people_map)
+    identity_people_map.update(people_map)
+    if not identity_people_map or not events:
         return {}
     max_age_days = int(getattr(args, "terminal_identity_max_age_days", 30) or 0)
     identity_start = start - timedelta(days=max_age_days) if max_age_days > 0 else start
@@ -545,24 +604,46 @@ def limited_terminal_identity_history(
     if not filters:
         return {}
     query = f"""
-SELECT ts,
-  JSONExtractString(raw_json, 'process_name') AS process_name,
-  JSONExtractString(raw_json, 'client_name') AS client_name,
-  JSONExtractString(raw_json, 'client_ip') AS client_ip,
-  JSONExtractString(raw_json, 'client_login_account') AS login_account,
-  JSONExtractString(raw_json, 'local_account') AS local_account,
-  JSONExtractString(raw_json, 'local_nickname') AS local_nickname
+SELECT {ch_b64('ts')},
+  {ch_b64("JSONExtractString(raw_json, 'process_name')")},
+  {ch_b64("JSONExtractString(raw_json, 'client_name')")},
+  {ch_b64("JSONExtractString(raw_json, 'client_ip')")},
+  {ch_b64("JSONExtractString(raw_json, 'client_login_account')")},
+  {ch_b64("JSONExtractString(raw_json, 'local_account')")},
+  {ch_b64("JSONExtractString(raw_json, 'local_nickname')")}
 FROM raw_syslog
 WHERE ts >= parseDateTime64BestEffort({ch_quote(identity_start.isoformat())}, 3)
   AND ts < parseDateTime64BestEffort({ch_quote(end.isoformat())}, 3)
   AND topic = 'im_audit'
   AND lower(JSONExtractString(raw_json, 'process_name')) = 'wxwork.exe'
-  AND (length(JSONExtractString(raw_json, 'client_login_account')) > 0 OR length(JSONExtractString(raw_json, 'local_nickname')) > 0)
+  AND (
+    length(JSONExtractString(raw_json, 'client_login_account')) > 0
+    OR length(JSONExtractString(raw_json, 'local_account')) > 0
+    OR length(JSONExtractString(raw_json, 'local_nickname')) > 0
+  )
   AND ({' OR '.join(filters)})
-FORMAT JSONEachRow
-"""
-    rows = (json.loads(line) for line in clickhouse_query_body(config, query).splitlines() if line.strip())
-    return report_gen.build_terminal_identity_history_from_rows(rows, tz, wecom_people_map)
+FORMAT TabSeparated
+    """
+    parsed_rows: list[dict[str, Any]] = []
+    for line in clickhouse_query_body(config, query).splitlines():
+        if not line.strip():
+            continue
+        values = line.split("\t")
+        if len(values) != 7:
+            raise RuntimeError(f"terminal identity TSV column mismatch: expected 7, got {len(values)}")
+        parsed_rows.append(
+            {
+                "ts": decode_b64_text(values[0]),
+                "process_name": decode_b64_text(values[1]),
+                "client_name": decode_b64_text(values[2]),
+                "client_ip": decode_b64_text(values[3]),
+                "login_account": decode_b64_text(values[4]),
+                "local_account": decode_b64_text(values[5]),
+                "local_nickname": decode_b64_text(values[6]),
+            }
+        )
+    rows = iter(parsed_rows)
+    return report_gen.build_terminal_identity_history_from_rows(rows, tz, identity_people_map)
 
 
 def collect_wecom_recipient_accounts(events: list[Any]) -> list[str]:
@@ -604,25 +685,17 @@ def fetch_wecom_recipient_context_events(
             f"OR arrayExists(x -> position(x, {quoted}) > 0, targets) "
             f"OR arrayExists(x -> position(x, {quoted}) > 0, target_domains))"
         )
-    query = f"""
-SELECT {report_gen.CLICKHOUSE_AUDIT_EVENT_SELECT}
-FROM audit_events
-WHERE ts >= parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
+    where_sql = f"""
+ts >= parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
   AND ts < parseDateTime64BestEffort({ch_quote(end.isoformat())}, 3)
   AND topic = 'im_audit'
   AND lowerUTF8(process_name) IN ('wxwork.exe','wxwork','wecom.exe','wecom')
   AND ({' OR '.join(filters)})
-FORMAT JSONEachRow
 """
     try:
-        text = clickhouse_query(config, query)
+        return clickhouse_audit_event_rows(config, where_sql, tz)
     except Exception:
         return []
-    return [
-        report_gen.audit_event_from_clickhouse_row(json.loads(line), tz)
-        for line in text.splitlines()
-        if line.strip()
-    ]
 
 
 def fetch_report_detail_events(config: Any, start: datetime, end: datetime, policy_doc: dict[str, Any]) -> list[dict[str, Any]]:
@@ -630,10 +703,8 @@ def fetch_report_detail_events(config: Any, start: datetime, end: datetime, poli
     tz = report_gen.get_tz(getattr(config, "timezone", "Asia/Shanghai"))
     three_d, two_d, archives, _patterns = policy_exts(policy_doc)
     signal_exts = sorted(three_d | two_d | archives)
-    query = f"""
-SELECT {report_gen.CLICKHOUSE_AUDIT_EVENT_SELECT}
-FROM audit_events
-WHERE ts >= parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
+    where_sql = f"""
+ts >= parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
   AND ts < parseDateTime64BestEffort({ch_quote(end.isoformat())}, 3)
   AND topic IN ('mail_audit','im_audit','file_audit')
   AND length(file_names) > 0
@@ -649,13 +720,8 @@ WHERE ts >= parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
       OR level = 'HIGH'
       OR ifNull(file_size, 0) >= 10485760
   )
-FORMAT JSONEachRow
 """
-    audit_events = [
-        report_gen.audit_event_from_clickhouse_row(json.loads(line), tz)
-        for line in clickhouse_query(config, query).splitlines()
-        if line.strip()
-    ]
+    audit_events = clickhouse_audit_event_rows(config, where_sql, tz)
     if not audit_events:
         return []
     terminal_identity_history = limited_terminal_identity_history(config, args, audit_events, tz, start, end)
@@ -678,30 +744,27 @@ FORMAT JSONEachRow
         tz,
     )
     if context_events:
+        identity_people_map = dict(getattr(args, "wecom_people_map_loaded", {}) or {})
+        identity_people_map.update(getattr(args, "people_map_loaded", {}) or {})
         report_gen.repair_wecom_recipients_from_event_context(
             audit_events + context_events,
-            getattr(args, "wecom_people_map_loaded", {}) or {},
+            identity_people_map,
             getattr(args, "recipient_map_loaded", {}) or {},
         )
         for event in audit_events:
             report_gen.normalize_untrusted_internal_im_relation(event)
     report_gen.apply_terminal_majority_identity(audit_events, terminal_identity_history)
-    detail_events, _false_positive_reasons = report_gen.report_focus_events(audit_events, internal_domains)
-    rows = [report_detail_row(event, internal_domains) for event in detail_events]
+    report_gen.refresh_event_priorities_after_recipient_repair(audit_events, internal_domains)
+    rows = [report_detail_row(event, internal_domains) for event in audit_events]
     return [row for row in rows if row.get("parsed_ts") and candidate_scope_event(row)]
 
 
 def fetch_audit_events_from_table(config: Any, start: datetime, end: datetime, policy_doc: dict[str, Any]) -> list[dict[str, Any]]:
     three_d, two_d, archives, _patterns = policy_exts(policy_doc)
     signal_exts = sorted(three_d | two_d | archives)
-    query = f"""
-SELECT
-    event_id, event_date, ts, topic, channel, level, company, department,
-    resolved_person, person, client_name, client_ip, process_name, sender_mailbox,
-    recipient_relation, targets, target_domains, recipients, file_names, file_exts,
-    file_size, reasons
-FROM audit_events
-WHERE ts >= parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
+    tz = report_gen.get_tz(getattr(config, "timezone", "Asia/Shanghai"))
+    where_sql = f"""
+ts >= parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
   AND ts < parseDateTime64BestEffort({ch_quote(end.isoformat())}, 3)
   AND topic IN ('mail_audit','im_audit','file_audit')
   AND length(file_names) > 0
@@ -715,17 +778,13 @@ WHERE ts >= parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
       OR level = 'HIGH'
       OR ifNull(file_size, 0) >= 10485760
   )
-FORMAT JSONEachRow
 """
-    events: list[dict[str, Any]] = []
-    for line in clickhouse_query(config, query).splitlines():
-        if not line.strip():
-            continue
-        row = json.loads(line)
-        row["parsed_ts"] = parse_ts(row.get("ts"))
-        if candidate_scope_event(row):
-            events.append(row)
-    return events
+    internal_domains = fast_review_policy_context(policy_doc)
+    return [
+        row
+        for row in (report_detail_row(event, internal_domains) for event in clickhouse_audit_event_rows(config, where_sql, tz))
+        if row.get("parsed_ts") and candidate_scope_event(row)
+    ]
 
 
 def fetch_audit_events(config: Any, start: datetime, end: datetime, policy_doc: dict[str, Any]) -> list[dict[str, Any]]:
@@ -737,10 +796,10 @@ def fetch_audit_events(config: Any, start: datetime, end: datetime, policy_doc: 
 
 def fetch_mac_map(config: Any) -> dict[tuple[str, str], str]:
     query = """
-SELECT client_name, client_ip, argMax(client_mac, observed_at) AS client_mac
+SELECT base64Encode(toString(client_name)), base64Encode(toString(client_ip)), base64Encode(toString(argMax(client_mac, observed_at)))
 FROM asset_latest
 GROUP BY client_name, client_ip
-FORMAT JSONEachRow
+FORMAT TabSeparated
 """
     result: dict[tuple[str, str], str] = {}
     try:
@@ -750,9 +809,11 @@ FORMAT JSONEachRow
     for line in text.splitlines():
         if not line.strip():
             continue
-        row = json.loads(line)
-        key = (str(row.get("client_name") or ""), str(row.get("client_ip") or ""))
-        value = normalize_text(row.get("client_mac"))
+        values = line.split("\t")
+        if len(values) != 3:
+            continue
+        key = (decode_b64_text(values[0]), decode_b64_text(values[1]))
+        value = normalize_text(decode_b64_text(values[2]))
         if value:
             result[key] = value
     return result
@@ -863,6 +924,55 @@ def build_candidate(
     )
 
 
+def level_one_dedup_key(event: dict[str, Any], label: str) -> tuple[str, str, str, str, str, str]:
+    ts = event.get("parsed_ts")
+    minute = ts.strftime("%Y-%m-%d %H:%M") if hasattr(ts, "strftime") else normalize_text(ts)
+    files = ";".join(sorted(str(item or "").strip() for item in event.get("file_names") or [] if str(item or "").strip()))
+    targets = ";".join(
+        sorted(
+            str(item or "").strip()
+            for item in list(event.get("recipients") or []) + list(event.get("targets") or []) + list(event.get("target_domains") or [])
+            if str(item or "").strip()
+        )
+    )
+    return (
+        minute,
+        str(event.get("client_name") or ""),
+        str(event.get("client_ip") or ""),
+        files,
+        targets,
+        label,
+    )
+
+
+def add_deduped_event(target: dict[str, dict[str, Any]], label: str, event: dict[str, Any]) -> None:
+    key = json.dumps(level_one_dedup_key(event, label), ensure_ascii=False, sort_keys=False)
+    selected_key = f"{label}|{key}"
+    if selected_key in target:
+        selected_key = f"{selected_key}|{event.get('event_id') or id(event)}"
+    target.setdefault(selected_key, event)
+
+
+def level_one_event_representatives(events: list[dict[str, Any]], label: str) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str, str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for event in events:
+        grouped[level_one_dedup_key(event, label)].append(event)
+    representatives: list[dict[str, Any]] = []
+    for group in grouped.values():
+        if len(group) <= 1:
+            representatives.extend(group)
+            continue
+        has_identity_repair_companion = any(
+            normalize_key(event.get("person")) and normalize_key(event.get("resolved_person")) and normalize_key(event.get("person")) != normalize_key(event.get("resolved_person"))
+            for event in group
+        )
+        if has_identity_repair_companion:
+            representatives.append(sorted(group, key=lambda item: 0 if str(item.get("topic") or "") == "im_audit" else 1)[0])
+        else:
+            representatives.extend(group)
+    return representatives
+
+
 def burst_window(events: list[dict[str, Any]], minutes: int, min_events: int) -> list[dict[str, Any]]:
     ordered = sorted([event for event in events if event.get("parsed_ts")], key=lambda item: item["parsed_ts"])
     left = 0
@@ -884,8 +994,6 @@ def generate_candidates(config: Any, policy_doc: dict[str, Any], start: datetime
     events = fetch_audit_events(config, start, end, policy_doc)
     three_d, two_d, archives, patterns = policy_exts(policy_doc)
     mac_map = fetch_mac_map(config)
-    other_drawing_min = max(1, policy_int(policy, "other_drawing_min_events") or 100)
-    sensitive_min = max(1, policy_int(policy, "sensitive_name_min_events") or 1000)
     groups: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for event in events:
         ts = event.get("parsed_ts")
@@ -906,29 +1014,15 @@ def generate_candidates(config: Any, policy_doc: dict[str, Any], start: datetime
         if standard_events:
             reason_labels.append("一级风险：标准图纸流转")
             reason_basis.append("标准图纸经邮件、IM、外部站点上传或外设拷贝等通道流转。")
-            for event in standard_events:
-                selected_events[str(event.get("event_id") or id(event))] = event
+            for event in level_one_event_representatives(standard_events, "标准图纸流转"):
+                add_deduped_event(selected_events, "标准图纸流转", event)
 
         large_archive_events = [event for event in significant if large_archive_event(event, three_d, two_d, archives, patterns)]
         if large_archive_events:
-            reason_labels.append("一级风险：大于100MB压缩包流转")
-            reason_basis.append("大于100MB压缩包经邮件、IM、外部站点上传或外设拷贝等通道流转。")
-            for event in large_archive_events:
-                selected_events[str(event.get("event_id") or id(event))] = event
-
-        ordinary_drawing_events = [event for event in significant if ordinary_drawing_event(event, three_d, two_d, archives, patterns)]
-        if len(ordinary_drawing_events) >= other_drawing_min:
-            reason_labels.append("普通图纸高频流转")
-            reason_basis.append(f"非标准三维模型或 DWG 图纸流转达到 {other_drawing_min} 条阈值。")
-            for event in ordinary_drawing_events:
-                selected_events[str(event.get("event_id") or id(event))] = event
-
-        sensitive_events = [event for event in significant if sensitive_name_event(event, three_d, two_d, archives, patterns)]
-        if len(sensitive_events) >= sensitive_min:
-            reason_labels.append("敏感文件高频流转")
-            reason_basis.append(f"敏感名称文件流转达到 {sensitive_min} 条阈值。")
-            for event in sensitive_events:
-                selected_events[str(event.get("event_id") or id(event))] = event
+            reason_labels.append("一级风险：技术/工艺/研发大于100MB压缩包流转")
+            reason_basis.append("技术部、工艺部或研发部大于100MB压缩包经邮件、IM、外部站点上传或外设拷贝等通道流转。")
+            for event in level_one_event_representatives(large_archive_events, "大于100MB压缩包流转"):
+                add_deduped_event(selected_events, "大于100MB压缩包流转", event)
 
         if selected_events:
             candidate = build_candidate("；".join(reason_labels), list(selected_events.values()), policy_doc, mac_map, "；".join(reason_basis))
@@ -937,7 +1031,6 @@ def generate_candidates(config: Any, policy_doc: dict[str, Any], start: datetime
         candidates.values(),
         key=lambda item: (
             0 if item.anomaly_type.startswith("一级风险") else 1,
-            1 if item.anomaly_type.startswith("普通图纸") else 2 if item.anomaly_type.startswith("敏感文件") else 3,
             -item.event_count,
             -(item.structure_count + item.electrical_count),
             -item.three_d_count,
@@ -1002,9 +1095,8 @@ def generate_candidate_summaries(config: Any, policy_doc: dict[str, Any], start:
         return []
     internal_domains = fast_review_policy_context(policy_doc)
     object_expr, channel_expr, focus_expr = report_gen.clickhouse_matrix_classification_exprs(internal_domains)
-    other_drawing_min = max(1, policy_int(policy, "other_drawing_min_events") or 100)
-    sensitive_min = max(1, policy_int(policy, "sensitive_name_min_events") or 1000)
     large_archive_bytes = int(report_gen.LARGE_ARCHIVE_RISK_BYTES)
+    large_archive_scope_expr = report_gen.clickhouse_large_archive_scope_expr("department")
     query = f"""
 SELECT
     client_name,
@@ -1015,7 +1107,7 @@ SELECT
     channel_group,
     object,
     count() AS count,
-    countIf(ifNull(file_size, 0) > {large_archive_bytes}) AS large_archive_count,
+    countIf(ifNull(file_size, 0) > {large_archive_bytes} AND ({large_archive_scope_expr})) AS large_archive_count,
     min(ts) AS event_start,
     max(ts) AS event_end,
     groupUniqArray(256)(event_id) AS event_ids
@@ -1082,7 +1174,6 @@ FORMAT JSONEachRow
                 "archive_count": 0,
                 "large_archive_count": 0,
                 "standard_count": 0,
-                "sensitive_count": 0,
             },
         )
         count = int(row.get("count") or 0)
@@ -1112,8 +1203,6 @@ FORMAT JSONEachRow
         if bucket == "压缩包":
             item["archive_count"] += count
             item["large_archive_count"] += int(row.get("large_archive_count") or 0)
-        if bucket == "敏感名称":
-            item["sensitive_count"] += count
         for event_id in row.get("event_ids") or []:
             event_text = str(event_id or "")
             if event_text and event_text not in item["event_ids"]:
@@ -1140,15 +1229,8 @@ FORMAT JSONEachRow
             reason_labels.append("一级风险：标准图纸流转")
             reason_basis.append("标准图纸经邮件、IM、外部站点上传或外设拷贝等通道流转。")
         if int(item["large_archive_count"] or 0) > 0:
-            reason_labels.append("一级风险：大于100MB压缩包流转")
-            reason_basis.append("大于100MB压缩包经邮件、IM、外部站点上传或外设拷贝等通道流转。")
-        ordinary_count = int(item["three_d_count"] or 0) + int(item["dwg_count"] or 0)
-        if ordinary_count >= other_drawing_min:
-            reason_labels.append("普通图纸高频流转")
-            reason_basis.append(f"非标准三维模型或 DWG 图纸流转达到 {other_drawing_min} 条阈值。")
-        if int(item["sensitive_count"] or 0) >= sensitive_min:
-            reason_labels.append("敏感文件高频流转")
-            reason_basis.append(f"敏感名称文件流转达到 {sensitive_min} 条阈值。")
+            reason_labels.append("一级风险：技术/工艺/研发大于100MB压缩包流转")
+            reason_basis.append("技术部、工艺部或研发部大于100MB压缩包经邮件、IM、外部站点上传或外设拷贝等通道流转。")
         if not reason_labels:
             continue
         event_start = item["event_start"] or start
@@ -1191,7 +1273,6 @@ FORMAT JSONEachRow
         candidates.values(),
         key=lambda candidate: (
             0 if candidate.anomaly_type.startswith("一级风险") else 1,
-            1 if candidate.anomaly_type.startswith("普通图纸") else 2 if candidate.anomaly_type.startswith("敏感文件") else 3,
             -candidate.event_count,
             -(candidate.structure_count + candidate.electrical_count),
             -candidate.three_d_count,
@@ -1247,16 +1328,42 @@ def reviews_from_rows(rows: Iterable[dict[str, Any]]) -> list[TerminalBehaviorRe
 def fetch_reviews(config: Any, start: datetime, end: datetime, include_all_status: bool = True) -> list[TerminalBehaviorReview]:
     ensure_review_table(config)
     include_filter = "" if include_all_status else "AND include_in_report = 1"
+    select_parts: list[str] = []
+    for name, kind in REVIEW_SELECT_FIELDS:
+        if kind == "array":
+            select_parts.append(f"base64Encode(toJSONString({name}))")
+        elif kind == "int":
+            select_parts.append(f"toString({name})")
+        elif kind == "nullable_string":
+            select_parts.append(f"base64Encode(ifNull(toString({name}), ''))")
+        else:
+            select_parts.append(f"base64Encode(toString({name}))")
     query = f"""
-SELECT *
+SELECT {', '.join(select_parts)}
 FROM terminal_behavior_reviews FINAL
 WHERE event_start >= parseDateTime64BestEffort({ch_quote(start.isoformat())}, 3)
   AND event_start < parseDateTime64BestEffort({ch_quote(end.isoformat())}, 3)
   {include_filter}
 ORDER BY event_start DESC, event_count DESC
-FORMAT JSONEachRow
+FORMAT TabSeparated
 """
-    rows = [json.loads(line) for line in clickhouse_query(config, query).splitlines() if line.strip()]
+    rows: list[dict[str, Any]] = []
+    expected_columns = len(REVIEW_SELECT_FIELDS)
+    for line_no, line in enumerate(clickhouse_query(config, query).splitlines(), start=1):
+        if not line.strip():
+            continue
+        values = line.split("\t")
+        if len(values) != expected_columns:
+            raise RuntimeError(f"terminal reviews TSV column mismatch at line {line_no}: expected {expected_columns}, got {len(values)}")
+        row: dict[str, Any] = {}
+        for value, (name, kind) in zip(values, REVIEW_SELECT_FIELDS):
+            if kind == "array":
+                row[name] = decode_b64_json_array(value)
+            elif kind == "int":
+                row[name] = int(value) if value else 0
+            else:
+                row[name] = decode_b64_text(value)
+        rows.append(row)
     return reviews_from_rows(rows)
 
 
@@ -1287,7 +1394,7 @@ def report_summary_html(config: Any, start: datetime, end: datetime) -> str:
         return """
     <section id="terminal-behavior-review-summary" class="section-block terminal-review-summary">
       <div class="section-title-row">
-        <div><span class="section-eyebrow">Manual Review</span><h2>风险终端复核</h2><p>本周期暂无人工确认进入报告的风险终端复核记录；候选线索请进入复核工作台处理。</p></div>
+        <div><span class="section-eyebrow">Manual Review</span><h2>风险终端复核</h2><p>本周期暂无人工确认进入报告的风险终端复核记录；待复核线索请进入复核工作台处理。</p></div>
         <a class="section-action" href="/terminal-check">进入复核工作台</a>
       </div>
     </section>
@@ -1315,7 +1422,7 @@ def report_summary_html(config: Any, start: datetime, end: datetime) -> str:
         <a class="section-action" href="/terminal-check">进入复核工作台</a>
       </div>
       <div class="terminal-review-chip-grid">{chip_html}</div>
-      <p class="note">本周期核查集中公司：{esc(top_company)}；高频终端：{esc(top_terminal)}。候选未人工确认前不进入正式报告。</p>
+      <p class="note">本周期核查集中公司：{esc(top_company)}；高频终端：{esc(top_terminal)}。待复核终端未人工确认前不进入正式报告。</p>
     </section>
 """
 
