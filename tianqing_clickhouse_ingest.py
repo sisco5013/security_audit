@@ -584,7 +584,8 @@ def ingest(args: argparse.Namespace) -> tuple[int, int]:
     current_policy_hash = strategy_fingerprint(args)
     previous_policy_hash = str(state.get("__policy_hash") or "")
     if (
-        not args.no_auto_rebuild_on_policy_change
+        getattr(args, "auto_rebuild_on_policy_change", False)
+        and not args.no_auto_rebuild_on_policy_change
         and not args.from_beginning
         and current_policy_hash != previous_policy_hash
     ):
@@ -837,7 +838,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backfill-assets-from-raw", action="store_true", help="Rebuild asset analysis tables from existing raw_syslog rows without touching raw/event tables.")
     parser.add_argument("--reset-asset-tables", action="store_true", help="Truncate asset analysis tables before --backfill-assets-from-raw.")
     parser.add_argument("--rebuild-events-from-raw", action="store_true", help="Rebuild audit_events from raw_syslog using the current strategy files; raw_syslog is not changed.")
-    parser.add_argument("--no-auto-rebuild-on-policy-change", action="store_true", help="Disable automatic audit_events rebuild when strategy file hash changes.")
+    parser.add_argument("--auto-rebuild-on-policy-change", action="store_true", help="Explicitly rebuild audit_events from raw_syslog when strategy file hash changes. Disabled by default because Tianqing history is large.")
+    parser.add_argument("--no-auto-rebuild-on-policy-change", action="store_true", help="Compatibility flag; automatic policy-change rebuild is already disabled unless --auto-rebuild-on-policy-change is set.")
     return parser.parse_args()
 
 

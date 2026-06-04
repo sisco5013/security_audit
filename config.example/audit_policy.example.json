@@ -34,7 +34,11 @@
   "organization_aliases": [],
   "plm_login_audit": {
     "constrained_departments": ["技术部", "研发部", "工艺部"],
-    "terminal_match_fields": ["ip_address", "computer_name"]
+    "terminal_match_fields": ["ip_address", "computer_name"],
+    "ip_mac_lookup_hours": 2,
+    "terminal_valid_days": 7,
+    "source_warn_days": 3,
+    "source_stale_days": 7
   },
   "auth": {
     "policy_admin_userids": ["10056"],

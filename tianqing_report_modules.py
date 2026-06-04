@@ -262,10 +262,10 @@ def build_global_management_summary_html(
 
     plm_enabled = bool(plm_metrics and plm_metrics.get("enabled"))
     plm_risks = _metric_int(plm_metrics, "risk_count")
-    plm_label = "池外登录" if plm_enabled else "待接入"
+    plm_label = "非有效加密终端登录" if plm_enabled else "待接入"
     plm_value = str(plm_risks) if plm_enabled else "未纳入"
     plm_detail = (
-        f"已纳入 PLM 登录合规审计，本期识别 {plm_risks} 条技术、研发、工艺账号池外登录记录。"
+        f"已纳入 PLM 登录合规审计，本期识别 {plm_risks} 条技术、研发、工艺账号非有效加密终端登录记录。"
         if plm_enabled
         else "接口接入后重点校验技术、研发、工艺账号是否从 MAC+计算机名授信终端登录。"
     )
@@ -303,7 +303,7 @@ def build_global_management_summary_html(
         ),
         row_html(
             "风险终端复核记录",
-            f"本周期人工复核记录 {review_total} 条，待复核 {review_pending} 条，已复核 {review_done} 条；该行展示复核闭环状态，不代表三大模块一级风险总数。",
+            f"本周期复核对象 {review_total} 条，待复核 {review_pending} 条，已复核 {review_done} 条；候选未保存时仍计入待复核，人工标记“不纳入报告”后不计入。",
             "/terminal-check",
             "review",
         ),

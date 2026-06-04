@@ -344,6 +344,7 @@ def clickhouse_matrix_classification_exprs(internal_domains: set[str] | None = N
         ") AND ("
         f"recipient_relation IN {external_relations} "
         f"OR hasAny(reasons, {external_reasons}) "
+        "OR (topic = 'file_audit' AND (channel = '外设拷贝' OR has(reasons, '外设拷贝'))) "
         "OR (topic IN ('mail_audit', 'im_audit') AND recipient_relation = 'unknown') "
         "OR (topic = 'file_audit' AND recipient_relation = 'unknown' AND ("
         f"hasAny(file_exts, {three_d_exts}) "
@@ -500,10 +501,53 @@ def build_trend_range_summary(
     if precomputed_counts is not None:
         labels = precomputed_labels or []
         granularity = precomputed_granularity or trend_granularity(start, end)
-        channel_counts = precomputed_counts.get("channels") or {}
-        object_counts = precomputed_counts.get("objects") or {}
-        company_counts = precomputed_counts.get("companies") or {}
-        department_counts = precomputed_counts.get("departments") or {}
+        channel_counts = {key: list(values) for key, values in (precomputed_counts.get("channels") or {}).items()}
+        object_counts = {key: list(values) for key, values in (precomputed_counts.get("objects") or {}).items()}
+        company_counts = {key: list(values) for key, values in (precomputed_counts.get("companies") or {}).items()}
+        department_counts = {key: list(values) for key, values in (precomputed_counts.get("departments") or {}).items()}
+        if top_source_events and report_start and report_end and granularity == "day" and start and end:
+            current_buckets, _current_labels = trend_buckets(start, end, granularity, tz)
+            report_start_local = report_start.astimezone(tz)
+            report_end_local = report_end.astimezone(tz)
+            overlay_indices = [
+                idx
+                for idx, bucket in enumerate(current_buckets)
+                if bucket < report_end_local and add_trend_bucket(bucket, granularity) > report_start_local
+            ]
+            if overlay_indices:
+                report_matrix_events = trend_matrix_events(top_source_events, internal_domains)
+                overlay_channel_counts = trend_counts_by_bucket(
+                    report_matrix_events,
+                    current_buckets,
+                    granularity,
+                    tz,
+                    lambda event: audit_channel_group(event, internal_domains),
+                )
+                overlay_object_counts = trend_counts_by_bucket(
+                    report_matrix_events,
+                    current_buckets,
+                    granularity,
+                    tz,
+                    lambda event: audit_matrix_bucket(event),
+                )
+                overlay_company_counts = trend_counts_by_bucket(report_matrix_events, current_buckets, granularity, tz, event_company_label)
+                overlay_department_counts = trend_counts_by_bucket(report_matrix_events, current_buckets, granularity, tz, event_department_label)
+
+                def apply_overlay(target: dict[str, list[int]], overlay: dict[str, list[int]]) -> None:
+                    width = len(current_buckets)
+                    for values in target.values():
+                        for idx in overlay_indices:
+                            if idx < len(values):
+                                values[idx] = 0
+                    for label, values in overlay.items():
+                        target_values = target.setdefault(label, [0 for _ in range(width)])
+                        for idx in overlay_indices:
+                            target_values[idx] = values[idx] if idx < len(values) else 0
+
+                apply_overlay(channel_counts, overlay_channel_counts)
+                apply_overlay(object_counts, overlay_object_counts)
+                apply_overlay(company_counts, overlay_company_counts)
+                apply_overlay(department_counts, overlay_department_counts)
         company_labels = company_labels or top_trend_count_labels(company_counts, 5)
         department_labels = department_labels or top_trend_count_labels(department_counts, 5)
         company_links = {label: org_links.get(("company", label, ""), "") for label in company_labels}

@@ -2186,6 +2186,11 @@ def normalize_untrusted_internal_im_relation(event: AuditEvent) -> None:
         if "企业微信本人/文件助手" in event.reasons:
             return
         if is_wecom_process_name(event.process_name):
+            if "企业微信内部接收方" in event.reasons or event_has_controlled_wecom_recipient_account(event):
+                return
+            event.recipient_relation = "unknown"
+            if "接收方未命中受控企业微信账号" not in event.reasons:
+                event.reasons.append("接收方未命中受控企业微信账号")
             return
         has_internal_network_target = any(
             target_is_internal_network(value, DEFAULT_INTERNAL_DOMAINS)
@@ -2195,6 +2200,16 @@ def normalize_untrusted_internal_im_relation(event: AuditEvent) -> None:
             event.recipient_relation = "unknown"
             if "接收端IP未确认" not in event.reasons:
                 event.reasons.append("接收端IP未确认")
+
+
+def event_has_controlled_wecom_recipient_account(event: AuditEvent) -> bool:
+    accounts: set[str] = set()
+    for raw_target in wecom_event_recipient_values(event):
+        _nickname, account = split_im_target(raw_target)
+        account_key = normalize_key(account)
+        if re.fullmatch(r"[A-Za-z0-9_-]{5,64}", account or ""):
+            accounts.add(account_key)
+    return bool(accounts) and all(account in WECOM_INTERNAL_RECIPIENT_ACCOUNTS for account in accounts)
 
 
 def normalize_unconfirmed_wecom_external_relation(event: AuditEvent) -> None:
@@ -9809,7 +9824,7 @@ def build_html_report(
     )
     home_focus_text = (
         "一级风险定义：标准图纸解密；天擎标准图纸流转；"
-        "技术、工艺、研发部门大于100MB压缩包流转（排除内部系统上传）；PLM技术、研发、工艺账号池外登录。"
+        "技术、工艺、研发部门大于100MB压缩包流转（排除内部系统上传）；PLM技术、研发、工艺账号非有效加密终端登录。"
     )
     home_evidence_text = "一级风险进入顶部汇总管理结论，矩阵、趋势和明细用于定位组织、终端与证据链。"
     home_modules = [

@@ -64,6 +64,25 @@ SETTINGS index_granularity = 8192
 """
 
 
+TERMINAL_BEHAVIOR_CANDIDATE_CACHE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS terminal_behavior_candidate_cache
+(
+    period_start DateTime64(3, 'Asia/Shanghai'),
+    period_end DateTime64(3, 'Asia/Shanghai'),
+    policy_hash String,
+    source LowCardinality(String),
+    updated_at DateTime64(3, 'Asia/Shanghai'),
+    candidate_count UInt32,
+    payload_json String
+)
+ENGINE = ReplacingMergeTree(updated_at)
+PARTITION BY toYYYYMM(period_start)
+ORDER BY (source, period_start, period_end, policy_hash)
+TTL period_start + INTERVAL 3 YEAR
+SETTINGS index_granularity = 8192
+"""
+
+
 REVIEW_STATUSES = ["待核查", "异常待整改", "正常业务", "误报", "继续观察", "已闭环", "不纳入报告"]
 REPORT_EXCLUDED_STATUSES = {"不纳入报告"}
 DEFAULT_REVIEW_POLICY: dict[str, Any] = {
@@ -277,6 +296,11 @@ def ensure_review_table(config: Any) -> None:
     clickhouse_query(config, TERMINAL_BEHAVIOR_REVIEW_TABLE_SQL)
 
 
+def ensure_candidate_cache_table(config: Any) -> None:
+    clickhouse_query(config, f"CREATE DATABASE IF NOT EXISTS {getattr(config, 'clickhouse_database', 'tianqing')}")
+    clickhouse_query(config, TERMINAL_BEHAVIOR_CANDIDATE_CACHE_TABLE_SQL)
+
+
 def policy_int(policy: dict[str, Any], key: str) -> int:
     default = int(DEFAULT_REVIEW_POLICY[key])
     try:
@@ -331,6 +355,159 @@ def parse_ts(value: Any) -> datetime | None:
         return datetime.fromisoformat(text.replace(" ", "T"))
     except ValueError:
         return None
+
+
+def json_ready(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Counter):
+        return dict(value)
+    if isinstance(value, dict):
+        return {str(key): json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [json_ready(item) for item in value]
+    return value
+
+
+def candidate_to_dict(candidate: TerminalBehaviorCandidate) -> dict[str, Any]:
+    return {
+        "candidate_id": candidate.candidate_id,
+        "event_date": candidate.event_date.isoformat(),
+        "event_start": candidate.event_start.isoformat(),
+        "event_end": candidate.event_end.isoformat(),
+        "anomaly_type": candidate.anomaly_type,
+        "company": candidate.company,
+        "department": candidate.department,
+        "person": candidate.person,
+        "client_name": candidate.client_name,
+        "client_ip": candidate.client_ip,
+        "client_mac": candidate.client_mac,
+        "event_count": candidate.event_count,
+        "structure_count": candidate.structure_count,
+        "electrical_count": candidate.electrical_count,
+        "three_d_count": candidate.three_d_count,
+        "dwg_count": candidate.dwg_count,
+        "archive_count": candidate.archive_count,
+        "channels": list(candidate.channels),
+        "targets": list(candidate.targets),
+        "sample_files": list(candidate.sample_files),
+        "event_ids": list(candidate.event_ids),
+        "matrix_counts": dict(candidate.matrix_counts),
+        "evidence_events": json_ready(candidate.evidence_events),
+        "basis": candidate.basis,
+    }
+
+
+def candidate_from_dict(row: dict[str, Any]) -> TerminalBehaviorCandidate:
+    event_date_text = str(row.get("event_date") or "")
+    try:
+        event_date_value = date.fromisoformat(event_date_text)
+    except ValueError:
+        event_date_value = datetime.now().date()
+    event_start = parse_ts(row.get("event_start")) or datetime.now()
+    event_end = parse_ts(row.get("event_end")) or event_start
+    evidence_events = row.get("evidence_events") if isinstance(row.get("evidence_events"), list) else []
+    for event in evidence_events:
+        if isinstance(event, dict) and isinstance(event.get("parsed_ts"), str):
+            parsed_ts = parse_ts(event.get("parsed_ts"))
+            if parsed_ts is not None:
+                event["parsed_ts"] = parsed_ts
+    return TerminalBehaviorCandidate(
+        candidate_id=str(row.get("candidate_id") or ""),
+        event_date=event_date_value,
+        event_start=event_start,
+        event_end=event_end,
+        anomaly_type=str(row.get("anomaly_type") or ""),
+        company=str(row.get("company") or ""),
+        department=str(row.get("department") or ""),
+        person=str(row.get("person") or ""),
+        client_name=str(row.get("client_name") or ""),
+        client_ip=str(row.get("client_ip") or ""),
+        client_mac=str(row.get("client_mac") or ""),
+        event_count=int(row.get("event_count") or 0),
+        structure_count=int(row.get("structure_count") or 0),
+        electrical_count=int(row.get("electrical_count") or 0),
+        three_d_count=int(row.get("three_d_count") or 0),
+        dwg_count=int(row.get("dwg_count") or 0),
+        archive_count=int(row.get("archive_count") or 0),
+        channels=[str(item) for item in row.get("channels") or []],
+        targets=[str(item) for item in row.get("targets") or []],
+        sample_files=[str(item) for item in row.get("sample_files") or []],
+        event_ids=[str(item) for item in row.get("event_ids") or []],
+        matrix_counts={str(key): int(value or 0) for key, value in (row.get("matrix_counts") or {}).items()},
+        evidence_events=[event for event in evidence_events if isinstance(event, dict)],
+        basis=str(row.get("basis") or ""),
+    )
+
+
+def candidates_to_json(candidates: list[TerminalBehaviorCandidate]) -> str:
+    return json.dumps([candidate_to_dict(candidate) for candidate in candidates], ensure_ascii=False, separators=(",", ":"))
+
+
+def candidates_from_json(text: str) -> list[TerminalBehaviorCandidate]:
+    if not text.strip():
+        return []
+    parsed = json.loads(text)
+    if not isinstance(parsed, list):
+        return []
+    return [candidate_from_dict(row) for row in parsed if isinstance(row, dict)]
+
+
+def fetch_cached_candidates(
+    config: Any,
+    start: datetime,
+    end: datetime,
+    policy_hash: str,
+    source: str = "tianqing_level_one",
+) -> list[TerminalBehaviorCandidate] | None:
+    ensure_candidate_cache_table(config)
+    start_key = start.strftime("%Y-%m-%d %H:%M:%S.000")
+    end_key = end.strftime("%Y-%m-%d %H:%M:%S.000")
+    query = f"""
+SELECT base64Encode(payload_json)
+FROM terminal_behavior_candidate_cache
+WHERE source = {ch_quote(source)}
+  AND policy_hash = {ch_quote(policy_hash)}
+  AND toString(period_start) = {ch_quote(start_key)}
+  AND toString(period_end) = {ch_quote(end_key)}
+ORDER BY updated_at DESC
+LIMIT 1
+FORMAT TabSeparated
+"""
+    text = clickhouse_query(config, query).strip()
+    if not text:
+        return None
+    try:
+        return candidates_from_json(decode_b64_text(text.split("\t", 1)[0]))
+    except Exception:
+        return None
+
+
+def clickhouse_datetime64_text(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M:%S.%f")[:23]
+
+
+def store_cached_candidates(
+    config: Any,
+    start: datetime,
+    end: datetime,
+    policy_hash: str,
+    candidates: list[TerminalBehaviorCandidate],
+    source: str = "tianqing_level_one",
+) -> None:
+    ensure_candidate_cache_table(config)
+    row = {
+        "period_start": clickhouse_datetime64_text(start),
+        "period_end": clickhouse_datetime64_text(end),
+        "policy_hash": policy_hash,
+        "source": source,
+        "updated_at": clickhouse_datetime64_text(datetime.now()),
+        "candidate_count": len(candidates),
+        "payload_json": candidates_to_json(candidates),
+    }
+    clickhouse_query(config, "INSERT INTO terminal_behavior_candidate_cache FORMAT JSONEachRow", data=(json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8"))
 
 
 def display_channel(event: dict[str, Any]) -> str:
@@ -962,7 +1139,8 @@ def level_one_event_representatives(events: list[dict[str, Any]], label: str) ->
         if len(group) <= 1:
             representatives.extend(group)
             continue
-        has_identity_repair_companion = any(
+        topics = {str(event.get("topic") or "") for event in group}
+        has_identity_repair_companion = len(topics) > 1 and any(
             normalize_key(event.get("person")) and normalize_key(event.get("resolved_person")) and normalize_key(event.get("person")) != normalize_key(event.get("resolved_person"))
             for event in group
         )

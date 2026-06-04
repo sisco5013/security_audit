@@ -36,8 +36,10 @@ import urllib.error
 import urllib.request
 
 import tianqing_decrypt_records as decrypt_records
+import tianqing_decrypt_data_module as decrypt_data
 import tianqing_encryption_terminals as encryption_terminals
 import tianqing_external_audit_report as report_gen
+import tianqing_plm_login_audit as plm_audit
 import tianqing_terminal_behavior_review as terminal_review
 
 try:
@@ -110,12 +112,16 @@ AUTH_STATE_COOKIE_NAME = "tq_audit_state"
 AUTH_PROXY_TOKEN_FILE = ".auth_proxy_token"
 AUTH_SESSION_FILE = ".auth_sessions.json"
 DEFAULT_POLICY_ADMIN_USERIDS = [FIXED_POLICY_ADMIN_USERID]
-DEFAULT_PLM_CONSTRAINED_DEPARTMENTS = ["技术部", "研发部", "工艺部"]
-DEFAULT_PLM_TERMINAL_MATCH_FIELDS = ["ip_address", "computer_name"]
+DEFAULT_PLM_CONSTRAINED_DEPARTMENTS = plm_audit.DEFAULT_CONSTRAINED_DEPARTMENTS
+DEFAULT_PLM_TERMINAL_MATCH_FIELDS = plm_audit.DEFAULT_TERMINAL_MATCH_FIELDS
+DEFAULT_PLM_IP_MAC_LOOKUP_HOURS = plm_audit.DEFAULT_IP_MAC_LOOKUP_HOURS
+DEFAULT_PLM_TERMINAL_VALID_DAYS = plm_audit.DEFAULT_TERMINAL_VALID_DAYS
+DEFAULT_PLM_SOURCE_WARN_DAYS = plm_audit.DEFAULT_SOURCE_WARN_DAYS
+DEFAULT_PLM_SOURCE_STALE_DAYS = plm_audit.DEFAULT_SOURCE_STALE_DAYS
 ENCRYPTION_TERMINAL_TRUST_DAYS = 7
 TOP_RISK_DEFINITION_TEXT = (
     "一级风险定义：标准图纸解密；天擎标准图纸流转；"
-    "技术、工艺、研发部门大于100MB压缩包流转（排除内部系统上传）；PLM技术、研发、工艺账号池外登录。"
+    "技术、工艺、研发部门大于100MB压缩包流转（排除内部系统上传）；PLM技术、研发、工艺账号非有效加密终端登录。"
 )
 TOP_RISK_EVIDENCE_TEXT = "一级风险进入顶部汇总管理结论，矩阵、趋势和明细用于定位组织、终端与证据链。"
 
@@ -145,6 +151,17 @@ def encryption_terminal_trust_status_sql(prefix: str = "") -> str:
 def encryption_terminal_mac_key_sql(prefix: str = "") -> str:
     base = f"{prefix}." if prefix else ""
     return f"lowerUTF8(replaceAll(replaceAll(replaceAll({base}mac_address, '-', ''), ':', ''), ' ', ''))"
+
+
+def resolve_plm_login_device(config: "AppConfig", login_time: datetime, login_ip: str, computer_name: str) -> plm_audit.PlmDeviceResolution:
+    """Resolve PLM login IP to Tianqing MAC, then validate encryption-terminal trust."""
+    return plm_audit.resolve_plm_login_device_from_policy_doc(
+        config,
+        login_time,
+        login_ip,
+        computer_name,
+        load_policy_doc(config),
+    )
 
 
 @dataclass
@@ -219,6 +236,13 @@ DECRYPT_ANALYSIS_CACHE_TTL_SECONDS = 30 * 60
 DECRYPT_ANALYSIS_CACHE_MAX_ENTRIES = 6
 DECRYPT_ANALYSIS_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
 DECRYPT_ANALYSIS_CACHE_LOCK = threading.Lock()
+DECRYPT_SUMMARY_CACHE_TTL_SECONDS = 10 * 60
+DECRYPT_SUMMARY_CACHE_MAX_ENTRIES = 12
+DECRYPT_SUMMARY_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
+DECRYPT_SUMMARY_CACHE_LOCK = threading.Lock()
+DECRYPT_DETAIL_WARMUP_CACHE_TTL_SECONDS = 30 * 60
+DECRYPT_DETAIL_WARMUP_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
+DECRYPT_DETAIL_WARMUP_CACHE_LOCK = threading.Lock()
 RECENT_JOB_SECONDS = 12 * 3600
 CUSTOM_REPORT_TTL_DAYS = int(os.getenv("TIANQING_CUSTOM_REPORT_TTL_DAYS", "7") or "7")
 JOB_LOG_TTL_DAYS = int(os.getenv("TIANQING_JOB_LOG_TTL_DAYS", "30") or "30")
@@ -226,6 +250,16 @@ REPORT_ARCHIVE_RE = re.compile(r"^tianqing_leadership_(previous-day|today|curren
 REPORT_ARCHIVE_INDEX = "report_archives.jsonl"
 TEMP_REPORT_GROUP_RE = re.compile(r"^(?P<stem>tianqing_custom_\d{12}_\d{12}_(?P<job_id>\d{14}-\d+-\d{4}))(?:_|\.html$)")
 AI_DETAIL_REPORT_RE = re.compile(r"_ai-[0-9a-f]{10}\.html$", re.IGNORECASE)
+
+
+def env_flag_enabled(name: str, default: bool = True) -> bool:
+    raw = str(os.getenv(name, "1" if default else "0") or "").strip().lower()
+    return raw not in {"0", "false", "no", "off", "disabled"}
+
+
+def realtime_optimization_enabled() -> bool:
+    """Feature flag for reversible dynamic-page performance optimizations."""
+    return env_flag_enabled("TIANQING_REALTIME_OPTIMIZATION", True)
 
 
 def esc(value: Any) -> str:
@@ -1379,12 +1413,70 @@ def _live_decrypt_management_metrics(config: AppConfig, start: datetime, end: da
 
 
 def _terminal_review_management_metrics(config: AppConfig, start: datetime, end: datetime) -> dict[str, int]:
+    def review_visible(review: Any) -> bool:
+        return bool(int(getattr(review, "include_in_report", 0) or 0))
+
+    def review_is_pending(review: Any | None) -> bool:
+        if review is None:
+            return True
+        return str(getattr(review, "status", "") or "").strip() == "待核查"
+
+    def review_event_count(value: Any) -> int:
+        try:
+            count = int(getattr(value, "event_count", 0) or 0)
+        except (TypeError, ValueError):
+            count = 0
+        return max(count, 1)
+
     try:
-        reviews = terminal_review.fetch_reviews(config, start, end, include_all_status=False)
+        reviews = terminal_review.fetch_reviews(config, start, end, include_all_status=True)
     except Exception:
         return {"total": 0, "pending": 0, "reviewed": 0}
-    pending = sum(1 for review in reviews if str(review.status or "").strip() == "待核查")
-    return {"total": len(reviews), "pending": pending, "reviewed": max(len(reviews) - pending, 0)}
+    visible_reviews = [review for review in reviews if review_visible(review)]
+    reviews_by_candidate = {str(review.candidate_id or ""): review for review in visible_reviews}
+    candidates: list[Any] = []
+    try:
+        policy_doc = load_policy_doc(config)
+        key = terminal_check_cache_key(policy_doc, start, end)
+        entry = terminal_check_cache_entry(key)
+        if entry and entry.get("status") == "ready":
+            payload = entry.get("payload") or {}
+            candidates = list(payload.get("candidates") or [])
+        else:
+            snapshot_payload = terminal_check_snapshot_payload(config, policy_doc, start, end)
+            if snapshot_payload is not None:
+                candidates = list(snapshot_payload.get("candidates") or [])
+    except Exception:
+        candidates = []
+
+    total = 0
+    pending = 0
+    reviewed = 0
+    seen_candidate_ids: set[str] = set()
+    for candidate in candidates:
+        candidate_id = str(getattr(candidate, "candidate_id", "") or "")
+        review = reviews_by_candidate.get(candidate_id)
+        if review is not None and not review_visible(review):
+            continue
+        count = review_event_count(candidate)
+        total += count
+        seen_candidate_ids.add(candidate_id)
+        if review_is_pending(review):
+            pending += count
+        else:
+            reviewed += count
+
+    for review in visible_reviews:
+        candidate_id = str(review.candidate_id or "")
+        if candidate_id in seen_candidate_ids:
+            continue
+        count = review_event_count(review)
+        total += count
+        if review_is_pending(review):
+            pending += count
+        else:
+            reviewed += count
+    return {"total": total, "pending": pending, "reviewed": reviewed}
 
 
 def global_management_summary_style() -> str:
@@ -3936,6 +4028,63 @@ def existing_json_doc(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+POLICY_CHANGE_TRACKED_FILES = {"audit_policy.json", "sensitive_keywords.json", "audit_exclusions.json"}
+
+
+def policy_change_log_path(config: AppConfig) -> Path:
+    return policy_path(config).parent / "policy_change_log.jsonl"
+
+
+def policy_doc_hash(data: Any) -> str:
+    if isinstance(data, dict):
+        payload = {key: value for key, value in data.items() if key != "updated_at"}
+    else:
+        payload = data
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def policy_changed_keys(old_doc: dict[str, Any], new_doc: dict[str, Any]) -> list[str]:
+    keys = sorted((set(old_doc) | set(new_doc)) - {"updated_at"})
+    result: list[str] = []
+    for key in keys:
+        old_raw = json.dumps(old_doc.get(key), ensure_ascii=False, sort_keys=True, default=str)
+        new_raw = json.dumps(new_doc.get(key), ensure_ascii=False, sort_keys=True, default=str)
+        if old_raw != new_raw:
+            result.append(key)
+    return result
+
+
+def record_policy_doc_change(path: Path, old_doc: dict[str, Any], new_doc: dict[str, Any], config: AppConfig) -> None:
+    if path.name not in POLICY_CHANGE_TRACKED_FILES:
+        return
+    old_hash = policy_doc_hash(old_doc)
+    new_hash = policy_doc_hash(new_doc)
+    if old_hash == new_hash:
+        return
+    entry = {
+        "changed_at": iso_now(config),
+        "file": path.name,
+        "old_hash": old_hash,
+        "new_hash": new_hash,
+        "changed_keys": policy_changed_keys(old_doc, new_doc),
+        "auto_recompute": {
+            "tianqing_history": False,
+            "decrypt": "data-arrival-or-manual",
+            "plm": "data-arrival-or-manual",
+        },
+        "note": "策略变更只记录影响范围；天擎历史底稿和历史归档不会因策略 hash 变化自动重算。",
+    }
+    log_path = policy_change_log_path(config)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+    try:
+        log_path.chmod(0o640)
+    except OSError:
+        pass
+
+
 def backup_rule_doc(path: Path) -> None:
     if not path.exists():
         return
@@ -3960,6 +4109,7 @@ def guard_policy_doc_write(path: Path, data: dict[str, Any]) -> None:
 
 def write_rule_doc(path: Path, data: dict[str, Any], config: AppConfig) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    old_doc = existing_json_doc(path) if path.exists() else {}
     guard_policy_doc_write(path, data)
     backup_rule_doc(path)
     data["updated_at"] = iso_now(config)
@@ -3969,6 +4119,10 @@ def write_rule_doc(path: Path, data: dict[str, Any], config: AppConfig) -> None:
     try:
         path.chmod(0o640 if path.name == "audit_policy.json" else 0o644)
     except OSError:
+        pass
+    try:
+        record_policy_doc_change(path, old_doc, data, config)
+    except Exception:
         pass
 
 
@@ -4002,6 +4156,10 @@ def load_policy_doc(config: AppConfig) -> dict[str, Any]:
             "plm_login_audit": {
                 "constrained_departments": DEFAULT_PLM_CONSTRAINED_DEPARTMENTS,
                 "terminal_match_fields": DEFAULT_PLM_TERMINAL_MATCH_FIELDS,
+                "ip_mac_lookup_hours": DEFAULT_PLM_IP_MAC_LOOKUP_HOURS,
+                "terminal_valid_days": DEFAULT_PLM_TERMINAL_VALID_DAYS,
+                "source_warn_days": DEFAULT_PLM_SOURCE_WARN_DAYS,
+                "source_stale_days": DEFAULT_PLM_SOURCE_STALE_DAYS,
             },
             "terminal_behavior_review": terminal_review.DEFAULT_REVIEW_POLICY,
             "auth": {
@@ -4052,6 +4210,18 @@ def load_policy_doc(config: AppConfig) -> dict[str, Any]:
         match_fields = DEFAULT_PLM_TERMINAL_MATCH_FIELDS
     normalized_match_fields = [item for item in normalize_unique_text_list(match_fields) if item in DEFAULT_PLM_TERMINAL_MATCH_FIELDS]
     plm_login_audit["terminal_match_fields"] = normalized_match_fields or DEFAULT_PLM_TERMINAL_MATCH_FIELDS
+    plm_login_audit["ip_mac_lookup_hours"] = clamp_int(
+        plm_login_audit.get("ip_mac_lookup_hours"), DEFAULT_PLM_IP_MAC_LOOKUP_HOURS, 1, 24
+    )
+    plm_login_audit["terminal_valid_days"] = clamp_int(
+        plm_login_audit.get("terminal_valid_days"), DEFAULT_PLM_TERMINAL_VALID_DAYS, 1, 30
+    )
+    plm_login_audit["source_warn_days"] = clamp_int(
+        plm_login_audit.get("source_warn_days"), DEFAULT_PLM_SOURCE_WARN_DAYS, 1, 30
+    )
+    plm_login_audit["source_stale_days"] = clamp_int(
+        plm_login_audit.get("source_stale_days"), DEFAULT_PLM_SOURCE_STALE_DAYS, 1, 60
+    )
     loaded["plm_login_audit"] = plm_login_audit
     terminal_behavior_review = loaded.get("terminal_behavior_review")
     if not isinstance(terminal_behavior_review, dict):
@@ -5230,6 +5400,15 @@ def load_live_decrypt_analysis(
     return report_gen.load_decrypt_risk_analysis(args, start, end, tz, [], internal_domains)
 
 
+def load_live_decrypt_basic_records(
+    config: AppConfig,
+    start: datetime,
+    end: datetime,
+) -> list[report_gen.DecryptRiskRecord]:
+    args, tz, _internal_domains = live_decrypt_policy_context(config)
+    return decrypt_data.query_decrypt_records(args, start, end, tz)
+
+
 def live_decrypt_policy_fingerprint(config: AppConfig) -> str:
     with RULES_LOCK:
         policy_doc = load_policy_doc(config)
@@ -5265,6 +5444,46 @@ def live_decrypt_clear_cache() -> None:
             if hasattr(event, "set"):
                 event.set()
         DECRYPT_ANALYSIS_CACHE.clear()
+    with DECRYPT_SUMMARY_CACHE_LOCK:
+        DECRYPT_SUMMARY_CACHE.clear()
+    with DECRYPT_DETAIL_WARMUP_CACHE_LOCK:
+        DECRYPT_DETAIL_WARMUP_CACHE.clear()
+
+
+def live_decrypt_summary_prune(now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    for key, value in list(DECRYPT_SUMMARY_CACHE.items()):
+        if now - float(value.get("created_at") or 0) > DECRYPT_SUMMARY_CACHE_TTL_SECONDS:
+            DECRYPT_SUMMARY_CACHE.pop(key, None)
+    if len(DECRYPT_SUMMARY_CACHE) <= DECRYPT_SUMMARY_CACHE_MAX_ENTRIES:
+        return
+    ordered = sorted(DECRYPT_SUMMARY_CACHE.items(), key=lambda item: float(item[1].get("created_at") or 0))
+    for key, _value in ordered[: max(0, len(DECRYPT_SUMMARY_CACHE) - DECRYPT_SUMMARY_CACHE_MAX_ENTRIES)]:
+        DECRYPT_SUMMARY_CACHE.pop(key, None)
+
+
+def live_decrypt_summary_cache_get(config: AppConfig, start: datetime, end: datetime) -> bytes | None:
+    if not realtime_optimization_enabled():
+        return None
+    key = live_decrypt_cache_key(config, start, end)
+    now = time.time()
+    with DECRYPT_SUMMARY_CACHE_LOCK:
+        live_decrypt_summary_prune(now)
+        entry = DECRYPT_SUMMARY_CACHE.get(key)
+        if entry and now - float(entry.get("created_at") or 0) <= DECRYPT_SUMMARY_CACHE_TTL_SECONDS:
+            html_text = entry.get("html")
+            if isinstance(html_text, str):
+                return html_text.encode("utf-8")
+    return None
+
+
+def live_decrypt_summary_cache_put(config: AppConfig, start: datetime, end: datetime, html_text: str) -> None:
+    if not realtime_optimization_enabled():
+        return
+    key = live_decrypt_cache_key(config, start, end)
+    with DECRYPT_SUMMARY_CACHE_LOCK:
+        live_decrypt_summary_prune()
+        DECRYPT_SUMMARY_CACHE[key] = {"created_at": time.time(), "html": html_text}
 
 
 def live_decrypt_build_payload(config: AppConfig, start: datetime, end: datetime) -> dict[str, Any]:
@@ -5528,6 +5747,49 @@ FORMAT JSONEachRow
     }
 
 
+def live_decrypt_period_group_rows(config: AppConfig, start: datetime, end: datetime) -> list[dict[str, Any]]:
+    if not config.use_clickhouse:
+        return []
+    args, _tz, _internal_domains = live_decrypt_policy_context(config)
+    bucket_expr = live_decrypt_bucket_expr(live_decrypt_sql_classifiers())
+    query = f"""
+SELECT
+  {bucket_expr} AS bucket,
+  raw_org_path,
+  raw_company,
+  raw_department,
+  count() AS count
+FROM decrypt_records FINAL
+WHERE isNotNull(apply_time)
+  AND apply_time >= parseDateTime64BestEffort({decrypt_records.clickhouse_quote(start.isoformat())}, 3)
+  AND apply_time < parseDateTime64BestEffort({decrypt_records.clickhouse_quote(end.isoformat())}, 3)
+GROUP BY bucket, raw_org_path, raw_company, raw_department
+FORMAT JSONEachRow
+"""
+    return [
+        json.loads(line)
+        for line in decrypt_records.clickhouse_request(args, query).decode("utf-8", errors="replace").splitlines()
+        if line.strip()
+    ]
+
+
+def live_decrypt_counts_from_group_rows(rows: list[dict[str, Any]]) -> dict[str, int]:
+    bucket_counts: Counter = Counter()
+    for row in rows:
+        bucket_counts[str(row.get("bucket") or "其他")] += int(row.get("count") or 0)
+    structure = int(bucket_counts.get("结构", 0) or 0)
+    electrical = int(bucket_counts.get("电气", 0) or 0)
+    return {
+        "records": sum(int(value or 0) for value in bucket_counts.values()),
+        "standard": structure + electrical,
+        "structure": structure,
+        "electrical": electrical,
+        "three_d": int(bucket_counts.get("三维模型", 0) or 0),
+        "dwg": int(bucket_counts.get("DWG图纸", 0) or 0),
+        "archive": int(bucket_counts.get("压缩包", 0) or 0),
+    }
+
+
 def live_decrypt_trend_summary_html(config: AppConfig, start: datetime, end: datetime) -> str:
     if not config.use_clickhouse:
         return ""
@@ -5628,27 +5890,12 @@ def live_decrypt_company_matrix_summary_html(
     start: datetime,
     end: datetime,
     limit: int = 10,
+    grouped_rows: list[dict[str, Any]] | None = None,
 ) -> str:
     if not config.use_clickhouse:
         return ""
-    args, _tz, _internal_domains = live_decrypt_policy_context(config)
-    bucket_expr = live_decrypt_bucket_expr(live_decrypt_sql_classifiers())
-    query = f"""
-SELECT
-  {bucket_expr} AS bucket,
-  raw_org_path,
-  raw_company,
-  raw_department,
-  count() AS count
-FROM decrypt_records FINAL
-WHERE isNotNull(apply_time)
-  AND apply_time >= parseDateTime64BestEffort({decrypt_records.clickhouse_quote(start.isoformat())}, 3)
-  AND apply_time < parseDateTime64BestEffort({decrypt_records.clickhouse_quote(end.isoformat())}, 3)
-GROUP BY bucket, raw_org_path, raw_company, raw_department
-FORMAT JSONEachRow
-"""
     try:
-        rows = [json.loads(line) for line in decrypt_records.clickhouse_request(args, query).decode("utf-8", errors="replace").splitlines() if line.strip()]
+        rows = grouped_rows if grouped_rows is not None else live_decrypt_period_group_rows(config, start, end)
     except Exception:
         return ""
 
@@ -5796,10 +6043,22 @@ def live_decrypt_fragment(config: AppConfig, start: datetime, end: datetime) -> 
 
 
 def live_decrypt_summary_fragment(config: AppConfig, start: datetime, end: datetime) -> bytes:
-    counts = live_decrypt_summary_counts(config, start, end)
+    cached = live_decrypt_summary_cache_get(config, start, end)
+    if cached is not None:
+        return cached
+    grouped_rows: list[dict[str, Any]] | None = None
+    if realtime_optimization_enabled() and config.use_clickhouse:
+        try:
+            grouped_rows = live_decrypt_period_group_rows(config, start, end)
+            counts = live_decrypt_counts_from_group_rows(grouped_rows)
+        except Exception:
+            grouped_rows = None
+            counts = live_decrypt_summary_counts(config, start, end)
+    else:
+        counts = live_decrypt_summary_counts(config, start, end)
     links = live_decrypt_links(start, end)
     trend_html = live_decrypt_trend_summary_html(config, start, end)
-    company_matrix_html = live_decrypt_company_matrix_summary_html(config, start, end)
+    company_matrix_html = live_decrypt_company_matrix_summary_html(config, start, end, grouped_rows=grouped_rows)
     structure = int(counts.get("structure", 0) or 0)
     electrical = int(counts.get("electrical", 0) or 0)
     standard = int(counts.get("standard", 0) or 0)
@@ -5849,7 +6108,9 @@ def live_decrypt_summary_fragment(config: AppConfig, start: datetime, end: datet
         card("DWG图纸", dwg, "DWG 图纸解密记录", links.get("dwg"), "slate"),
         card("同名疑似线索", "打开即预热", "首页打开后同步预热解密记录与天擎审计事件的同名疑似后续线索", links.get("linked"), "red"),
     ]
-    return (overview + f'<div class="decrypt-card-grid">{"".join(cards)}</div>' + trend_html + company_matrix_html).encode("utf-8")
+    html_text = overview + f'<div class="decrypt-card-grid">{"".join(cards)}</div>' + trend_html + company_matrix_html
+    live_decrypt_summary_cache_put(config, start, end, html_text)
+    return html_text.encode("utf-8")
 
 
 def filter_live_decrypt_records(
@@ -5930,7 +6191,7 @@ def live_decrypt_detail_page(config: AppConfig, start: datetime, end: datetime, 
     return html_text.encode("utf-8")
 
 
-def live_decrypt_warmup_json(config: AppConfig, start: datetime, end: datetime) -> bytes:
+def live_decrypt_full_warmup(config: AppConfig, start: datetime, end: datetime) -> dict[str, Any]:
     started_at = time.time()
     payload = live_decrypt_cached_payload(config, start, end, wait_seconds=60, build_if_missing=True)
     if not payload:
@@ -5954,15 +6215,46 @@ def live_decrypt_warmup_json(config: AppConfig, start: datetime, end: datetime) 
         live_decrypt_detail_page(config, start, end, {"scope": ["company"], "company": [company], "bucket": ["__all__"]})
         warmed_details.append(f"company:{company}")
     elapsed = round(time.time() - started_at, 3)
-    return json.dumps(
-        {
-            "status": "ready",
-            "records": records_count,
-            "warmed_details": warmed_details,
-            "elapsed": elapsed,
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
+    return {
+        "status": "ready",
+        "records": records_count,
+        "warmed_details": warmed_details,
+        "elapsed": elapsed,
+    }
+
+
+def live_decrypt_schedule_full_warmup(config: AppConfig, start: datetime, end: datetime) -> dict[str, Any]:
+    key = live_decrypt_cache_key(config, start, end)
+    now = time.time()
+    with DECRYPT_DETAIL_WARMUP_CACHE_LOCK:
+        for cache_key, value in list(DECRYPT_DETAIL_WARMUP_CACHE.items()):
+            if now - float(value.get("created_at") or 0) > DECRYPT_DETAIL_WARMUP_CACHE_TTL_SECONDS:
+                DECRYPT_DETAIL_WARMUP_CACHE.pop(cache_key, None)
+        existing = DECRYPT_DETAIL_WARMUP_CACHE.get(key)
+        if existing and existing.get("status") in {"loading", "ready"}:
+            return dict(existing)
+        DECRYPT_DETAIL_WARMUP_CACHE[key] = {"created_at": now, "status": "loading"}
+
+    def worker() -> None:
+        try:
+            result = live_decrypt_full_warmup(config, start, end)
+        except Exception as exc:
+            result = {"status": "error", "error": f"{type(exc).__name__}: {str(exc)[:240]}"}
+        with DECRYPT_DETAIL_WARMUP_CACHE_LOCK:
+            result["created_at"] = time.time()
+            DECRYPT_DETAIL_WARMUP_CACHE[key] = result
+
+    threading.Thread(target=worker, name="decrypt-detail-warmup", daemon=True).start()
+    return {"created_at": now, "status": "loading"}
+
+
+def live_decrypt_warmup_json(config: AppConfig, start: datetime, end: datetime) -> bytes:
+    if realtime_optimization_enabled():
+        result = live_decrypt_schedule_full_warmup(config, start, end)
+    else:
+        result = live_decrypt_full_warmup(config, start, end)
+    result = {key: value for key, value in result.items() if key != "created_at"}
+    return json.dumps(result, ensure_ascii=False).encode("utf-8")
 
 
 def live_decrypt_loading_placeholder_html(start: datetime, end: datetime) -> str:
@@ -5997,6 +6289,7 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
         return data
     summary_url = live_decrypt_url("/api/decrypt-risk-summary-fragment", start, end)
     warmup_url = live_decrypt_url("/api/decrypt-risk-warmup", start, end)
+    optimized_realtime = "true" if realtime_optimization_enabled() else "false"
     prehide_style = """
 <style id="tq-live-decrypt-prehide">
   #decrypt-risk-overview[data-live-decrypt-state="loading"] {
@@ -6087,6 +6380,7 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
 (function() {{
   var summaryUrl = {json.dumps(summary_url, ensure_ascii=False)};
   var warmupUrl = {json.dumps(warmup_url, ensure_ascii=False)};
+  var optimizedRealtime = {optimized_realtime};
   function removePrehide() {{
     var style = document.getElementById("tq-live-decrypt-prehide");
     if (style && style.parentNode) {{
@@ -6124,7 +6418,7 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
       }} else if (warmupDone) {{
         status.textContent = "完整下钻缓存已刷新；首页数字刷新中";
       }} else {{
-        status.textContent = "解密审计数字和完整下钻缓存同步刷新中";
+        status.textContent = "解密审计数字、趋势和公司矩阵刷新中";
       }}
     }}
     function applySummary(html) {{
@@ -6204,21 +6498,33 @@ def inject_live_decrypt_loader(data: bytes, config: AppConfig) -> bytes:
           return resp.json();
         }});
     }}
+    function startWarmup() {{
+      fetchJson(warmupUrl)
+        .then(function(data) {{
+          warmupDone = true;
+          section.setAttribute("data-live-decrypt-warmup", data && data.status ? data.status : "ready");
+          refreshStatus();
+        }})
+        .catch(function(err) {{
+          warmupError = err.message || "unknown";
+          section.setAttribute("data-live-decrypt-warmup", "error");
+          refreshStatus();
+        }});
+    }}
     refreshStatus();
-    fetchJson(warmupUrl)
-      .then(function(data) {{
-        warmupDone = true;
-        section.setAttribute("data-live-decrypt-warmup", "ready");
-        refreshStatus();
-      }})
-      .catch(function(err) {{
-        warmupError = err.message || "unknown";
-        section.setAttribute("data-live-decrypt-warmup", "error");
-        refreshStatus();
-      }});
-    fetchHtml(summaryUrl)
-      .then(applySummary)
-      .catch(showError);
+    if (optimizedRealtime) {{
+      fetchHtml(summaryUrl)
+        .then(function(html) {{
+          applySummary(html);
+          window.setTimeout(startWarmup, 150);
+        }})
+        .catch(showError);
+    }} else {{
+      startWarmup();
+      fetchHtml(summaryUrl)
+        .then(applySummary)
+        .catch(showError);
+    }}
   }}
   if (document.readyState === "loading") {{
     document.addEventListener("DOMContentLoaded", loadLiveDecrypt);
@@ -6772,7 +7078,7 @@ def settings_page(config: AppConfig) -> bytes:
     terminal_pool = latest_encryption_terminal_pool(config)
     terminal_metric = "未导入"
     if terminal_pool:
-        terminal_metric = f"{int(terminal_pool.get('trusted_terminal_keys') or 0)} 个授信终端键"
+        terminal_metric = f"{int(terminal_pool.get('trusted_terminal_keys') or 0)} 个候选登录键"
     body = f"""
     <header>
       <div>
@@ -6863,7 +7169,7 @@ def settings_page(config: AppConfig) -> bytes:
       <div class="settings-card">
         <h3>加密终端列表</h3>
         <p class="metric">{esc(terminal_metric)}</p>
-        <p class="muted">上传加密软件终端清单，最新批次中 7 天内在线的 IP+计算机名作为 PLM 授信终端池来源。</p>
+        <p class="muted">上传加密软件终端清单，PLM 登录先用 IP+计算机名反查天擎 MAC，再按 MAC 校验是否属于有效加密终端。</p>
         <div class="actions"><a class="button primary" href="/settings/encryption-terminals">上传终端列表</a></div>
       </div>
       <div class="settings-card">
@@ -6944,6 +7250,20 @@ def terminal_check_policy_fingerprint(policy_doc: dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
+def terminal_check_tianqing_candidate_fingerprint(policy_doc: dict[str, Any]) -> str:
+    payload = {
+        "recipient_control_version": 2,
+        "candidate_event_count_version": 3,
+        "design_suffixes": policy_doc.get("design_suffixes"),
+        "critical_design_patterns": policy_doc.get("critical_design_patterns"),
+        "archive_suffixes": policy_doc.get("archive_suffixes"),
+        "internal_targets": policy_doc.get("internal_targets"),
+        "terminal_behavior_review": policy_doc.get("terminal_behavior_review"),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
 def terminal_check_cache_key(policy_doc: dict[str, Any], start: datetime, end: datetime) -> tuple[str, str, str]:
     return (datetime_input_value(start), datetime_input_value(end), terminal_check_policy_fingerprint(policy_doc))
 
@@ -7000,6 +7320,26 @@ def terminal_check_payload(
     }
 
 
+def terminal_check_tianqing_candidates(
+    config: AppConfig,
+    policy_doc: dict[str, Any],
+    start: datetime,
+    end: datetime,
+) -> list[terminal_review.TerminalBehaviorCandidate]:
+    policy_hash = terminal_check_tianqing_candidate_fingerprint(policy_doc)
+    if realtime_optimization_enabled():
+        cached = terminal_review.fetch_cached_candidates(config, start, end, policy_hash)
+        if cached is not None:
+            return cached
+    candidates = terminal_review.generate_candidates(config, policy_doc, start, end)
+    if realtime_optimization_enabled():
+        try:
+            terminal_review.store_cached_candidates(config, start, end, policy_hash, candidates)
+        except Exception:
+            pass
+    return candidates
+
+
 def decrypt_group_candidate_id(import_batch: str, applicant_key: str, records: list[report_gen.DecryptRiskRecord]) -> str:
     batch_key = import_batch or (records[0].source_file if records else "")
     if not batch_key:
@@ -7034,16 +7374,29 @@ def decrypt_record_review_row(record: report_gen.DecryptRiskRecord) -> dict[str,
 
 
 def decrypt_review_candidates(config: AppConfig, start: datetime, end: datetime) -> list[terminal_review.TerminalBehaviorCandidate]:
-    try:
-        payload = live_decrypt_cached_payload(config, start, end, wait_seconds=0, build_if_missing=True)
-    except Exception:
-        payload = None
-    if not payload:
-        return []
-    analysis = payload.get("analysis")
-    if analysis is None:
-        return []
-    records = report_gen.decrypt_standard_records(getattr(analysis, "records", []) or [])
+    records: list[report_gen.DecryptRiskRecord] = []
+    if realtime_optimization_enabled():
+        try:
+            records = report_gen.decrypt_standard_records(load_live_decrypt_basic_records(config, start, end))
+        except Exception:
+            records = []
+    if not records:
+        try:
+            payload = live_decrypt_cached_payload(
+                config,
+                start,
+                end,
+                wait_seconds=0,
+                build_if_missing=not realtime_optimization_enabled(),
+            )
+        except Exception:
+            payload = None
+        if not payload:
+            return []
+        analysis = payload.get("analysis")
+        if analysis is None:
+            return []
+        records = report_gen.decrypt_standard_records(getattr(analysis, "records", []) or [])
     groups: dict[tuple[str, str], list[report_gen.DecryptRiskRecord]] = defaultdict(list)
     for record in records:
         applicant_key = report_gen.normalize_key(record.applicant_account) or report_gen.normalize_key(record.applicant_name) or "unknown"
@@ -7117,7 +7470,26 @@ def decrypt_review_candidates(config: AppConfig, start: datetime, end: datetime)
 
 
 def terminal_check_build_payload(config: AppConfig, policy_doc: dict[str, Any], start: datetime, end: datetime) -> dict[str, Any]:
-    candidates = decrypt_review_candidates(config, start, end) + terminal_review.generate_candidates(config, policy_doc, start, end)
+    candidates = decrypt_review_candidates(config, start, end) + terminal_check_tianqing_candidates(config, policy_doc, start, end)
+    reviews = terminal_review.fetch_reviews(config, start, end, include_all_status=True)
+    return terminal_check_payload(candidates, reviews)
+
+
+def terminal_check_snapshot_payload(config: AppConfig, policy_doc: dict[str, Any], start: datetime, end: datetime) -> dict[str, Any] | None:
+    """Return a complete payload only when the Tianqing candidate snapshot exists.
+
+    Decrypt candidates are light-weight and may change after Excel imports, so
+    they are still read live. The expensive Tianqing side must already have a
+    candidate snapshot; otherwise the caller can decide whether to show a
+    waiting state or a non-precomputed state.
+    """
+    if not realtime_optimization_enabled():
+        return None
+    policy_hash = terminal_check_tianqing_candidate_fingerprint(policy_doc)
+    tianqing_candidates = terminal_review.fetch_cached_candidates(config, start, end, policy_hash)
+    if tianqing_candidates is None:
+        return None
+    candidates = decrypt_review_candidates(config, start, end) + tianqing_candidates
     reviews = terminal_review.fetch_reviews(config, start, end, include_all_status=True)
     return terminal_check_payload(candidates, reviews)
 
@@ -7572,80 +7944,6 @@ def terminal_check_css() -> str:
   .terminal-check-hidden {
     display: none;
   }
-  .terminal-check-live-status {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin: 16px 0 4px;
-    color: #475467;
-    font-size: 13px;
-    font-weight: 760;
-  }
-  .terminal-check-live-status::before {
-    content: "";
-    width: 7px;
-    height: 7px;
-    border-radius: 999px;
-    background: #175cd3;
-    box-shadow: 11px 0 0 rgba(23, 92, 211, .38), 22px 0 0 rgba(23, 92, 211, .18);
-    animation: terminalCheckDots 1.05s infinite ease-in-out;
-  }
-  .terminal-check-dot-value {
-    position: relative;
-    display: inline-flex;
-    min-width: 22px;
-    min-height: 20px;
-    align-items: center;
-    justify-content: center;
-    color: transparent !important;
-  }
-  .terminal-check-dot-value::after {
-    content: "...";
-    position: absolute;
-    inset: 0;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    color: #175cd3;
-    font-weight: 900;
-    letter-spacing: 1px;
-    animation: terminalCheckTextDots 1.05s infinite ease-in-out;
-  }
-  .terminal-check-skeleton-text {
-    display: block;
-    width: 72%;
-    height: 10px;
-    margin: 0 auto;
-    border-radius: 999px;
-    background: linear-gradient(110deg, #edf3fb 8%, #f8fbff 28%, #edf3fb 46%);
-    background-size: 220% 100%;
-    animation: terminalCheckShimmer 1.35s ease-in-out infinite;
-  }
-  .terminal-check-skeleton-text.short { width: 46%; }
-  .terminal-check-live[data-terminal-check-loading="1"] .terminal-check-chip strong,
-  .terminal-check-live[data-terminal-check-loading="1"] .terminal-check-chip span {
-    position: relative;
-    color: transparent !important;
-  }
-  .terminal-check-live[data-terminal-check-loading="1"] .terminal-check-chip strong::after {
-    content: "...";
-    position: absolute;
-    inset: 0;
-    display: inline-flex;
-    align-items: center;
-    color: #175cd3;
-    font-weight: 900;
-    letter-spacing: 1px;
-    animation: terminalCheckTextDots 1.05s infinite ease-in-out;
-  }
-  .terminal-check-live[data-terminal-check-loading="1"] .terminal-check-chip span::after {
-    content: attr(data-loading-label);
-    position: absolute;
-    inset: 0;
-    display: inline-flex;
-    align-items: center;
-    color: #667085;
-  }
   .terminal-check-loading {
     margin-top: 18px;
     border: 1px solid #d8e4f2;
@@ -7654,6 +7952,68 @@ def terminal_check_css() -> str:
     background: linear-gradient(180deg, #ffffff 0%, #f7fbff 100%);
     color: #43546c;
     box-shadow: 0 12px 26px rgba(23, 32, 51, 0.045);
+  }
+  .terminal-check-state {
+    margin-top: 18px;
+    border: 1px solid rgba(18, 32, 51, 0.10);
+    border-radius: 16px;
+    padding: 18px 20px;
+    background:
+      radial-gradient(circle at 100% 0%, rgba(36, 94, 219, 0.06) 0, transparent 24%),
+      linear-gradient(180deg, #ffffff 0%, #f9fbfe 100%);
+    box-shadow: 0 10px 26px rgba(18, 32, 51, 0.055);
+  }
+  .terminal-check-state-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+  }
+  .terminal-check-state h2 {
+    margin: 0;
+    color: #122033;
+    font-size: 20px;
+    font-weight: 900;
+  }
+  .terminal-check-state p {
+    margin: 7px 0 0;
+    color: #667085;
+    font-size: 13px;
+    font-weight: 720;
+    line-height: 1.6;
+  }
+  .terminal-check-state-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 30px;
+    border-radius: 999px;
+    border: 1px solid #d8e4f2;
+    padding: 4px 11px;
+    background: #f8fbff;
+    color: #175cd3;
+    font-size: 12px;
+    font-weight: 850;
+    white-space: nowrap;
+  }
+  .terminal-check-state-badge::before {
+    content: "";
+    width: 7px;
+    height: 7px;
+    border-radius: 999px;
+    background: #175cd3;
+  }
+  .terminal-check-state[data-terminal-check-loading="1"] .terminal-check-state-badge::before {
+    box-shadow: 11px 0 0 rgba(23, 92, 211, .38), 22px 0 0 rgba(23, 92, 211, .18);
+    animation: terminalCheckDots 1.05s infinite ease-in-out;
+  }
+  .terminal-check-state[data-terminal-check-missing="1"] .terminal-check-state-badge {
+    border-color: #fde2b8;
+    background: #fff8eb;
+    color: #b54708;
+  }
+  .terminal-check-state[data-terminal-check-missing="1"] .terminal-check-state-badge::before {
+    background: #f79009;
   }
   .terminal-check-live > section:not(.terminal-check-section),
   [data-terminal-check-ready] > section:not(.terminal-check-section),
@@ -7705,14 +8065,6 @@ def terminal_check_css() -> str:
     0%, 100% { box-shadow: 11px 0 0 rgba(23, 92, 211, .38), 22px 0 0 rgba(23, 92, 211, .18); }
     33% { box-shadow: 11px 0 0 #175cd3, 22px 0 0 rgba(23, 92, 211, .38); }
     66% { box-shadow: 11px 0 0 rgba(23, 92, 211, .38), 22px 0 0 #175cd3; }
-  }
-  @keyframes terminalCheckTextDots {
-    0%, 100% { opacity: .42; }
-    50% { opacity: 1; }
-  }
-  @keyframes terminalCheckShimmer {
-    0% { background-position: 180% 0; }
-    100% { background-position: -60% 0; }
   }
   @media (max-width: 980px) {
     .terminal-check-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -7778,14 +8130,6 @@ def terminal_check_metrics_html(candidates: list[terminal_review.TerminalBehavio
     ]
     return '<div class="terminal-check-grid">' + "".join(
         f'<div class="terminal-check-chip"><span>{esc(label)}</span><strong>{esc(value)}</strong></div>' for label, value in chips
-    ) + "</div>"
-
-
-def terminal_check_loading_metrics_html() -> str:
-    labels = ["一级风险复核对象", "解密审计", "天擎流转", "人工确认/进入报告"]
-    return '<div class="terminal-check-grid">' + "".join(
-        f'<div class="terminal-check-chip"><span data-loading-label="{esc(label)}">{esc(label)}</span><strong>...</strong></div>'
-        for label in labels
     ) + "</div>"
 
 
@@ -8086,53 +8430,6 @@ def terminal_check_matrix_headers(channels: list[str], columns: list[str]) -> tu
     return channel_headers, object_headers
 
 
-def terminal_candidates_loading_table(row_count: int = 8) -> str:
-    channels = list(report_gen.CHANNEL_MATRIX_BASE_ROWS)
-    columns = list(report_gen.CHANNEL_MATRIX_COLUMNS)
-    channel_headers, object_headers = terminal_check_matrix_headers(channels, columns)
-    colgroup = terminal_check_matrix_colgroup(channels, columns)
-    matrix_cell_count = len(channels) * len(columns)
-    rows: list[str] = []
-    for idx in range(1, row_count + 1):
-        matrix_cells = "".join('<td><span class="terminal-check-dot-value">...</span></td>' for _ in range(matrix_cell_count))
-        rows.append(
-            f"""
-<tr>
-  <td class="rank-cell">{idx}</td>
-  <td class="identity-cell"><span class="terminal-check-skeleton-text"></span></td>
-  <td class="identity-cell"><span class="terminal-check-skeleton-text short"></span></td>
-  <td class="identity-cell"><span class="terminal-check-skeleton-text short"></span></td>
-  <td class="ip-cell"><span class="terminal-check-skeleton-text"></span></td>
-  {matrix_cells}
-  <td><span class="terminal-check-dot-value">...</span></td>
-  <td class="review-action-cell"><span class="terminal-check-action">待核查</span></td>
-  <td class="review-action-cell"><span class="terminal-check-action">填写</span></td>
-</tr>"""
-        )
-    return f"""
-<div class="terminal-check-matrix-wrap">
-  <table class="terminal-check-matrix" data-matrix-data-cols="{matrix_cell_count}">
-    {colgroup}
-    <thead>
-      <tr>
-        <th rowspan="2">#</th>
-        <th rowspan="2">公司</th>
-        <th rowspan="2">部门</th>
-        <th rowspan="2">使用人</th>
-        <th rowspan="2">IP地址</th>
-        {channel_headers}
-        <th rowspan="2">合计</th>
-        <th rowspan="2">核查状态</th>
-        <th rowspan="2">核查结果</th>
-      </tr>
-      <tr>{object_headers}</tr>
-    </thead>
-    <tbody>{''.join(rows)}</tbody>
-  </table>
-</div>
-"""
-
-
 def terminal_reviews_table(reviews: list[terminal_review.TerminalBehaviorReview]) -> str:
     if not reviews:
         return '<p class="muted">当前周期暂无已保存核查记录。</p>'
@@ -8151,34 +8448,6 @@ def terminal_reviews_table(reviews: list[terminal_review.TerminalBehaviorReview]
   <td class="compact" title="{esc(review.conclusion)}">{esc(review.conclusion or "-")}</td>
   <td>{esc(review.reviewer_name or review.reviewer_userid)}<br><span class="muted">{esc(review.review_time[:19])}</span></td>
   <td>{esc('是' if review.include_in_report else '否')}</td>
-</tr>"""
-        )
-    return f"""
-<div class="table-wrap">
-  <table class="terminal-check-table">
-    <thead><tr><th>事件时间</th><th>入选原因</th><th>公司/部门</th><th>使用人</th><th>IP地址</th><th>事件数</th><th>核查状态</th><th>核查结果</th><th>审核人</th><th>进入报告</th></tr></thead>
-    <tbody>{''.join(rows)}</tbody>
-  </table>
-</div>
-"""
-
-
-def terminal_reviews_loading_table(row_count: int = 3) -> str:
-    rows = []
-    for _idx in range(row_count):
-        rows.append(
-            """
-<tr>
-  <td><span class="terminal-check-skeleton-text"></span></td>
-  <td><span class="terminal-check-skeleton-text"></span></td>
-  <td><span class="terminal-check-skeleton-text"></span></td>
-  <td><span class="terminal-check-skeleton-text short"></span></td>
-  <td><span class="terminal-check-skeleton-text"></span></td>
-  <td><span class="terminal-check-dot-value">...</span></td>
-  <td><span class="terminal-check-action">待核查</span></td>
-  <td><span class="terminal-check-skeleton-text short"></span></td>
-  <td><span class="terminal-check-skeleton-text"></span></td>
-  <td><span class="terminal-check-dot-value">...</span></td>
 </tr>"""
         )
     return f"""
@@ -8234,7 +8503,7 @@ def terminal_check_work_area_html(
       <div class="terminal-check-section-head">
         <div>
           <h2>天擎外发/流转审计</h2>
-          <p class="muted">仅展示天擎一级风险：标准图纸流转、技术/工艺/研发大于100MB压缩包流转；按终端聚合，数字为去重后的一级风险笔数。</p>
+          <p class="muted">仅展示天擎一级风险：标准图纸流转、技术/工艺/研发大于100MB压缩包流转；按终端聚合，矩阵数字为可追溯的事实事件数。</p>
         </div>
         <div class="actions">{save_button}</div>
       </div>
@@ -8260,30 +8529,42 @@ def terminal_check_work_area_html(
 """
 
 
+def terminal_check_period_recent_enough(config: AppConfig, _start: datetime, end: datetime) -> bool:
+    tz = local_tz(config.timezone)
+    now = datetime.now(tz) if tz else datetime.now()
+    if end.tzinfo is None and now.tzinfo is not None:
+        now_cmp = now.replace(tzinfo=None)
+    elif end.tzinfo is not None and now.tzinfo is None:
+        now_cmp = now.replace(tzinfo=end.tzinfo)
+    else:
+        now_cmp = now
+    return end >= now_cmp - timedelta(days=10)
+
+
 def terminal_check_loading_html(start: datetime, end: datetime) -> str:
     return f"""
-<div class="terminal-check-live" data-terminal-check-loading="1">
-  <p class="terminal-check-live-status">一级风险复核对象正在计算，三大模块结构已就绪，数字和行数据稍后自动刷新</p>
-  {terminal_check_loading_metrics_html()}
-  <form class="terminal-check-review-form" method="post" action="/terminal-check/review" aria-busy="true">
-    <input type="hidden" name="start" value="{esc(datetime_input_value(start))}">
-    <input type="hidden" name="end" value="{esc(datetime_input_value(end))}">
-    <section class="terminal-check-section">
-      <div class="terminal-check-section-head">
-        <div>
-          <h2>一级风险复核池</h2>
-          <p class="muted">按当前报告周期聚合加密软件解密审计、天擎外发/流转审计和 PLM 登录审计；完成后可点击数字查看证据并保存核查结果。</p>
-        </div>
-        <div class="actions"><button class="primary" type="button" disabled>保存核查结果</button></div>
-      </div>
-      {terminal_candidates_loading_table()}
-    </section>
-  </form>
-  <section>
-    <h2>已保存核查记录</h2>
-    <p class="muted">已保存记录会随复核数据一起刷新。</p>
-    {terminal_reviews_loading_table()}
-  </section>
+<div class="terminal-check-state" data-terminal-check-loading="1">
+  <div class="terminal-check-state-head">
+    <div>
+      <h2>一级风险复核候选正在准备</h2>
+      <p>周期：{esc(start.strftime('%Y-%m-%d %H:%M'))} 至 {esc(end.strftime('%Y-%m-%d %H:%M'))}。系统正在生成本周期候选快照，完成后页面会自动显示复核矩阵。</p>
+    </div>
+    <span class="terminal-check-state-badge">生成中</span>
+  </div>
+</div>
+"""
+
+
+def terminal_check_missing_snapshot_html(start: datetime, end: datetime) -> str:
+    return f"""
+<div class="terminal-check-state" data-terminal-check-missing="1">
+  <div class="terminal-check-state-head">
+    <div>
+      <h2>该周期复核候选未预计算</h2>
+      <p>周期：{esc(start.strftime('%Y-%m-%d %H:%M'))} 至 {esc(end.strftime('%Y-%m-%d %H:%M'))}。为避免打开历史页面时触发天擎大范围重算，当前不会自动扫描历史底稿。</p>
+    </div>
+    <span class="terminal-check-state-badge">未预计算</span>
+  </div>
 </div>
 """
 
@@ -8313,6 +8594,14 @@ def terminal_check_fragment_html(config: AppConfig, start: datetime, end: dateti
         return terminal_check_work_area_html(payload.get("candidates") or [], payload.get("reviews") or [], start, end).encode("utf-8")
     if entry and entry.get("status") == "error":
         return terminal_check_error_html(str(entry.get("error") or "候选生成失败")).encode("utf-8")
+    snapshot_payload = terminal_check_snapshot_payload(config, policy_doc, start, end)
+    if snapshot_payload is not None:
+        terminal_check_put_cache(policy_doc, start, end, snapshot_payload.get("candidates") or [], snapshot_payload.get("reviews") or [])
+        return terminal_check_work_area_html(snapshot_payload.get("candidates") or [], snapshot_payload.get("reviews") or [], start, end).encode("utf-8")
+    if entry and entry.get("status") == "loading":
+        return terminal_check_loading_html(start, end).encode("utf-8")
+    if not terminal_check_period_recent_enough(config, start, end):
+        return terminal_check_missing_snapshot_html(start, end).encode("utf-8")
     terminal_check_schedule_warm_cache(config, policy_doc, start, end)
     return terminal_check_loading_html(start, end).encode("utf-8")
 
@@ -8352,7 +8641,10 @@ def terminal_check_loader_script(start: datetime, end: datetime) -> str:
     if (target.querySelector("[data-terminal-check-ready='1']")) {{
       return;
     }}
-    if (target.querySelector("[data-terminal-check-summary='1']")) {{
+    if (target.querySelector("[data-terminal-check-missing='1']")) {{
+      return;
+    }}
+    if (target.querySelector("[data-terminal-check-loading='1'],[data-terminal-check-summary='1']")) {{
       timer = window.setTimeout(load, 2000);
     }} else {{
       load();
@@ -8458,7 +8750,7 @@ def terminal_behavior_policy_page(config: AppConfig, message: str = "", error: s
         </select>
       </label>
       {inputs}
-      <p class="muted full">当前口径：天擎标准图纸经邮件、IM、外部站点上传或外设拷贝等通道流转即入候选；大于100MB压缩包仅在技术部、工艺部、研发部命中时入候选；PLM 登录审计接入后，技术、研发、工艺账号池外登录也进入复核。敏感词和普通图纸高频不进入风险终端复核候选。</p>
+      <p class="muted full">当前口径：天擎标准图纸经邮件、IM、外部站点上传或外设拷贝等通道流转即入候选；大于100MB压缩包仅在技术部、工艺部、研发部命中时入候选；PLM 登录审计接入后，技术、研发、工艺账号非有效加密终端登录也进入复核。敏感词和普通图纸高频不进入风险终端复核候选。</p>
       <div class="actions"><button class="primary" type="submit">保存复核策略</button></div>
     </form>
 """
@@ -8645,6 +8937,10 @@ def plm_login_policy_page(config: AppConfig, message: str = "", error: str = "")
     plm = doc.get("plm_login_audit") if isinstance(doc.get("plm_login_audit"), dict) else {}
     departments = normalize_unique_text_list(plm.get("constrained_departments") or DEFAULT_PLM_CONSTRAINED_DEPARTMENTS)
     terminal_match_fields = normalize_unique_text_list(plm.get("terminal_match_fields") or DEFAULT_PLM_TERMINAL_MATCH_FIELDS)
+    ip_mac_lookup_hours = clamp_int(plm.get("ip_mac_lookup_hours"), DEFAULT_PLM_IP_MAC_LOOKUP_HOURS, 1, 24)
+    terminal_valid_days = clamp_int(plm.get("terminal_valid_days"), DEFAULT_PLM_TERMINAL_VALID_DAYS, 1, 30)
+    source_warn_days = clamp_int(plm.get("source_warn_days"), DEFAULT_PLM_SOURCE_WARN_DAYS, 1, 30)
+    source_stale_days = clamp_int(plm.get("source_stale_days"), DEFAULT_PLM_SOURCE_STALE_DAYS, 1, 60)
     department_text = ", ".join(departments)
     msg = f'<p class="muted">{esc(message)}</p>' if message else ""
     err = f'<p class="note error">{esc(error)}</p>' if error else ""
@@ -8652,7 +8948,7 @@ def plm_login_policy_page(config: AppConfig, message: str = "", error: str = "")
     <header>
       <div>
         <h1>PLM登录审计策略</h1>
-        <div class="muted">定义需要强制使用 7 天内在线的加密终端授信池登录 PLM 的部门范围。</div>
+        <div class="muted">定义 PLM 强约束部门，以及通过天擎资产观测反查 MAC 后再校验加密终端的判定口径。</div>
       </div>
       <div class="actions">
         <a class="button" href="/settings">策略中心</a>
@@ -8668,14 +8964,26 @@ def plm_login_policy_page(config: AppConfig, message: str = "", error: str = "")
         <label class="full">部门名称，逗号分隔
           <textarea name="constrained_departments" spellcheck="false" placeholder="技术部, 研发部, 工艺部">{esc(department_text)}</textarea>
         </label>
-        <p class="muted full">PLM账号匹配到企业微信通讯录，且部门命中该列表时，登录 IP + 计算机名不在最新加密终端授信池内即判一级风险；最后在线超过 {ENCRYPTION_TERMINAL_TRUST_DAYS} 天的终端视为加密失效，不进入授信池。列表外部门暂不跟踪。</p>
+        <p class="muted full">PLM账号匹配到企业微信通讯录，且部门命中该列表时，先用登录时间、IP、计算机名回查天擎资产观测到的 MAC，再用 MAC 校验是否属于有效加密终端。列表外部门暂不跟踪。</p>
+        <label>IP反查MAC窗口（小时）
+          <input name="ip_mac_lookup_hours" type="number" min="1" max="24" value="{esc(ip_mac_lookup_hours)}">
+        </label>
+        <label>加密终端有效期（天）
+          <input name="terminal_valid_days" type="number" min="1" max="30" value="{esc(terminal_valid_days)}">
+        </label>
+        <label>清单偏旧提醒（天）
+          <input name="source_warn_days" type="number" min="1" max="30" value="{esc(source_warn_days)}">
+        </label>
+        <label>清单过期降级（天）
+          <input name="source_stale_days" type="number" min="1" max="60" value="{esc(source_stale_days)}">
+        </label>
         <div class="full actions"><button class="primary" type="submit">保存覆盖</button></div>
       </form>
     </section>
     <section class="panel">
       <h2>当前口径</h2>
-      <p class="muted">授信终端键：{esc(' + '.join(terminal_match_fields))}；有效条件：最后在线时间在 {ENCRYPTION_TERMINAL_TRUST_DAYS} 天内。PLM 登录接口接入后会按该键匹配最新加密终端批次。</p>
-      <div class="table-wrap"><table><thead><tr><th>部门</th><th>规则</th></tr></thead><tbody>{"".join(f"<tr><td>{esc(item)}</td><td>登录IP+计算机名不在7天内在线授信终端池判一级风险</td></tr>" for item in departments) or '<tr><td colspan="2" class="muted">暂无强约束部门。</td></tr>'}</tbody></table></div>
+      <p class="muted">PLM登录原始字段：{esc(' + '.join(terminal_match_fields))}；设备身份主体：天擎反查得到的 MAC；有效条件：加密终端最后在线距登录时间不超过 {terminal_valid_days} 天。反查优先登录前后 {ip_mac_lookup_hours} 小时，失败后扩展到登录当天；清单超过 {source_warn_days} 天提示偏旧，超过 {source_stale_days} 天降级为待复核。</p>
+      <div class="table-wrap"><table><thead><tr><th>部门</th><th>规则</th></tr></thead><tbody>{"".join(f"<tr><td>{esc(item)}</td><td>IP+计算机名先反查MAC；MAC未命中有效加密终端判一级风险，无法反查或冲突判待复核</td></tr>" for item in departments) or '<tr><td colspan="2" class="muted">暂无强约束部门。</td></tr>'}</tbody></table></div>
     </section>
 """
     return page_shell("PLM登录审计策略", body)
@@ -8890,7 +9198,7 @@ def encryption_terminals_page(
     <header>
       <div>
         <h1>加密终端列表导入</h1>
-        <div class="muted">上传加密软件终端清单 .xlsx；最新导入批次中 7 天内在线的 IP + 计算机名作为授信终端池来源。</div>
+        <div class="muted">上传加密软件终端清单 .xlsx；最新导入批次用于校验 PLM 登录设备是否为有效加密终端。</div>
       </div>
       <div class="actions">
         <a class="button" href="/settings">策略中心</a>
@@ -8903,13 +9211,13 @@ def encryption_terminals_page(
     <section class="panel">
       <h2>当前授信终端池来源</h2>
       <p class="metric">{esc(pool_text)}</p>
-      <p class="muted">该页面只维护数据源。PLM 登录审计等模块后续会读取最新批次中 `IP地址 + 计算机名` 且最后在线时间在 {ENCRYPTION_TERMINAL_TRUST_DAYS} 天内的记录作为授信终端键；超过 {ENCRYPTION_TERMINAL_TRUST_DAYS} 天未在线视为加密失效，不进入授信池。若 PLM 登录记录缺少计算机名，应单独标记为待复核，不按纯 IP 自动放行。</p>
+      <p class="muted">该页面只维护数据源。PLM 登录审计不会按纯 IP 放行：系统先用登录时间、IP、计算机名回查天擎资产观测到的 MAC，再用 MAC 匹配本清单中的有效加密终端；超过 {ENCRYPTION_TERMINAL_TRUST_DAYS} 天未在线视为加密失效。若 PLM 登录记录缺少计算机名，应单独标记为待复核。</p>
     </section>
     <section class="panel">
       <div class="settings-toolbar">
         <div>
-          <h2>授信 IP 池</h2>
-          <p class="muted">只展示最后在线时间在 {ENCRYPTION_TERMINAL_TRUST_DAYS} 天内，且同时具备 IP 地址和计算机名的终端；重复 IP 仅按授信池计算。</p>
+          <h2>当前可用加密终端线索</h2>
+          <p class="muted">只展示最后在线时间在 {ENCRYPTION_TERMINAL_TRUST_DAYS} 天内，且同时具备 IP 地址和计算机名的终端；IP 只作为 PLM 登录反查 MAC 的线索，不作为设备唯一身份。</p>
         </div>
         <div class="actions">{mode_actions}{size_actions}</div>
       </div>
@@ -9924,6 +10232,18 @@ class ReportHandler(BaseHTTPRequestHandler):
                 plm_login_audit = {}
             plm_login_audit["constrained_departments"] = departments
             plm_login_audit["terminal_match_fields"] = DEFAULT_PLM_TERMINAL_MATCH_FIELDS
+            plm_login_audit["ip_mac_lookup_hours"] = clamp_int(
+                form.get("ip_mac_lookup_hours"), DEFAULT_PLM_IP_MAC_LOOKUP_HOURS, 1, 24
+            )
+            plm_login_audit["terminal_valid_days"] = clamp_int(
+                form.get("terminal_valid_days"), DEFAULT_PLM_TERMINAL_VALID_DAYS, 1, 30
+            )
+            plm_login_audit["source_warn_days"] = clamp_int(
+                form.get("source_warn_days"), DEFAULT_PLM_SOURCE_WARN_DAYS, 1, 30
+            )
+            plm_login_audit["source_stale_days"] = clamp_int(
+                form.get("source_stale_days"), DEFAULT_PLM_SOURCE_STALE_DAYS, 1, 60
+            )
             doc["plm_login_audit"] = plm_login_audit
             write_rule_doc(policy_path(self.config), doc, self.config)
         self.redirect("/settings/plm-login")
